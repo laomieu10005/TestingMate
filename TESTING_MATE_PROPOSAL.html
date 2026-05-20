@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Testing Mate v5 - ASPICE-Ready Test Automation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .slide-container {
+            max-width: 1000px;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            overflow: hidden;
+        }
+        
+        .slide {
+            display: none;
+            padding: 60px;
+            min-height: 600px;
+            animation: fadeIn 0.5s;
+        }
+        
+        .slide.active {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        
+        /* Slide 1: Title */
+        .slide-title {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            text-align: center;
+        }
+        
+        .slide-title h1 {
+            font-size: 3em;
+            margin-bottom: 20px;
+            font-weight: 700;
+        }
+        
+        .slide-title .subtitle {
+            font-size: 1.5em;
+            opacity: 0.9;
+            margin-bottom: 40px;
+        }
+        
+        .slide-title .tagline {
+            font-size: 1.2em;
+            opacity: 0.8;
+            border-top: 2px solid rgba(255,255,255,0.3);
+            padding-top: 30px;
+            margin-top: 40px;
+        }
+        
+        /* Slide 2: Problem */
+        .slide-problem {
+            background: linear-gradient(to right, #f5f7fa 0%, #c3cfe2 100%);
+        }
+        
+        .slide-problem h2 {
+            color: #333;
+            font-size: 2.5em;
+            margin-bottom: 40px;
+        }
+        
+        .problem-list {
+            font-size: 1.3em;
+            line-height: 2;
+            color: #555;
+        }
+        
+        .problem-list li {
+            margin-bottom: 20px;
+            padding-left: 30px;
+            list-style: none;
+            position: relative;
+        }
+        
+        .problem-list li:before {
+            content: "✗";
+            position: absolute;
+            left: 0;
+            color: #e74c3c;
+            font-weight: bold;
+            font-size: 1.3em;
+        }
+        
+        /* Slide 3: Solution */
+        .slide-solution {
+            background: linear-gradient(to right, #a8edea 0%, #fed6e3 100%);
+        }
+        
+        .slide-solution h2 {
+            color: #333;
+            font-size: 2.5em;
+            margin-bottom: 40px;
+        }
+        
+        .solution-list {
+            font-size: 1.3em;
+            line-height: 2;
+            color: #555;
+        }
+        
+        .solution-list li {
+            margin-bottom: 20px;
+            padding-left: 30px;
+            list-style: none;
+            position: relative;
+        }
+        
+        .solution-list li:before {
+            content: "✓";
+            position: absolute;
+            left: 0;
+            color: #27ae60;
+            font-weight: bold;
+            font-size: 1.3em;
+        }
+        
+        /* Slide 4: Key Features */
+        .slide-features h2 {
+            color: #667eea;
+            font-size: 2.5em;
+            margin-bottom: 40px;
+            text-align: center;
+        }
+        
+        .features-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+        }
+        
+        .feature-box {
+            background: white;
+            padding: 25px;
+            border-radius: 8px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+            border-left: 4px solid #667eea;
+        }
+        
+        .feature-box h3 {
+            color: #667eea;
+            font-size: 1.3em;
+            margin-bottom: 15px;
+        }
+        
+        .feature-box p {
+            color: #555;
+            font-size: 1em;
+            line-height: 1.6;
+        }
+        
+        /* Slide 5: Compliance */
+        .slide-compliance {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+        }
+        
+        .slide-compliance h2 {
+            font-size: 2.5em;
+            margin-bottom: 40px;
+            text-align: center;
+        }
+        
+        .compliance-boxes {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 20px;
+        }
+        
+        .compliance-box {
+            background: rgba(255, 255, 255, 0.15);
+            backdrop-filter: blur(10px);
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            text-align: center;
+        }
+        
+        .compliance-box h3 {
+            font-size: 1.2em;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+        
+        .compliance-box p {
+            font-size: 0.95em;
+            line-height: 1.5;
+        }
+        
+        /* Slide 6: Workflow */
+        .slide-workflow h2 {
+            color: #667eea;
+            font-size: 2.5em;
+            margin-bottom: 40px;
+            text-align: center;
+        }
+        
+        .workflow-steps {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 1.1em;
+        }
+        
+        .step {
+            flex: 1;
+            text-align: center;
+            position: relative;
+        }
+        
+        .step-number {
+            width: 60px;
+            height: 60px;
+            background: #667eea;
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 1.3em;
+            margin: 0 auto 15px;
+        }
+        
+        .step-text {
+            color: #555;
+            font-weight: 500;
+        }
+        
+        .step:not(:last-child):after {
+            content: "→";
+            position: absolute;
+            right: -20px;
+            top: 30px;
+            font-size: 1.5em;
+            color: #667eea;
+        }
+        
+        /* Slide 7: ROI */
+        .slide-roi {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        .slide-roi h2 {
+            font-size: 2.5em;
+            margin-bottom: 40px;
+            text-align: center;
+        }
+        
+        .roi-metrics {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 40px;
+        }
+        
+        .metric {
+            text-align: center;
+        }
+        
+        .metric-value {
+            font-size: 2.5em;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        
+        .metric-label {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+        
+        /* Slide 8: Call to Action */
+        .slide-cta {
+            background: linear-gradient(135deg, #84fab0 0%, #8fd3f4 100%);
+            text-align: center;
+        }
+        
+        .slide-cta h2 {
+            color: #333;
+            font-size: 2.5em;
+            margin-bottom: 30px;
+        }
+        
+        .slide-cta p {
+            color: #555;
+            font-size: 1.3em;
+            margin-bottom: 40px;
+            line-height: 1.8;
+        }
+        
+        .cta-buttons {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            padding: 15px 40px;
+            font-size: 1.1em;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+        
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background: #764ba2;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-secondary {
+            background: white;
+            color: #667eea;
+            border: 2px solid #667eea;
+        }
+        
+        .btn-secondary:hover {
+            background: #667eea;
+            color: white;
+        }
+        
+        /* Controls */
+        .controls {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 60px;
+            background: #f5f7fa;
+        }
+        
+        .nav-button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+        
+        .nav-button:hover {
+            background: #764ba2;
+        }
+        
+        .nav-button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .slide-counter {
+            color: #667eea;
+            font-weight: 600;
+            font-size: 1.1em;
+        }
+        
+        .dots {
+            display: flex;
+            gap: 8px;
+        }
+        
+        .dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ccc;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .dot.active {
+            background: #667eea;
+            transform: scale(1.3);
+        }
+        
+        /* Additional slide styles */
+        .slide-pipeline {
+            background: linear-gradient(to right, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px 60px;
+        }
+        
+        .slide-pipeline h2 {
+            font-size: 2.5em;
+            margin-bottom: 40px;
+            text-align: center;
+        }
+        
+        .pipeline-flow {
+            background: rgba(255,255,255,0.1);
+            padding: 30px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.95em;
+            line-height: 2;
+            color: #e0e0ff;
+            text-align: center;
+        }
+        
+        .slide-backends {
+            background: linear-gradient(to right, #12c2e9 0%, #c471ed 100%);
+            color: white;
+        }
+        
+        .slide-backends h2 {
+            font-size: 2.5em;
+            margin-bottom: 40px;
+            text-align: center;
+        }
+        
+        .backend-boxes {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+        }
+        
+        .backend-box {
+            background: rgba(255,255,255,0.15);
+            backdrop-filter: blur(10px);
+            padding: 25px;
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.3);
+        }
+        
+        .backend-box h3 {
+            font-size: 1.4em;
+            margin-bottom: 15px;
+            font-weight: 600;
+        }
+        
+        .backend-box ul {
+            font-size: 0.95em;
+            line-height: 1.8;
+            list-style: none;
+            padding-left: 0;
+        }
+        
+        .backend-box li {
+            padding-left: 25px;
+            position: relative;
+            margin-bottom: 8px;
+        }
+        
+        .backend-box li:before {
+            content: "✓";
+            position: absolute;
+            left: 0;
+            font-weight: bold;
+        }
+        
+        .slide-audit {
+            background: linear-gradient(135deg, #ffd89b 0%, #19547b 100%);
+            color: white;
+        }
+        
+        .slide-audit h2 {
+            font-size: 2.5em;
+            margin-bottom: 40px;
+            text-align: center;
+        }
+        
+        .audit-boxes {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+        }
+        
+        .audit-item {
+            background: rgba(255,255,255,0.12);
+            padding: 20px;
+            border-radius: 8px;
+            border-left: 4px solid rgba(255,255,255,0.5);
+        }
+        
+        .audit-item h3 {
+            font-size: 1.2em;
+            margin-bottom: 12px;
+            font-weight: 600;
+        }
+        
+        .audit-item p {
+            font-size: 0.95em;
+            line-height: 1.6;
+            opacity: 0.95;
+        }
+    </style>
+</head>
+<body>
+    <div class="slide-container">
+        <!-- Slide 1: Title -->
+        <div class="slide slide-title active">
+            <h1>Testing Mate v5</h1>
+            <div class="subtitle">ASPICE-Ready Test Automation for Automotive Safety</div>
+            <div class="tagline">Generate, Execute & Audit Coverage-Oriented Test Vectors Automatically</div>
+        </div>
+        
+        <!-- Slide 2: Problem -->
+        <div class="slide slide-problem">
+            <h2>The Challenge</h2>
+            <ul class="problem-list">
+                <li>Manual test case creation is time-consuming and error-prone</li>
+                <li>Ensuring ISO 26262 & ASPICE compliance requires extensive documentation</li>
+                <li>Coverage metrics (C0, C1, MC/DC) are difficult to verify consistently</li>
+                <li>Traceability from requirements to test evidence is fragmented</li>
+                <li>Integration with CppUTest, and GoogleTest requires custom scripting</li>
+            </ul>
+        </div>
+        
+        <!-- Slide 3: Solution -->
+        <div class="slide slide-solution">
+            <h2>Testing Mate Solution</h2>
+            <div style="margin-bottom: 30px;">
+                <h3 style="color: #333; font-size: 1.3em; margin-bottom: 15px;">Advanced Analysis Pipeline:</h3>
+                <ul class="solution-list">
+                    <li>GCC preprocessing to resolve macros and includes</li>
+                    <li>Clang AST analysis to extract functions, parameters, and conditions</li>
+                    <li>Intelligent vector generation targeting C0/C1/MC/DC coverage</li>
+                    <li>LLM-enhanced test coverage for edge cases and robustness</li>
+                </ul>
+            </div>
+            <div style="margin-bottom: 30px;">
+                <h3 style="color: #333; font-size: 1.3em; margin-bottom: 15px;">Inputs & Outputs:</h3>
+                <ul class="solution-list">
+                    <li><strong>INPUT:</strong> C source code files</li>
+                    <li><strong>OUTPUT:</strong> Test cases, test environments (GTest, CppUTest), comprehensive reports</li>
+                    <li>ASPICE audit-ready artifacts: checklists, CSV exports, JSON metadata, HTML dashboards</li>
+                    <li>Backend support: CppUTest CMake, GoogleTest CMake</li>
+                </ul>
+            </div>
+        </div>
+        
+        <!-- Slide 4: Key Features -->
+        <div class="slide slide-features">
+            <h2>Core Capabilities</h2>
+            <div class="features-grid">
+                <div class="feature-box">
+                    <h3>📊 Intelligent Analysis</h3>
+                    <p>Automatic function, parameter, and condition discovery with optional AI refinement via Ollama</p>
+                </div>
+                <div class="feature-box">
+                    <h3>✓ Coverage Levels</h3>
+                    <p>C0 (statement), C1 (branch), MC/DC (independence) with ISO 26262 method-profile guidance</p>
+                </div>
+                <div class="feature-box">
+                    <h3>🎯 Multiple Backends</h3>
+                    <p>CppUTest CMake, GoogleTest CMake—all from a single analysis</p>
+                </div>
+                <div class="feature-box">
+                    <h3>📋 Audit Artifacts</h3>
+                    <p>HTML reports, markdown checklists, CSV test cases, JSON metadata for seamless compliance documentation</p>
+                </div>
+                <div class="feature-box">
+                    <h3>🔗 Full Traceability</h3>
+                    <p>Link tests to requirements, safety goals, ASIL classification, and ASPICE process targets</p>
+                </div>
+                <div class="feature-box">
+                    <h3>⚙️ No External Dependencies</h3>
+                    <p>Pure Python + Tkinter GUI; no third-party packages required for core functionality</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 5: Processing Pipeline -->
+        <div class="slide slide-pipeline">
+            <h2>Deterministic Analysis Pipeline</h2>
+            <div class="pipeline-flow">
+Code inputs<br>
+↓<br>
+GCC preprocessor (resolve macros/includes)<br>
+↓<br>
+Clang AST analyzer (extract functions, conditions)<br>
+↓<br>
+Code database (persistent analysis record)<br>
+↓<br>
+Coverage mode / ISO 26262 profile selection<br>
+↓<br>
+Test vector & test case generation<br>
+↓<br>
+CppUTest or GoogleTest backend<br>
+↓<br>
+Backend execution & coverage collection<br>
+↓<br>
+Optional: Local Ollama/qwen refinement<br>
+↓<br>
+HTML report + audit artifacts            </div>
+        </div>
+        
+        <!-- Slide 5a: Execution Backends -->
+        <div class="slide slide-backends">
+            <h2>Multi-Backend Execution & Integration</h2>
+            <div class="backend-boxes">
+                <div class="backend-box">
+                    <h3>GoogleTest (gtest)</h3>
+                    <ul>
+                        <li>Auto-generated CMake harness</li>
+                        <li>Fast local compilation & smoke test</li>
+                        <li>Coverage flags enabled (gcov/lcov)</li>
+                        <li>Integrated CI/CD pipeline support</li>
+                        <li>HTML coverage report generation</li>
+                        <li>Generated from single analysis</li>
+                    </ul>
+                </div>
+                <div class="backend-box">
+                    <h3>CppUTest</h3>
+                    <ul>
+                        <li>Separate TEST_GROUP per function</li>
+                        <li>CMake-based harness generation</li>
+                        <li>Coverage metrics collection</li>
+                        <li>C-focused unit test framework</li>
+                        <li>Embedded systems friendly</li>
+                        <li>Batch run with result parsing</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 5b: ASPICE Audit Trail -->
+        <div class="slide slide-audit">
+            <h2>ASPICE Audit Trail & Evidence</h2>
+            <div class="audit-boxes">
+                <div class="audit-item">
+                    <h3>📋 Artifact Generation</h3>
+                    <p>CSV test cases, JSON metadata, markdown checklists, HTML reports—all audit-ready with full traceability from code to evidence</p>
+                </div>
+                <div class="audit-item">
+                    <h3>🔗 Requirement Traceability</h3>
+                    <p>Link each test case to requirements, safety goals, ASIL classification, and ASPICE process targets</p>
+                </div>
+                <div class="audit-item">
+                    <h3>✓ Test Evidence Fields</h3>
+                    <p>Preconditions, setup, test steps, expected output, teardown, pass/fail criteria—all populated automatically</p>
+                </div>
+                <div class="audit-item">
+                    <h3>📊 Coverage Metrics</h3>
+                    <p>C0 (statement), C1 (branch), MC/DC independence with generated-vector evidence and backend integration</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 5c: Compliance -->
+        <div class="slide slide-compliance">
+            <h2>Compliance & Standards Alignment</h2>
+            <div class="compliance-boxes">
+                <div class="compliance-box">
+                    <h3>ISO 26262</h3>
+                    <p>Functional Safety for Automotive<br><br>
+                    • Method-profile test derivation<br>
+                    • MC/DC coverage for ASIL A-D<br>
+                    • Requirements traceability</p>
+                </div>
+                <div class="compliance-box">
+                    <h3>ASPICE</h3>
+                    <p>Automotive SPICE Process Capability<br><br>
+                    • SYS.4 & SWE.4/5 verification/validation<br>
+                    • Audit checklists & evidence closure<br>
+                    • Test metrics reporting</p>
+                </div>
+                <div class="compliance-box">
+                    <h3>Test Levels</h3>
+                    <p>Unit, Integration, System Testing<br><br>
+                    • UT, IT, ST classification<br>
+                    • Structured test case export</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 6: Workflow -->
+        <div class="slide slide-workflow">
+            <h2>Simple Workflow</h2>
+            <div class="workflow-steps">
+                <div class="step">
+                    <div class="step-number">1</div>
+                    <div class="step-text">Add C Files</div>
+                </div>
+                <div class="step">
+                    <div class="step-number">2</div>
+                    <div class="step-text">Select Coverage Level</div>
+                </div>
+                <div class="step">
+                    <div class="step-number">3</div>
+                    <div class="step-text">Choose Backend</div>
+                </div>
+                <div class="step">
+                    <div class="step-number">4</div>
+                    <div class="step-text">Click Generate</div>
+                </div>
+                <div class="step">
+                    <div class="step-number">5</div>
+                    <div class="step-text">Review Artifacts</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 6b: Detailed Typical Flow -->
+        <div class="slide" style="background: linear-gradient(to right, #f5f7fa 0%, #c3cfe2 100%); padding: 60px;">
+            <h2 style="color: #333; font-size: 2.5em; margin-bottom: 30px; text-align: center;">Typical Testing Workflow</h2>
+            <div style="font-size: 1em; color: #555; line-height: 2; columns: 2; gap: 30px;">
+                <strong>1. Add Sources</strong><br>
+                Load C/C++ files, folders, or compile_commands.json with build flags
+                <br><br>
+                
+                <strong>2. Configure</strong><br>
+                Select coverage level (C0/C1 or MC/DC), test level (UT/IT/ST), ISO 26262 profile
+                <br><br>
+                
+                <strong>3. Set Compiler</strong><br>
+                GCC (default) or custom compiler; include paths and defines merged from build
+                <br><br>
+                
+                <strong>4. Choose Backend</strong><br>
+                GoogleTest (default) or CppUTest; auto-generates CMake harness
+                <br><br>
+                
+                <strong>5. Generate</strong><br>
+                Preprocess, Clang analyze, generate vectors, create test cases & backend artifacts
+                <br><br>
+                
+                <strong>6. Execute (Optional)</strong><br>
+                Run backend and collect coverage (gcov/lcov); Testing Mate parses results
+                <br><br>
+                
+                <strong>7. Refine (Optional)</strong><br>
+                Feed backend report to Ollama for LLM enhancement of uncovered paths
+                <br><br>
+                
+                <strong>8. Review & Sign Off</strong><br>
+                HTML report, CSV cases, markdown audit checklist for traceability closure
+            </div>
+        </div>
+        
+        <!-- Slide 7: ROI -->
+        <div class="slide slide-roi">
+            <h2>Business Impact</h2>
+            <div class="roi-metrics">
+                <div class="metric">
+                    <div class="metric-value">70–80%</div>
+                    <div class="metric-label">Reduction in manual test creation time</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value">1–2 weeks</div>
+                    <div class="metric-label">Faster audit preparation and evidence closure</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value">100%</div>
+                    <div class="metric-label">Traceability from source to test to audit checklist</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value">Multi-backend</div>
+                    <div class="metric-label">CppUTest, GoogleTest in one tool</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 8: Call to Action -->
+        <div class="slide slide-cta">
+            <h2>Ready to Transform Your Test Process?</h2>
+            <p>Testing Mate v5 is ready for proof-of-concept and production deployment.<br>
+            Start with a pilot project and see measurable results in days.</p>
+            <div class="cta-buttons">
+                <button class="btn btn-primary" onclick="requestDemo()">Request Demo</button>
+                <button class="btn btn-secondary" onclick="viewDocumentation()">View Documentation</button>
+            </div>
+        </div>
+        
+        <!-- Controls -->
+        <div class="controls">
+            <button class="nav-button" id="prevBtn" onclick="changeSlide(-1)">← Previous</button>
+            <div class="dots" id="dotsContainer"></div>
+            <button class="nav-button" id="nextBtn" onclick="changeSlide(1)">Next →</button>
+        </div>
+    </div>
+    
+    <script>
+        let currentSlide = 0;
+        const slides = document.querySelectorAll('.slide');
+        const totalSlides = slides.length;
+        
+        function showSlide(n) {
+            slides[currentSlide].classList.remove('active');
+            currentSlide = (n + totalSlides) % totalSlides;
+            slides[currentSlide].classList.add('active');
+            
+            // Update controls
+            document.getElementById('prevBtn').disabled = currentSlide === 0;
+            document.getElementById('nextBtn').disabled = currentSlide === totalSlides - 1;
+            
+            // Update counter
+            updateDots();
+        }
+        
+        function changeSlide(direction) {
+            showSlide(currentSlide + direction);
+        }
+        
+        function updateDots() {
+            const dotsContainer = document.getElementById('dotsContainer');
+            dotsContainer.innerHTML = '';
+            
+            for (let i = 0; i < totalSlides; i++) {
+                const dot = document.createElement('div');
+                dot.className = 'dot' + (i === currentSlide ? ' active' : '');
+                dot.onclick = () => showSlide(i);
+                dotsContainer.appendChild(dot);
+            }
+        }
+        
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowLeft') changeSlide(-1);
+            if (e.key === 'ArrowRight') changeSlide(1);
+        });
+        
+        // Initialize
+        updateDots();
+        showSlide(0);
+        
+        // Request Demo - Send email
+        function requestDemo() {
+            const email = 'ThanhCD@fpt.com';
+            const subject = 'Testing Mate v5 - Request Demo';
+            const body = 'Hi,\n\nI would like to request a demo of Testing Mate v5.\n\nPlease let me know about availability.\n\nThank you.';
+            window.location.href = `mailto:${email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+        }
+        
+        // View Documentation - Open README
+        function viewDocumentation() {
+            window.open('./README.md', '_blank');
+        }
+    </script>
+</body>
+</html>
