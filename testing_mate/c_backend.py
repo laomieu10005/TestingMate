@@ -219,6 +219,10 @@ class CPreprocessor:
         combined = f"{source.stem}:{content_hash}:{includes_str}:{defines_str}"
         return hashlib.md5(combined.encode()).hexdigest()
 
+    @staticmethod
+    def _preprocessor_path(env: dict[str, str]) -> str | None:
+        return shutil.which("clang", path=env.get("PATH")) or shutil.which("clang.exe", path=env.get("PATH"))
+
     def preprocess_file(self, source: Path, out_dir: Path) -> tuple[Path, str]:
         # Check cache first (Phase D: preprocess caching)
         cache_key = self._cache_key(source, self.include_dirs, self.defines)
@@ -238,9 +242,10 @@ class CPreprocessor:
             if stub_include.exists():
                 include_dirs.insert(0, str(stub_include))
         
-        compiler_path = shutil.which(self.compiler, path=env.get("PATH"))
-        if compiler_path:
-            cmd = [compiler_path, "-E", "-P", str(source)]
+        preprocessor_path = self._preprocessor_path(env)
+        if preprocessor_path:
+            language = "c++" if source.suffix.lower() in {".cc", ".cpp", ".cxx", ".hpp"} else "c"
+            cmd = [preprocessor_path, "-x", language, "-E", "-P", str(source)]
             for inc in include_dirs:
                 if inc:
                     cmd.extend(["-I", inc])
@@ -255,21 +260,21 @@ class CPreprocessor:
                     processed_text = self._inject_missing_stubs(processed_text, source)
                     target.write_text(processed_text, encoding="utf-8", errors="replace")
                     self._preprocess_cache[cache_key] = target
-                    return target, f"Preprocessed with {compiler_path}: {source.name}"
+                    return target, f"Preprocessed with Clang AST frontend {preprocessor_path}: {source.name}"
                 fallback = self._fallback(source.read_text(encoding="utf-8", errors="replace"))
                 fallback = self._inject_missing_stubs(fallback, source)
                 target.write_text(fallback, encoding="utf-8")
-                return target, f"{self.compiler} preprocessing failed for {source.name}; used internal cleanup. {result.stderr.strip()[:240]}"
+                return target, f"Clang preprocessing failed for {source.name}; used internal cleanup. {result.stderr.strip()[:240]}"
             except Exception as exc:
                 fallback = self._fallback(source.read_text(encoding="utf-8", errors="replace"))
                 fallback = self._inject_missing_stubs(fallback, source)
                 target.write_text(fallback, encoding="utf-8")
-                return target, f"{self.compiler} preprocessing error for {source.name}; used internal cleanup. {exc}"
+                return target, f"Clang preprocessing error for {source.name}; used internal cleanup. {exc}"
 
         fallback = self._fallback(source.read_text(encoding="utf-8", errors="replace"))
         fallback = self._inject_missing_stubs(fallback, source)
         target.write_text(fallback, encoding="utf-8")
-        return target, f"{self.compiler} not found; used internal cleanup for {source.name}"
+        return target, f"Clang preprocessor not found; used internal cleanup for {source.name}"
 
     def _inject_missing_stubs(self, text: str, source: Path) -> str:
         """Detect missing symbols and inject stubs if available from stub folder.
@@ -425,6 +430,7 @@ class CAnalyzer:
         enum_types = self._enum_types(text)
         line_starts = self._line_offsets(text)
         functions: list[FunctionInfo] = []
+        seen: set[tuple[str, int]] = set()
         for match in self.function_header.finditer(text):
             name = match.group("name")
             return_type = " ".join(match.group("rtype").split())
@@ -433,7 +439,7 @@ class CAnalyzer:
             return_type = " ".join(return_type.split())
             
             # Skip keywords, compiler builtins, and prototypes/typedefs
-            if name in C_KEYWORDS or name.startswith("__") or name.startswith("_"):
+            if name in C_KEYWORDS or name in {"FUNC", "P2VAR", "P2CONST", "CONSTP2VAR", "P2FUNC"} or name.startswith("__") or name.startswith("_"):
                 continue
             if name == "main" and not include_main:
                 continue
@@ -457,7 +463,79 @@ class CAnalyzer:
             )
             fn.conditions = self._conditions(body, start_line)
             functions.append(fn)
+            seen.add((name, start_line))
+        for item in self._scan_brace_function_definitions(text, line_starts):
+            name, return_type, params, body, start_line, end_line = item
+            if name == "main" and not include_main:
+                continue
+            if return_type.strip().startswith("static") and not include_static_functions:
+                continue
+            key = (name, start_line)
+            if key in seen or name in C_KEYWORDS or name in {"FUNC", "P2VAR", "P2CONST", "CONSTP2VAR", "P2FUNC"} or name.startswith("__") or name.startswith("_"):
+                continue
+            fn = FunctionInfo(
+                name=name,
+                return_type=return_type,
+                parameters=self._parse_parameters(params, enum_types),
+                start_line=start_line,
+                end_line=end_line,
+                body=body,
+            )
+            fn.conditions = self._conditions(body, start_line)
+            functions.append(fn)
+            seen.add(key)
+        functions.sort(key=lambda fn: (fn.start_line, fn.name))
         return functions
+
+    @classmethod
+    def _scan_brace_function_definitions(cls, text: str, line_starts: list[int]) -> list[tuple[str, str, str, str, int, int]]:
+        definitions: list[tuple[str, str, str, str, int, int]] = []
+        for match in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", text):
+            name = match.group(1)
+            if name in C_KEYWORDS:
+                continue
+            params, close_paren = cls._extract_parenthesized(text, match.end() - 1)
+            if close_paren < 0:
+                continue
+            brace = cls._next_nonspace_index(text, close_paren + 1)
+            if brace is None or text[brace] != "{":
+                continue
+            if cls._looks_like_control_statement(text, match.start()):
+                continue
+            body_end = cls._matching_brace(text, brace)
+            if body_end < 0:
+                continue
+            return_type = cls._return_type_before_name(text, match.start())
+            if not return_type:
+                continue
+            body = text[brace + 1 : body_end]
+            start_line = cls._line_for_offset(line_starts, match.start())
+            end_line = cls._line_for_offset(line_starts, body_end)
+            definitions.append((name, return_type, params, body, start_line, end_line))
+        return definitions
+
+    @staticmethod
+    def _next_nonspace_index(text: str, index: int) -> int | None:
+        while index < len(text) and text[index].isspace():
+            index += 1
+        return index if index < len(text) else None
+
+    @staticmethod
+    def _looks_like_control_statement(text: str, name_start: int) -> bool:
+        prefix = text[max(0, name_start - 32) : name_start]
+        return bool(re.search(r"\b(if|for|while|switch|return|sizeof)\s*$", prefix))
+
+    @classmethod
+    def _return_type_before_name(cls, text: str, name_start: int) -> str:
+        boundary = max(text.rfind(";", 0, name_start), text.rfind("}", 0, name_start), text.rfind("\n#", 0, name_start))
+        prefix = text[boundary + 1 : name_start].strip()
+        prefix = re.sub(r"/\*.*?\*/", " ", prefix, flags=re.S)
+        prefix = re.sub(r"//.*", " ", prefix)
+        prefix = " ".join(prefix.split())
+        func_match = re.search(r"\bFUNC\s*\(\s*([^,()]+)\s*,[^)]*\)\s*$", prefix)
+        if func_match:
+            return func_match.group(1).strip()
+        return prefix
 
     @staticmethod
     def _line_offsets(text: str) -> list[int]:
@@ -666,7 +744,7 @@ class CAnalyzer:
                     )
                 )
         
-        return conditions
+        return sorted(conditions, key=lambda condition: (condition.line, condition.depth, condition.text))
 
     @staticmethod
     def _strip_wrapping_parentheses(text: str) -> str:

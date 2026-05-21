@@ -66,15 +66,16 @@ class TestBackendGenerator:
         test_dir = self.out_dir / f"{source.stem}_cpputest"
         test_dir.mkdir(parents=True, exist_ok=True)
         source_env_dir = test_dir / "src"
-        copied = self._copy_unit_files(unit_sources, source_env_dir)
+        harness_sources = [source]
+        copied = self._copy_target_source(source, source_env_dir)
         test_file = test_dir / f"{source.stem}_cpputest_test.cpp"
         cmake_file = test_dir / "CMakeLists.txt"
         runner = test_dir / "run_cpputest.sh"
-        link_sources = self._link_unit_sources(unit_sources)
-        stub_result = StubHarnessEngine().write_for_backend("CppUTest", test_dir, source, functions, cases, unit_sources, self.include_dirs, code_database)
+        link_sources = self._link_unit_sources(harness_sources)
+        stub_result = StubHarnessEngine().write_for_backend("CppUTest", test_dir, source, functions, cases, harness_sources, self.include_dirs, code_database)
         c_sources = " ".join([*(f"src/{path.name}" for path in link_sources), *self._relative_cmake_paths(stub_result.source_files, test_dir)])
-        include_dirs = self._cmake_include_dirs(source, unit_sources, [Path("src"), Path("stub/include")])
-        test_file.write_text(self._cpp_test_source("CppUTest", source, functions, cases, unit_sources), encoding="utf-8")
+        include_dirs = self._cmake_include_dirs(source, harness_sources, [Path("src"), Path("stub/include")])
+        test_file.write_text(self._cpp_test_source("CppUTest", source, functions, cases, harness_sources), encoding="utf-8")
         cmake_file.write_text(
             "\n".join(
                 [
@@ -126,15 +127,16 @@ class TestBackendGenerator:
         test_dir = self.out_dir / f"{source.stem}_gtest"
         test_dir.mkdir(parents=True, exist_ok=True)
         source_env_dir = test_dir / "src"
-        copied = self._copy_unit_files(unit_sources, source_env_dir)
+        harness_sources = [source]
+        copied = self._copy_target_source(source, source_env_dir)
         test_file = test_dir / f"{source.stem}_gtest_test.cpp"
         cmake_file = test_dir / "CMakeLists.txt"
         runner = test_dir / "run_gtest.sh"
-        link_sources = self._link_unit_sources(unit_sources)
-        stub_result = StubHarnessEngine().write_for_backend("GoogleTest", test_dir, source, functions, cases, unit_sources, self.include_dirs, code_database)
+        link_sources = self._link_unit_sources(harness_sources)
+        stub_result = StubHarnessEngine().write_for_backend("GoogleTest", test_dir, source, functions, cases, harness_sources, self.include_dirs, code_database)
         c_sources = " ".join([*(f"src/{path.name}" for path in link_sources), *self._relative_cmake_paths(stub_result.source_files, test_dir)])
-        include_dirs = self._cmake_include_dirs(source, unit_sources, [Path("src"), Path("stub/include")])
-        test_file.write_text(self._cpp_test_source("GoogleTest", source, functions, cases, unit_sources), encoding="utf-8")
+        include_dirs = self._cmake_include_dirs(source, harness_sources, [Path("src"), Path("stub/include")])
+        test_file.write_text(self._cpp_test_source("GoogleTest", source, functions, cases, harness_sources), encoding="utf-8")
         cmake_file.write_text(
             "\n".join(
                 [
@@ -174,6 +176,16 @@ class TestBackendGenerator:
         )
         runner.write_text(self._cmake_runner(source.stem + "_gtest", f"src/{source.name}"), encoding="utf-8")
         return [*copied, *stub_result.generated_paths, test_file, cmake_file, runner]
+
+    def _copy_target_source(self, source: Path, test_dir: Path) -> list[Path]:
+        copied: list[Path] = []
+        if not source.exists() or not source.is_file():
+            return copied
+        test_dir.mkdir(parents=True, exist_ok=True)
+        target = test_dir / source.name
+        shutil.copy2(source, target)
+        copied.append(target)
+        return copied
 
     def _copy_unit_files(self, sources: list[Path], test_dir: Path) -> list[Path]:
         copied: list[Path] = []

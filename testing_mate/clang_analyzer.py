@@ -40,6 +40,11 @@ class ClangEnhancedAnalyzer:
         self._preprocessed_cache: dict[str, Path] = {}  # Cache preprocessed files
 
     def analyze(self, source: Path, include_static_functions: bool = False, include_main: bool = False) -> list[FunctionInfo]:
+        try:
+            original_text = source.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            original_text = ""
+
         # Preprocess source file if preprocessor is available
         source_for_analysis = source
         preprocess_msg = ""
@@ -56,7 +61,9 @@ class ClangEnhancedAnalyzer:
         if not clang:
             self.log("Clang analysis skipped: clang executable was not found; using internal analyzer.")
             self.last_analyzer = "internal_fallback"
-            return self.fallback.analyze(source_for_analysis, include_static_functions, include_main)
+            functions = self.fallback.analyze(source_for_analysis, include_static_functions, include_main)
+            self._apply_original_source_conditions(functions, original_text)
+            return functions
 
         try:
             ast = self._load_ast(clang, source_for_analysis)
@@ -64,6 +71,7 @@ class ClangEnhancedAnalyzer:
             enum_types = self.fallback._enum_types(text)
             functions = self._functions_from_ast(ast, source_for_analysis, text, enum_types, include_static_functions, include_main)
             if functions:
+                self._apply_original_source_conditions(functions, original_text)
                 self.log(f"Clang analysis: extracted {len(functions)} functions from {source.name}.{preprocess_msg}")
                 self.last_analyzer = "clang_ast_json"
                 return functions
@@ -71,7 +79,66 @@ class ClangEnhancedAnalyzer:
         except Exception as exc:
             self.log(f"Clang analysis failed for {source.name}; using internal analyzer. {str(exc)[:240]}{preprocess_msg}")
         self.last_analyzer = "internal_fallback"
-        return self.fallback.analyze(source_for_analysis, include_static_functions, include_main)
+        functions = self.fallback.analyze(source_for_analysis, include_static_functions, include_main)
+        self._apply_original_source_conditions(functions, original_text)
+        return functions
+
+    def _apply_original_source_conditions(self, functions: list[FunctionInfo], source_text: str) -> None:
+        if not source_text.strip():
+            return
+        source_index = self._source_function_index(source_text)
+        for fn in functions:
+            source_fn = source_index.get(fn.name)
+            if source_fn is None:
+                continue
+            fn.start_line = source_fn.start_line
+            fn.end_line = source_fn.end_line
+            fn.body = source_fn.body
+            if source_fn.conditions:
+                fn.conditions = source_fn.conditions
+
+    def _source_function_index(self, source_text: str) -> dict[str, FunctionInfo]:
+        result: dict[str, FunctionInfo] = {}
+        line_starts = self.fallback._line_offsets(source_text)
+        for match in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", source_text):
+            name = match.group(1)
+            if name in C_KEYWORDS or name in {"FUNC", "P2VAR", "P2CONST", "CONSTP2VAR", "P2FUNC"} or name in result:
+                continue
+            _params, close_paren = CAnalyzer._extract_parenthesized(source_text, match.end() - 1)
+            if close_paren < 0:
+                continue
+            brace = self._next_nonspace_index(source_text, close_paren + 1)
+            if brace is None or brace >= len(source_text) or source_text[brace] != "{":
+                continue
+            if self._looks_like_control_statement(source_text, match.start()):
+                continue
+            body_end = CAnalyzer._matching_brace(source_text, brace)
+            if body_end < 0:
+                continue
+            body = source_text[brace + 1 : body_end]
+            start_line = CAnalyzer._line_for_offset(line_starts, match.start())
+            end_line = CAnalyzer._line_for_offset(line_starts, body_end)
+            result[name] = FunctionInfo(
+                name=name,
+                return_type="",
+                parameters=[],
+                start_line=start_line,
+                end_line=end_line,
+                body=body,
+                conditions=self.fallback._conditions(body, start_line),
+            )
+        return result
+
+    @staticmethod
+    def _next_nonspace_index(text: str, index: int) -> int | None:
+        while index < len(text) and text[index].isspace():
+            index += 1
+        return index if index < len(text) else None
+
+    @staticmethod
+    def _looks_like_control_statement(text: str, name_start: int) -> bool:
+        prefix = text[max(0, name_start - 32) : name_start]
+        return bool(re.search(r"\b(if|for|while|switch|return|sizeof)\s*$", prefix))
 
     def _clang_executable(self) -> str | None:
         compiler_name = Path(self.compiler.strip().split()[0]).name.lower() if self.compiler.strip() else ""
@@ -88,6 +155,13 @@ class ClangEnhancedAnalyzer:
     def get_preprocessed_source(self, source: Path) -> Path | None:
         """Get the cached preprocessed path for a source file if available."""
         return self._preprocessed_cache.get(str(source))
+
+    def apply_original_source_context(self, functions: list[FunctionInfo], source: Path) -> None:
+        try:
+            source_text = source.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        self._apply_original_source_conditions(functions, source_text)
 
     def _load_ast(self, clang: str, source: Path) -> dict:
         # Determine if source is preprocessed based on naming or check if preprocessor was used

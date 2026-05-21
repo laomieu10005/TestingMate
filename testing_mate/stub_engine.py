@@ -595,10 +595,22 @@ class HeaderPrototype:
 
 
 @dataclass
+class HeaderGlobal:
+    name: str
+    ctype: str
+    declaration: str
+    array_suffix: str = ""
+    header_path: str = ""
+    header_include: str = ""
+
+
+@dataclass
 class StubSymbol:
     name: str
+    kind: str = "function"
     return_type: str = "int"
     params: str = "void"
+    array_suffix: str = ""
     reason: str = "external call"
     source: str = "analysis"
     from_prototype: bool = False
@@ -692,6 +704,8 @@ class StubHarnessEngine:
             defined.update(record.name for record in code_database.functions)
 
         prototypes = self._prototype_map(source, unit_sources, include_dirs)
+        global_declarations = self._global_declaration_map(source, unit_sources, include_dirs)
+        defined_globals = self._defined_global_names(unit_sources)
         calls = self._referenced_calls(functions)
         calls.update(self._case_harness_calls(cases))
         controlled_returns = self._case_stub_return_calls(cases)
@@ -725,6 +739,7 @@ class StubHarnessEngine:
             safe = self._safe_identifier(name)
             symbol = StubSymbol(
                 name=name,
+                kind="function",
                 return_type=self._clean_return_type(rtype),
                 params=self._definition_params(params),
                 reason=reason,
@@ -735,6 +750,29 @@ class StubHarnessEngine:
                 header_include=header_include,
                 call_count_name=f"TestingMate_{safe}_CallCount",
                 return_control_name=f"TestingMate_SetStubReturn_{safe}",
+            )
+            symbols.append(symbol)
+
+        for name in sorted(self._referenced_globals(functions, code_database)):
+            if name in defined_globals or name in C_KEYWORDS or name.startswith("__"):
+                continue
+            declaration = global_declarations.get(name)
+            if declaration is None:
+                continue
+            symbol = StubSymbol(
+                name=name,
+                kind="global",
+                return_type=self._clean_variable_type(declaration.ctype),
+                params="",
+                array_suffix=declaration.array_suffix,
+                reason=f"global reference declared in header {Path(declaration.header_path).name}",
+                source=declaration.header_path or str(source),
+                from_prototype=True,
+                prototype=declaration.declaration,
+                header_path=declaration.header_path,
+                header_include=declaration.header_include,
+                call_count_name="",
+                return_control_name="",
             )
             symbols.append(symbol)
         return symbols
@@ -820,6 +858,30 @@ class StubHarnessEngine:
                 calls.add(match.group(1))
         return calls
 
+    @staticmethod
+    def _referenced_globals(functions: list[FunctionInfo], code_database: CodeDatabase | None) -> set[str]:
+        globals_: set[str] = set()
+        if code_database is not None:
+            for record in code_database.functions:
+                globals_.update(item.split(".", 1)[0] for item in record.globals_read)
+                globals_.update(item.split(".", 1)[0] for item in record.globals_written)
+        local_names = {local for fn in functions for local in StubHarnessEngine._local_variable_names(fn)}
+        param_names = {param.name for fn in functions for param in fn.parameters}
+        call_names = {name for fn in functions for name in StubHarnessEngine._calls_in_body(fn)}
+        function_names = {fn.name for fn in functions}
+        for fn in functions:
+            body = StubHarnessEngine._strip_comments_and_strings(fn.body)
+            for name in re.findall(r"\b[A-Za-z_]\w*\b", body):
+                if name in C_KEYWORDS or name in local_names or name in param_names or name in call_names or name in function_names:
+                    continue
+                globals_.add(name)
+        return globals_
+
+    @staticmethod
+    def _calls_in_body(fn: FunctionInfo) -> set[str]:
+        body = StubHarnessEngine._strip_comments_and_strings(fn.body)
+        return {match.group(1) for match in StubHarnessEngine.call_pattern.finditer(body)}
+
     def _case_harness_calls(self, cases: list[TestCase]) -> set[str]:
         calls: set[str] = set()
         for case in cases:
@@ -849,6 +911,35 @@ class StubHarnessEngine:
             text = self._strip_comments_and_strings(text)
             result.update(match.group(1) for match in self.function_definition_pattern.finditer(text))
         return result
+
+    def _defined_global_names(self, unit_sources: list[Path]) -> set[str]:
+        result: set[str] = set()
+        for source in unit_sources:
+            if source.suffix.lower() not in C_SOURCE_EXTENSIONS:
+                continue
+            try:
+                text = source.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            sanitized = self._strip_comments_and_strings(text)
+            sanitized = re.sub(r"^\s*#.*$", "", sanitized, flags=re.MULTILINE)
+            for statement in self._iter_top_level_statements(sanitized):
+                name = self._parse_global_name_statement(statement)
+                if name:
+                    result.add(name)
+        return result
+
+    @staticmethod
+    def _local_variable_names(fn: FunctionInfo) -> set[str]:
+        names: set[str] = set()
+        declaration = re.compile(
+            r"\b(?:const\s+|volatile\s+|static\s+|unsigned\s+|signed\s+|long\s+|short\s+|struct\s+\w+\s+|enum\s+\w+\s+|union\s+\w+\s+|"
+            r"char\s+|int\s+|float\s+|double\s+|bool\s+|uint\d+_t\s+|int\d+_t\s+|size_t\s+|[A-Za-z_]\w+_t\s+)+"
+            r"[*\s]*([A-Za-z_]\w*)\s*(?:=|;|,|\[)"
+        )
+        for match in declaration.finditer(StubHarnessEngine._strip_comments_and_strings(fn.body)):
+            names.add(match.group(1))
+        return names
 
     @staticmethod
     def _analysis_sources_from_database(code_database: CodeDatabase | None) -> list[Path]:
@@ -890,6 +981,33 @@ class StubHarnessEngine:
             for proto in self._parse_header_prototypes(text, path, include_dirs, source.parent):
                 if proto.name not in result and not self._should_ignore_call(proto.name):
                     result[proto.name] = proto
+        return result
+
+    def _global_declaration_map(
+        self,
+        source: Path,
+        unit_sources: list[Path],
+        include_dirs: list[Path],
+    ) -> dict[str, HeaderGlobal]:
+        candidates = self._prototype_candidate_files(source, unit_sources, include_dirs)
+        result: dict[str, HeaderGlobal] = {}
+        seen: set[Path] = set()
+
+        for path in candidates[:1000]:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved in seen or not resolved.exists() or not resolved.is_file():
+                continue
+            seen.add(resolved)
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for declaration in self._parse_header_globals(text, path, include_dirs, source.parent):
+                if declaration.name not in result:
+                    result[declaration.name] = declaration
         return result
 
     def _prototype_candidate_files(
@@ -947,6 +1065,26 @@ class StubHarnessEngine:
             prototypes.append(proto)
         return prototypes
 
+    def _parse_header_globals(
+        self,
+        text: str,
+        path: Path,
+        include_dirs: list[Path],
+        source_parent: Path,
+    ) -> list[HeaderGlobal]:
+        sanitized = self._strip_comments_and_strings(text)
+        sanitized = re.sub(r"^\s*#.*$", "", sanitized, flags=re.MULTILINE)
+
+        globals_: list[HeaderGlobal] = []
+        for statement in self._iter_top_level_statements(sanitized):
+            declaration = self._parse_global_declaration_statement(statement)
+            if declaration is None:
+                continue
+            declaration.header_path = str(path)
+            declaration.header_include = self._header_include_name(path, include_dirs, source_parent)
+            globals_.append(declaration)
+        return globals_
+
     @staticmethod
     def _iter_top_level_statements(text: str) -> list[str]:
         statements: list[str] = []
@@ -975,6 +1113,52 @@ class StubHarnessEngine:
                 current = []
 
         return statements
+
+    def _parse_global_declaration_statement(self, statement: str) -> HeaderGlobal | None:
+        stmt = " ".join(statement.strip().rstrip(";").split())
+        if not stmt or "(" in stmt and not re.search(r"\b(?:VAR|CONST|P2VAR|P2CONST)\s*\(", stmt):
+            return None
+        if re.search(r"\btypedef\b", stmt) or "{" in stmt or "}" in stmt:
+            return None
+        if "=" in stmt:
+            return None
+        if "extern" not in stmt and not re.match(r"^(?:VAR|CONST|P2VAR|P2CONST)\s*\(", stmt):
+            return None
+
+        stmt = re.sub(r"\b__attribute__\s*\(\(.*?\)\)", "", stmt).strip()
+        var_match = re.match(
+            r"(?P<ctype>.+?(?:\*|\s))(?P<name>[A-Za-z_]\w*)\s*(?P<array>(?:\[[^\]]*\]\s*)*)$",
+            stmt,
+        )
+        if not var_match:
+            return None
+        name = var_match.group("name")
+        if name in C_KEYWORDS:
+            return None
+        ctype = self._clean_variable_type(var_match.group("ctype"))
+        if not ctype:
+            return None
+        return HeaderGlobal(
+            name=name,
+            ctype=ctype,
+            declaration=stmt + ";",
+            array_suffix="".join((var_match.group("array") or "").split()),
+        )
+
+    @staticmethod
+    def _parse_global_name_statement(statement: str) -> str:
+        stmt = " ".join(statement.strip().rstrip(";").split())
+        if not stmt or "(" in stmt or re.search(r"\b(?:typedef|extern)\b", stmt):
+            return ""
+        stmt = stmt.split("=", 1)[0].strip()
+        var_match = re.match(
+            r"(?P<ctype>.+?(?:\*|\s))(?P<name>[A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*$",
+            stmt,
+        )
+        if not var_match:
+            return ""
+        name = var_match.group("name")
+        return "" if name in C_KEYWORDS else name
 
     def _parse_prototype_statement(self, statement: str) -> HeaderPrototype | None:
         stmt = " ".join(statement.strip().rstrip(";").split())
@@ -1106,6 +1290,14 @@ class StubHarnessEngine:
             return "\n".join(lines)
 
         for symbol in symbols:
+            if symbol.kind != "global":
+                continue
+            lines.append(self._global_definition_line(symbol))
+            lines.append("")
+
+        for symbol in symbols:
+            if symbol.kind != "function":
+                continue
             safe = self._safe_identifier(symbol.name)
             params = symbol.params or "void"
             definition_prefix = self._definition_return_prefix(symbol.return_type)
@@ -1143,6 +1335,8 @@ class StubHarnessEngine:
             "void TestingMate_StubsPresent(void);",
         ]
         for symbol in symbols:
+            if symbol.kind != "function":
+                continue
             lines.append(f"unsigned {symbol.call_count_name}(void);")
             lines.append(f"void {symbol.return_control_name}(long long value);")
             if not symbol.from_prototype:
@@ -1190,14 +1384,15 @@ class StubHarnessEngine:
             "",
         ]
         if not symbols:
-            lines.append("No external function calls were discovered.")
+            lines.append("No external function or header-declared global references were discovered.")
         else:
-            lines.append("| Symbol | Return | Params | Header | Reason | Call-count accessor |")
-            lines.append("|---|---|---|---|---|---|")
+            lines.append("| Symbol | Kind | Type/Return | Params | Header | Reason | Call-count accessor |")
+            lines.append("|---|---|---|---|---|---|---|")
             for symbol in symbols:
                 header = symbol.header_include or "fallback"
+                accessor = f"`{symbol.call_count_name}()`" if symbol.call_count_name else ""
                 lines.append(
-                    f"| `{symbol.name}` | `{symbol.return_type}` | `{symbol.params}` | `{header}` | {symbol.reason} | `{symbol.call_count_name}()` |"
+                    f"| `{symbol.name}` | `{symbol.kind}` | `{symbol.return_type}` | `{symbol.params}` | `{header}` | {symbol.reason} | {accessor} |"
                 )
         lines.append("")
         return "\n".join(lines)
@@ -1341,6 +1536,24 @@ class StubHarnessEngine:
         return clean or "int"
 
     @staticmethod
+    def _global_definition_line(symbol: StubSymbol) -> str:
+        ctype = StubHarnessEngine._clean_variable_type(symbol.return_type)
+        suffix = symbol.array_suffix or ""
+        initializer = StubHarnessEngine._global_initializer(ctype, suffix)
+        return f"TESTING_MATE_WEAK {ctype} {symbol.name}{suffix} = {initializer};"
+
+    @staticmethod
+    def _global_initializer(ctype: str, suffix: str = "") -> str:
+        lowered = ctype.lower()
+        if suffix or lowered.startswith("struct ") or lowered.startswith("union "):
+            return "{0}"
+        if "*" in ctype:
+            return "0"
+        if "bool" in lowered or "boolean" in lowered:
+            return "0"
+        return "0"
+
+    @staticmethod
     def _actual_return_type(return_type: str) -> str:
         clean = " ".join((return_type or "int").split()).strip()
         func_match = re.match(r"FUNC\s*\(\s*([^,]+)\s*,", clean)
@@ -1432,6 +1645,13 @@ class StubHarnessEngine:
     @staticmethod
     def _clean_return_type(return_type: str) -> str:
         clean = " ".join((return_type or "int").replace("\n", " ").split()).strip()
+        clean = re.sub(r"\b(extern|static|inline|__inline|__inline__)\b", "", clean)
+        clean = " ".join(clean.split()).strip()
+        return clean or "int"
+
+    @staticmethod
+    def _clean_variable_type(ctype: str) -> str:
+        clean = " ".join((ctype or "int").replace("\n", " ").split()).strip()
         clean = re.sub(r"\b(extern|static|inline|__inline|__inline__)\b", "", clean)
         clean = " ".join(clean.split()).strip()
         return clean or "int"

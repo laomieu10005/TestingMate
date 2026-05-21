@@ -8,7 +8,7 @@ DEFAULT_COMPILER = "gcc"
 # - oracle: Generate expected values (C-literal/enum/cast) for test oracles  
 # - negative: Generate negative/security test cases (robustness/boundary/invalid-enum)
 # - compliance: Generate compliance-specific test cases (ISO 26262/21434)
-DEFAULT_LLM_STAGES = ["coverage_gap", "oracle", "negative"]
+DEFAULT_LLM_STAGES = ["coverage_gap"]
 
 # Source input support. C++ is accepted as experimental by the current regex analyzer;
 # use compile_commands.json or clang integration for production-grade C++ parsing.

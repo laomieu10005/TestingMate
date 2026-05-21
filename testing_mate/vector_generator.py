@@ -11,6 +11,9 @@ from testing_mate.models import Condition, FunctionInfo, Parameter, TestCase
 
 # Maximum vectors to generate per function to prevent explosion
 MAX_VECTORS_PER_FUNCTION = 512
+SIMPLE_CONDITION_LIMIT = 1
+SIMPLE_PARAMETER_LIMIT = 3
+MODERATE_CONDITION_LIMIT = 10
 
 
 class TestVectorGenerator:
@@ -431,10 +434,50 @@ class TestVectorGenerator:
         }
 
     def _vectors_for(self, fn: FunctionInfo, coverage: str) -> list[dict[str, str]]:
+        complexity = self._function_complexity(fn)
+        if complexity == "SIMPLE":
+            return self._simple_vectors_for(fn, coverage)[:MAX_VECTORS_PER_FUNCTION]
+        if complexity == "MODERATE":
+            return self._moderate_vectors_for(fn, coverage)[:MAX_VECTORS_PER_FUNCTION]
+        return self._deep_vectors_for(fn, coverage)[:MAX_VECTORS_PER_FUNCTION]
+
+    @staticmethod
+    def _function_complexity(fn: FunctionInfo) -> str:
+        if len(fn.conditions) <= SIMPLE_CONDITION_LIMIT and len(fn.parameters) <= SIMPLE_PARAMETER_LIMIT:
+            return "SIMPLE"
+        if len(fn.conditions) <= MODERATE_CONDITION_LIMIT:
+            return "MODERATE"
+        return "COMPLEX"
+
+    def _base_vector_for(self, fn: FunctionInfo) -> dict[str, str]:
         params = fn.parameters
         base = {param.name: self._nominal_value(param) for param in params}
         base.update(self._pointer_field_defaults(fn))
         base.update(self._database_pointer_defaults(fn))
+        return base
+
+    def _simple_vectors_for(self, fn: FunctionInfo, coverage: str) -> list[dict[str, str]]:
+        params = fn.parameters
+        base = self._base_vector_for(fn)
+        vectors: list[dict[str, str]] = []
+        self._append_unique(vectors, base)
+        if coverage in {"C0/C1", "C1"}:
+            for condition in fn.conditions[:1]:
+                for vec in self._condition_vectors(params, condition, coverage):
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
+        if coverage == "MC/DC":
+            for condition in fn.conditions[:1]:
+                for vec in self._mcdc_pair_vectors(params, condition):
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
+        return vectors
+
+    def _moderate_vectors_for(self, fn: FunctionInfo, coverage: str) -> list[dict[str, str]]:
+        params = fn.parameters
+        base = self._base_vector_for(fn)
         vectors: list[dict[str, str]] = []
         self._append_unique(vectors, base)
         for vec in self._database_execution_path_vectors(fn, base):
@@ -443,33 +486,40 @@ class TestVectorGenerator:
             self._append_unique(vectors, vec)
         for vec in self._path_optimized_vectors(fn, base):
             self._append_unique(vectors, vec)
-        if coverage in {"C0/C1", "C1", "MC/DC"}:
+        for vec in self._boundary_vectors(fn, [base])[:16]:
+            self._append_unique(vectors, vec)
+        for vec in self._equivalence_vectors(fn, [base])[:16]:
+            self._append_unique(vectors, vec)
+        if coverage in {"C0/C1", "C1"}:
             for condition in fn.conditions:
                 for vec in self._condition_vectors(params, condition, coverage):
-                    self._append_unique(vectors, vec)
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
+        return vectors
+
+    def _deep_vectors_for(self, fn: FunctionInfo, coverage: str) -> list[dict[str, str]]:
+        params = fn.parameters
+        base = self._base_vector_for(fn)
+        vectors = self._moderate_vectors_for(fn, coverage)
         if coverage == "MC/DC":
             for condition in fn.conditions:
                 for vec in self._mcdc_pair_vectors(params, condition):
-                    self._append_unique(vectors, vec)
-            for param in params:
-                for value in self._interesting_values(param):
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
+            for param in params[:8]:
+                values = self._interesting_values(param)
+                for value in (values[:2] + values[-2:]):
                     vec = dict(base)
                     vec[param.name] = value
                     self._append_unique(vectors, vec)
-            for left_index, left in enumerate(params):
-                for right in params[left_index + 1 :]:
-                    for left_value in self._interesting_values(left)[:5]:
-                        for right_value in self._interesting_values(right)[:5]:
-                            vec = dict(base)
-                            vec[left.name] = left_value
-                            vec[right.name] = right_value
-                            self._append_unique(vectors, vec)
             for field_key, values in self._pointer_field_values(fn).items():
-                for value in values:
+                for value in (values[:2] + values[-2:]):
                     vec = dict(base)
                     vec[field_key] = value
                     self._append_unique(vectors, vec)
-        return vectors[:MAX_VECTORS_PER_FUNCTION]
+        return vectors
 
     def _record_for(self, fn: FunctionInfo) -> CodeFunctionRecord | None:
         return self._code_records.get(fn.name)
@@ -628,20 +678,67 @@ class TestVectorGenerator:
         if not decisions:
             return []
         engine = BooleanExpressionEvaluator()
-        result: list[tuple[bool, ...]] = []
-        count = 1 << len(decisions)
-        for mask in range(count):
-            left = tuple(bool(mask & (1 << index)) for index in range(len(decisions)))
+        result = TestVectorGenerator._direct_mcdc_pair(condition_text, decisions, target_index, engine)
+        if result:
+            return result
+
+        for left in TestVectorGenerator._mcdc_candidate_contexts(len(decisions), target_index):
             right_list = list(left)
             right_list[target_index] = not right_list[target_index]
             right = tuple(right_list)
             if engine.combine(condition_text, decisions, list(left)) == engine.combine(condition_text, decisions, list(right)):
                 continue
-            if left not in result:
-                result.append(left)
-            if right not in result:
-                result.append(right)
-        return result[:4]
+            return [left, right]
+        return []
+
+    @staticmethod
+    def _direct_mcdc_pair(
+        condition_text: str,
+        decisions: list[str],
+        target_index: int,
+        engine: BooleanExpressionEvaluator,
+    ) -> list[tuple[bool, ...]]:
+        clean = re.sub(r"\([^()]*\)", "", condition_text)
+        if "||" not in clean and "&&" in clean:
+            left = tuple(index != target_index for index in range(len(decisions)))
+            right = tuple(True for _ in decisions)
+        elif "&&" not in clean and "||" in clean:
+            left = tuple(False for _ in decisions)
+            right = tuple(index == target_index for index in range(len(decisions)))
+        else:
+            return []
+        if engine.combine(condition_text, decisions, list(left)) == engine.combine(condition_text, decisions, list(right)):
+            return []
+        return [left, right]
+
+    @staticmethod
+    def _mcdc_candidate_contexts(count: int, target_index: int) -> list[tuple[bool, ...]]:
+        candidates: list[tuple[bool, ...]] = []
+
+        def add(values: list[bool]) -> None:
+            values[target_index] = False
+            item = tuple(values)
+            if item not in candidates:
+                candidates.append(item)
+
+        add([False] * count)
+        add([True] * count)
+        for index in range(count):
+            if index == target_index:
+                continue
+            values = [False] * count
+            values[index] = True
+            add(values)
+        for index in range(count):
+            if index == target_index:
+                continue
+            values = [True] * count
+            values[index] = False
+            add(values)
+        for split in range(count + 1):
+            add([index < split for index in range(count)])
+            add([index >= split for index in range(count)])
+        return candidates
 
     @staticmethod
     def _nominal_value(param: Parameter) -> str:

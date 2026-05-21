@@ -5,6 +5,8 @@ import html
 import json
 import os
 import re
+import socket
+import subprocess
 import threading
 import urllib.error
 import urllib.request
@@ -428,13 +430,47 @@ class CoverageGapPlanner:
 
 
 class OllamaClient:
-    def __init__(self, model: str = "qwen2.5-coder:3b", host: str = "http://localhost:11434", timeout: int = 120):
+    def __init__(self, model: str = "qwen2.5-coder:3b", host: str = "http://localhost:11434", timeout: int | None = None):
         self.model = model.strip() or "qwen2.5-coder:3b"
-        self.host = host.rstrip("/")
-        self.timeout = timeout
+        self.host = os.environ.get("TESTMATE_OLLAMA_HOST", host).rstrip("/")
+        self.timeout = self._env_int("TESTMATE_OLLAMA_TIMEOUT", timeout if timeout is not None else 45, minimum=5)
+        self.num_ctx = self._env_int("TESTMATE_OLLAMA_NUM_CTX", 4096, minimum=1024)
+        self.num_predict = self._env_int("TESTMATE_OLLAMA_NUM_PREDICT", 512, minimum=128)
 
-        os.system(f"ollama pull {self.model} >nul 2>&1")
+        # Do not pull the model automatically on every refine run. Pulling can block for minutes
+        # and looks like an Ollama generation timeout. Enable explicitly only when desired.
+        if self._env_bool("TESTMATE_OLLAMA_AUTO_PULL", False):
+            self._pull_model_once()
 
+    @staticmethod
+    def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+        try:
+            value = int(os.environ.get(name, str(default)))
+        except ValueError:
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        return value
+
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _pull_model_once(self) -> None:
+        try:
+            subprocess.run(
+                ["ollama", "pull", self.model],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=max(self.timeout, 30),
+                check=False,
+            )
+        except Exception:
+            # A failed pull should not prevent a local model that already exists from running.
+            pass
 
     def generate_json(self, prompt: str) -> dict:
         payload = json.dumps(
@@ -443,7 +479,11 @@ class OllamaClient:
                 "prompt": prompt,
                 "stream": False,
                 "format": "json",
-                "options": {"temperature": 0.1, "num_ctx": 8192},
+                "options": {
+                    "temperature": 0.1,
+                    "num_ctx": self.num_ctx,
+                    "num_predict": self.num_predict,
+                },
             }
         ).encode("utf-8")
         request = urllib.request.Request(
@@ -455,6 +495,15 @@ class OllamaClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 body = json.loads(response.read().decode("utf-8", errors="replace"))
+        except (TimeoutError, socket.timeout) as exc:
+            raise RuntimeError(
+                f"Ollama request timed out after {self.timeout}s. "
+                "Use a smaller model, lower TESTMATE_OLLAMA_NUM_CTX/NUM_PREDICT, "
+                "or increase TESTMATE_OLLAMA_TIMEOUT."
+            ) from exc
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"Ollama HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Ollama request failed. Start Ollama and run `ollama pull {self.model}`. Detail: {exc}") from exc
         raw = body.get("response", "")
@@ -1425,15 +1474,15 @@ class ArtifactWriter:
     .metric {{ font-size: 24px; font-weight: 700; margin-top: 6px; line-height: 1.1; color: var(--accent); }}
     .note {{ color: var(--muted); font-size: 12px; line-height: 1.35; margin-top: 6px; overflow-wrap: anywhere; }}
     .table-wrap {{ width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }}
-    table {{ width: 100%; border-collapse: collapse; background: var(--panel); table-layout: fixed; font-size: 12px; }}
-    th, td {{ border-bottom: 1px solid var(--line); border-right: 1px solid var(--line); padding: 7px 8px; text-align: left; vertical-align: top; overflow-wrap: anywhere; word-break: normal; }}
+    table {{ width: 100%; border-collapse: collapse; background: var(--panel); font-size: 12px; }}
+    th, td {{ border-bottom: 1px solid var(--line); border-right: 1px solid var(--line); padding: 7px 8px; text-align: left; vertical-align: top; overflow-wrap: break-word; word-wrap: break-word; word-break: break-word; white-space: normal; max-width: 300px; }}
     th:last-child, td:last-child {{ border-right: 0; }}
     tr:last-child td {{ border-bottom: 0; }}
     th {{ position: sticky; top: 0; z-index: 1; background: var(--head); color: #243044; font-weight: 650; }}
     .obligation-table {{ min-width: 760px; }}
     code, pre {{ font-family: Consolas, monospace; }}
-    code {{ background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 4px; padding: 1px 4px; }}
-    pre {{ white-space: pre-wrap; background: #111827; color: #e5e7eb; padding: 12px; border-radius: 6px; max-height: 280px; overflow: auto; }}
+    code {{ background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 4px; padding: 1px 4px; word-break: break-word; overflow-wrap: break-word; white-space: normal; display: inline-block; max-width: 100%; }}
+    pre {{ white-space: pre-wrap; word-wrap: break-word; overflow-wrap: break-word; background: #111827; color: #e5e7eb; padding: 12px; border-radius: 6px; max-height: 280px; overflow: auto; }}
     .trace-actions {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 8px 0 12px; }}
     .trace-link {{ display: inline-flex; align-items: center; min-height: 34px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; text-decoration: none; color: var(--accent); background: #f8fbff; font-weight: 650; }}
     .lcov-frame {{ width: 100%; height: min(760px, 72vh); border: 1px solid var(--line); border-radius: 6px; background: #fff; }}
@@ -2160,15 +2209,15 @@ class TestingMateApp(tk.Tk):
             ttk.Label(card, text=label, style="MetricLabel.TLabel").pack(anchor="w")
             ttk.Label(card, textvariable=var, style="MetricValue.TLabel").pack(anchor="w", pady=(2, 0))
 
-        ttk.Label(right, text="Generated Test Vectors", style="PanelTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(16, 8))
-        columns = ("test_id", "unit", "function", "coverage", "values")
+        ttk.Label(right, text="Coverage Summary and Feedback", style="PanelTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(16, 8))
+        columns = ("function", "line", "metric", "condition", "status")
         self.tree = ttk.Treeview(right, columns=columns, show="headings")
         for col, title, width in [
-            ("test_id", "Test ID", 180),
-            ("unit", "Unit", 120),
             ("function", "Function", 140),
-            ("coverage", "Coverage", 90),
-            ("values", "Values", 380),
+            ("line", "Line", 60),
+            ("metric", "Metric", 80),
+            ("condition", "Condition / Obligation", 280),
+            ("status", "Coverage Status", 200),
         ]:
             self.tree.heading(col, text=title)
             self.tree.column(col, width=width, stretch=True)
@@ -2346,7 +2395,7 @@ class TestingMateApp(tk.Tk):
         result = Orchestrator(self._append_log).analyze_and_generate(self._orchestrator_options())
         self.generated_paths = result.generated_paths
         self._update_metrics(len(result.functions), sum(len(fn.conditions) for fn in result.functions), len(result.cases))
-        self._populate_tree(result.cases)
+        self._populate_tree(result.functions, result.feedback)
         if result.generated_paths:
             self._append_log("Generated artifacts:")
             for path in result.generated_paths:
@@ -2360,7 +2409,7 @@ class TestingMateApp(tk.Tk):
         result = Orchestrator(self._append_log).refine_from_report(self._orchestrator_options())
         self.generated_paths = result.generated_paths
         self._update_metrics(len(result.functions), sum(len(fn.conditions) for fn in result.functions), len(result.cases))
-        self._populate_tree(result.cases)
+        self._populate_tree(result.functions, result.feedback)
         if result.generated_paths:
             self._append_log("Generated artifacts:")
             for path in result.generated_paths:
@@ -2374,7 +2423,7 @@ class TestingMateApp(tk.Tk):
         result = Orchestrator(self._append_log).rerun_existing(self._orchestrator_options())
         self.generated_paths = result.generated_paths
         self._update_metrics(len(result.functions), sum(len(fn.conditions) for fn in result.functions), len(result.cases))
-        self._populate_tree(result.cases)
+        self._populate_tree(result.functions, result.feedback)
         if result.generated_paths:
             self._append_log("Refreshed reports:")
             for path in result.generated_paths:
@@ -2449,12 +2498,43 @@ class TestingMateApp(tk.Tk):
     def _clear_tree(self) -> None:
         self.after(0, lambda: self.tree.delete(*self.tree.get_children()))
 
-    def _populate_tree(self, cases: list[TestCase]) -> None:
+    def _populate_tree(self, functions: list[FunctionInfo] | None = None, feedback: CoverageFeedback | None = None) -> None:
         def insert() -> None:
             self.tree.delete(*self.tree.get_children())
-            for case in cases:
-                values = ", ".join(f"{k}={v}" for k, v in case.values.items())
-                self.tree.insert("", "end", values=(case.test_id, case.unit, case.function, case.coverage, values))
+            if not functions:
+                return
+            
+            uncovered_items = feedback.uncovered_items if feedback else []
+            
+            # Populate coverage obligations from functions
+            for fn in functions:
+                # Add C0 obligation (statement coverage for function body)
+                status = "Covered" if not any("C0" in item and fn.name in item for item in uncovered_items) else "Uncovered"
+                self.tree.insert("", "end", values=(fn.name, f"{fn.start_line}-{fn.end_line}", "C0", f"Statement coverage ({fn.start_line}-{fn.end_line})", status))
+                
+                # Add C1 and MC/DC obligations (conditions)
+                for i, condition in enumerate(fn.conditions):
+                    c1_status = "Uncovered"
+                    mcdc_status = "Uncovered"
+                    
+                    for item in uncovered_items:
+                        if "C1" in item and str(condition.line) in item:
+                            c1_status = "Uncovered"
+                            break
+                    else:
+                        c1_status = "Covered"
+                    
+                    for item in uncovered_items:
+                        if "MC/DC" in item and str(condition.line) in item:
+                            mcdc_status = "Uncovered"
+                            break
+                    else:
+                        mcdc_status = "Covered"
+                    
+                    # Show C1 condition
+                    self.tree.insert("", "end", values=(fn.name, condition.line, "C1", condition.text, c1_status))
+                    # Show MC/DC condition  
+                    self.tree.insert("", "end", values=(fn.name, condition.line, "MC/DC", condition.text, mcdc_status))
 
         self.after(0, insert)
 
@@ -2606,10 +2686,10 @@ def refine_with_ollama(
     - oracle: Generate expected output values for test oracles
     - negative: Generate negative/security test cases
     
-    Default stages: coverage_gap,oracle,negative
+    Default stage: coverage_gap. Enable oracle/negative explicitly with TESTMATE_LLM_STAGES if needed.
     """
     # Parse enabled stages from environment variable
-    stages_env = os.environ.get("TESTMATE_LLM_STAGES", "coverage_gap,oracle,negative").strip()
+    stages_env = os.environ.get("TESTMATE_LLM_STAGES", "coverage_gap").strip()
     enabled_stages = {s.strip().lower() for s in stages_env.split(",") if s.strip()}
     
     if require_report and not has_report_evidence(feedback):
@@ -2620,7 +2700,8 @@ def refine_with_ollama(
         client = OllamaClient(model=model)
         refiner = OllamaTestRefiner(client)
         merged = list(cases)
-        for index, fn in enumerate(functions, start=1):
+        max_functions = OllamaClient._env_int("TESTMATE_LLM_MAX_FUNCTIONS", 8, minimum=1)
+        for index, fn in enumerate(functions[:max_functions], start=1):
             try:
                 new_cases, notes = refiner.refine(
                     source.name,
@@ -2639,6 +2720,8 @@ def refine_with_ollama(
             added = merge_cases(merged, new_cases)
             if added:
                 log(f"Ollama generation enhancement {fn.name}: added {added}. {notes[:240]}")
+        if len(functions) > max_functions:
+            log(f"Ollama generation enhancement capped at {max_functions}/{len(functions)} functions. Set TESTMATE_LLM_MAX_FUNCTIONS to increase.")
         return merged
     if feedback_meets_target(feedback, target_percent):
         log(f"Ollama skipped: parsed report already meets target {target_percent:.2f}%.")
@@ -2651,7 +2734,8 @@ def refine_with_ollama(
     # Main coverage-gap refinement stage (if enabled)
     if "coverage_gap" in enabled_stages:
         for iteration in range(1, max_rounds + 1):
-            gaps = planner.plan(feedback, functions, max_gaps=6)
+            max_gaps = OllamaClient._env_int("TESTMATE_LLM_MAX_GAPS", 3, minimum=1)
+            gaps = planner.plan(feedback, functions, max_gaps=max_gaps)
             if not gaps:
                 log("Ollama skipped: no uncovered coverage points were found in the report.")
                 break
@@ -2694,7 +2778,8 @@ def refine_with_ollama(
     if "oracle" in enabled_stages:
         log("Ollama oracle generation: generating expected output values for test oracles...")
         oracle_added = 0
-        for fn in functions:
+        max_functions = OllamaClient._env_int("TESTMATE_LLM_MAX_FUNCTIONS", 8, minimum=1)
+        for fn in functions[:max_functions]:
             if fn.return_type.strip() == "void":
                 continue
             try:
@@ -2713,7 +2798,8 @@ def refine_with_ollama(
     if "negative" in enabled_stages:
         log("Ollama negative test generation: generating security/robustness test cases...")
         negative_added = 0
-        for fn in functions:
+        max_functions = OllamaClient._env_int("TESTMATE_LLM_MAX_FUNCTIONS", 8, minimum=1)
+        for fn in functions[:max_functions]:
             try:
                 negative_cases, notes = refiner.refine_negative(source.name, fn, merged, max_rounds + 2, backend)
             except Exception as exc:
@@ -2759,6 +2845,7 @@ class OrchestratorResult:
     cases: list[TestCase] = field(default_factory=list)
     generated_paths: list[Path] = field(default_factory=list)
     summary_lines: list[str] = field(default_factory=list)
+    feedback: CoverageFeedback | None = None
     exit_code: int = 0
 
 
@@ -2876,6 +2963,8 @@ class Orchestrator:
                     include_static_functions=options.include_static_functions,
                     include_main=options.include_main_function,
                 )
+                if analysis_source != source:
+                    analyzer.apply_original_source_context(functions, source)
                 code_database = CodeDatabase.from_functions(source, analysis_source, functions, analyzer=analyzer.last_analyzer)
                 self._log(f"Code database: {len(code_database.functions)} functions extracted for {source.name}.")
                 if options.include_static_functions and backend in {"CppUTest", "GoogleTest"} and any(fn.return_type.strip().startswith("static") for fn in functions):
@@ -2961,6 +3050,7 @@ class Orchestrator:
 
                 result.functions.extend(functions)
                 result.cases.extend(cases)
+                result.feedback = active_feedback  # Store coverage feedback for GUI display
                 report_items.append(
                     {
                         "source": source,
