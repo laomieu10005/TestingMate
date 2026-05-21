@@ -1287,8 +1287,16 @@ class StubHarnessEngine:
             ]
         )
         if not symbols:
+            lines.extend([
+                "void TestingMate_ResetStubs(void)",
+                "{",
+                "    /* No generated function stubs to reset. */",
+                "}",
+                "",
+            ])
             return "\n".join(lines)
 
+        function_symbols: list[StubSymbol] = []
         for symbol in symbols:
             if symbol.kind != "global":
                 continue
@@ -1298,6 +1306,7 @@ class StubHarnessEngine:
         for symbol in symbols:
             if symbol.kind != "function":
                 continue
+            function_symbols.append(symbol)
             safe = self._safe_identifier(symbol.name)
             params = symbol.params or "void"
             definition_prefix = self._definition_return_prefix(symbol.return_type)
@@ -1321,6 +1330,18 @@ class StubHarnessEngine:
             lines.extend(self._unused_param_lines(params))
             lines.extend(self._return_lines(symbol.return_type, safe))
             lines.extend(["}", ""])
+        lines.extend([
+            "void TestingMate_ResetStubs(void)",
+            "{",
+        ])
+        if function_symbols:
+            for symbol in function_symbols:
+                safe = self._safe_identifier(symbol.name)
+                lines.append(f"    g_TestingMate_{safe}_calls = 0U;")
+                lines.append(f"    g_TestingMate_{safe}_return_value = 0;")
+        else:
+            lines.append("    /* No generated function stubs to reset. */")
+        lines.extend(["}", ""])
         return "\n".join(lines)
 
     def _stub_header(self, symbols: list[StubSymbol]) -> str:
@@ -1333,6 +1354,7 @@ class StubHarnessEngine:
             "#endif",
             "",
             "void TestingMate_StubsPresent(void);",
+            "void TestingMate_ResetStubs(void);",
         ]
         for symbol in symbols:
             if symbol.kind != "function":
