@@ -7,8 +7,10 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Iterable
 
-from testing_mate.c_backend import CAnalyzer
+from testing_mate.analysis import AstCache
+from testing_mate.c_backend import CAnalyzer, attach_fixit_hints, discover_include_dirs_for_source
 from testing_mate.constants import C_KEYWORDS
+from testing_mate.mc_coverage import MCDCAnalyzer
 from testing_mate.models import Condition, FunctionInfo, Parameter
 
 
@@ -30,7 +32,7 @@ class ClangEnhancedAnalyzer:
         log: Callable[[str], None] | None = None,
         preprocessor=None,
     ):
-        self.include_dirs = include_dirs or []
+        self.include_dirs = self._unique_strings(include_dirs or [])
         self.defines = defines or []
         self.compiler = compiler
         self.log = log or (lambda _text: None)
@@ -38,6 +40,7 @@ class ClangEnhancedAnalyzer:
         self.last_analyzer = "unresolved"
         self.preprocessor = preprocessor  # Optional CPreprocessor instance
         self._preprocessed_cache: dict[str, Path] = {}  # Cache preprocessed files
+        self.ast_cache = AstCache()
 
     def analyze(self, source: Path, include_static_functions: bool = False, include_main: bool = False) -> list[FunctionInfo]:
         try:
@@ -63,11 +66,13 @@ class ClangEnhancedAnalyzer:
             self.last_analyzer = "internal_fallback"
             functions = self.fallback.analyze(source_for_analysis, include_static_functions, include_main)
             self._apply_original_source_conditions(functions, original_text)
+            for fn in functions:
+                attach_fixit_hints(fn, source="clang_fallback")
             return functions
 
         try:
             ast = self._load_ast(clang, source_for_analysis)
-            text = source_for_analysis.read_text(encoding="utf-8", errors="replace")
+            text = self.ast_cache.source_text(source_for_analysis)
             enum_types = self.fallback._enum_types(text)
             functions = self._functions_from_ast(ast, source_for_analysis, text, enum_types, include_static_functions, include_main)
             if functions:
@@ -81,6 +86,8 @@ class ClangEnhancedAnalyzer:
         self.last_analyzer = "internal_fallback"
         functions = self.fallback.analyze(source_for_analysis, include_static_functions, include_main)
         self._apply_original_source_conditions(functions, original_text)
+        for fn in functions:
+            attach_fixit_hints(fn, source="clang_fallback")
         return functions
 
     def _apply_original_source_conditions(self, functions: list[FunctionInfo], source_text: str) -> None:
@@ -163,7 +170,33 @@ class ClangEnhancedAnalyzer:
             return
         self._apply_original_source_conditions(functions, source_text)
 
+    @staticmethod
+    def _unique_strings(values: list[str]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            clean = str(value).strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            result.append(clean)
+        return result
+    def _effective_include_dirs(self, source: Path) -> list[str]:
+        return self._unique_strings([*self.include_dirs, *discover_include_dirs_for_source(source)])
+    def _attach_function_metadata(self, fn: FunctionInfo, node: dict, body_node: dict, text: str) -> None:
+        """Preserve AST context and FixItHint-style analysis hints for vector generation."""
+        try:
+            fn.ast_node = node
+            fn.ast_body_node = body_node
+            fn.ast_source_text = text
+        except Exception:
+            pass
+        attach_fixit_hints(fn, source="clang_ast")
     def _load_ast(self, clang: str, source: Path) -> dict:
+        context = "|".join([clang, *self._effective_include_dirs(source), *self.defines])
+        return self.ast_cache.ast_for(source, lambda path: self._load_ast_uncached(clang, path), context)
+
+    def _load_ast_uncached(self, clang: str, source: Path) -> dict:
         # Determine if source is preprocessed based on naming or check if preprocessor was used
         is_preprocessed = ".preprocessed" in source.name or source.parent.name == ".preprocessed"
         
@@ -179,7 +212,7 @@ class ClangEnhancedAnalyzer:
         
         # For preprocessed files, skip include dirs as they are already resolved
         if not is_preprocessed:
-            for include_dir in self.include_dirs:
+            for include_dir in self._effective_include_dirs(source):
                 cmd.extend(["-I", include_dir])
             for define in self.defines:
                 cmd.append("-D" + define)
@@ -249,6 +282,7 @@ class ClangEnhancedAnalyzer:
             fn.conditions = self._conditions_from_ast(body_node, text, start_line)
             if not fn.conditions:
                 fn.conditions = self.fallback._conditions(body, start_line)
+            self._attach_function_metadata(fn, node, body_node, text)
             functions.append(fn)
         return functions
 
@@ -278,9 +312,11 @@ class ClangEnhancedAnalyzer:
             loc = condition_node.get("range", {}).get("begin") if condition_node else node.get("loc")
             line = self._line(loc) or self._line(node.get("range", {}).get("begin")) or function_start_line
             decisions = [
-                self.fallback._strip_wrapping_parentheses(piece.strip())
-                for piece in re.split(r"&&|\|\|", condition_text)
-                if piece.strip()
+                atom.text
+                for atom in MCDCAnalyzer().extract_atomic_conditions(
+                    Condition(text=condition_text, line=line, depth=self._ast_depth(body_node, node))
+                )
+                if atom.text
             ]
             conditions.append(
                 Condition(

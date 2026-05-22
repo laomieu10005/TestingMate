@@ -1,575 +1,3 @@
-# from __future__ import annotations
-
-# from dataclasses import asdict, dataclass, field
-# from pathlib import Path
-# import json
-# import re
-# import shutil
-
-# from testing_mate.constants import C_KEYWORDS, C_SOURCE_EXTENSIONS, HEADER_SOURCE_EXTENSIONS
-# from testing_mate.code_database import CodeDatabase
-# from testing_mate.models import FunctionInfo, TestCase
-
-
-# @dataclass
-# class StubSymbol:
-#     name: str
-#     return_type: str = "int"
-#     params: str = ""
-#     reason: str = "external call"
-#     source: str = "analysis"
-#     from_prototype: bool = False
-#     call_count_name: str = ""
-#     return_control_name: str = ""
-
-
-# @dataclass
-# class StubHarnessResult:
-#     backend: str
-#     stub_symbols: list[StubSymbol] = field(default_factory=list)
-#     generated_paths: list[Path] = field(default_factory=list)
-#     source_files: list[Path] = field(default_factory=list)
-#     header_files: list[Path] = field(default_factory=list)
-
-#     @property
-#     def symbols(self) -> list[str]:
-#         return [symbol.name for symbol in self.stub_symbols]
-
-
-# class StubHarnessEngine:
-#     """Create backend-specific stub harness artifacts for external C dependencies.
-
-#     The engine is intentionally conservative. It generates weak, reviewable stubs for
-#     external function calls that are referenced by the unit under test but not defined
-#     by the selected/auto-linked source files. The stubs unblock quick smoke builds;
-#     expected behavior still belongs in reviewed project-specific mocks.
-#     """
-
-#     call_pattern = re.compile(r"(?<![.#>])\b([A-Za-z_]\w*)\s*\(")
-#     function_definition_pattern = re.compile(
-#         r"(?m)^\s*[A-Za-z_]\w*[\w\s\*]*?(?:\s|\*)([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{"
-#     )
-#     prototype_pattern = re.compile(
-#         r"(?m)^\s*(?:extern\s+)?(?P<rtype>(?:const\s+|volatile\s+|signed\s+|unsigned\s+|long\s+|short\s+|struct\s+|enum\s+|union\s+|[A-Za-z_]\w*\s+|\*)+?)"
-#         r"\s*(?P<name>[A-Za-z_]\w*)\s*\((?P<params>[^;{}]*)\)\s*;"
-#     )
-#     include_pattern = re.compile(r'^\s*#\s*include\s+[<"]([^>"]+)[>"]', re.MULTILINE)
-
-#     ignored_calls = {
-#         *C_KEYWORDS,
-#         "main",
-#         "return",
-#         "sizeof",
-#         "alignof",
-#         "offsetof",
-#         "static_assert",
-#         "assert",
-#         "printf",
-#         "fprintf",
-#         "sprintf",
-#         "snprintf",
-#         "puts",
-#         "putchar",
-#         "memcpy",
-#         "memmove",
-#         "memset",
-#         "memcmp",
-#         "strlen",
-#         "strcmp",
-#         "strncmp",
-#         "strcpy",
-#         "strncpy",
-#         "malloc",
-#         "calloc",
-#         "realloc",
-#         "free",
-#         "abs",
-#         "labs",
-#         "fabs",
-#         "fabsf",
-#         "min",
-#         "max",
-#     }
-
-#     def discover(
-#         self,
-#         source: Path,
-#         functions: list[FunctionInfo],
-#         cases: list[TestCase],
-#         unit_sources: list[Path] | None = None,
-#         include_dirs: list[Path | str] | None = None,
-#         code_database: CodeDatabase | None = None,
-#     ) -> list[StubSymbol]:
-#         unit_sources = unit_sources or [source]
-#         include_dirs = [Path(item).expanduser() for item in (include_dirs or []) if item]
-#         defined = self._defined_function_names([*unit_sources, *self._analysis_sources_from_database(code_database)]) | {fn.name for fn in functions}
-#         if code_database is not None:
-#             defined.update(record.name for record in code_database.functions)
-#         prototypes = self._prototype_map(source, unit_sources, include_dirs)
-#         calls = self._referenced_calls(functions)
-#         calls.update(self._case_harness_calls(cases))
-#         controlled_returns = self._case_stub_return_calls(cases)
-#         calls.update(controlled_returns)
-#         symbols: list[StubSymbol] = []
-#         for name in sorted(calls):
-#             if (name in defined and name not in controlled_returns) or self._should_ignore_call(name):
-#                 continue
-#             rtype, params, from_prototype = prototypes.get(name, ("int", "", False))
-#             safe = self._safe_identifier(name)
-#             symbol = StubSymbol(
-#                 name=name,
-#                 return_type=self._clean_return_type(rtype),
-#                 params=self._definition_params(params),
-#                 reason="external call referenced by target source",
-#                 source=str(source),
-#                 from_prototype=from_prototype,
-#                 call_count_name=f"TestingMate_{safe}_CallCount",
-#                 return_control_name=f"TestingMate_SetStubReturn_{safe}",
-#             )
-#             symbols.append(symbol)
-#         return symbols
-
-#     def write_for_backend(
-#         self,
-#         backend: str,
-#         out_dir: Path,
-#         source: Path,
-#         functions: list[FunctionInfo],
-#         cases: list[TestCase],
-#         unit_sources: list[Path] | None = None,
-#         include_dirs: list[Path | str] | None = None,
-#         code_database: CodeDatabase | None = None,
-#     ) -> StubHarnessResult:
-#         out_dir.mkdir(parents=True, exist_ok=True)
-#         include_dirs_expanded = [Path(item).expanduser() for item in (include_dirs or []) if item]
-#         symbols = self.discover(source, functions, cases, unit_sources, include_dirs_expanded, code_database)
-#         if backend == "CppUTest":
-#             return self._write_cmake_backend("CppUTest", out_dir, source, symbols, include_dirs_expanded)
-#         if backend == "GoogleTest":
-#             return self._write_cmake_backend("GoogleTest", out_dir, source, symbols, include_dirs_expanded)
-#         return StubHarnessResult(backend=backend, stub_symbols=symbols)
-
-#     def _write_cmake_backend(self, backend: str, out_dir: Path, source: Path, symbols: list[StubSymbol], include_dirs: list[Path] | None = None) -> StubHarnessResult:
-#         stub_src_dir = out_dir / "stub" / "src"
-#         stub_include_dir = out_dir / "stub" / "include"
-#         stub_src_dir.mkdir(parents=True, exist_ok=True)
-#         stub_include_dir.mkdir(parents=True, exist_ok=True)
-#         c_path = stub_src_dir / "testing_mate_stubs.c"
-#         h_path = stub_include_dir / "testing_mate_stubs.h"
-#         manifest = stub_src_dir / "testing_mate_stub_manifest.json"
-#         readme = stub_src_dir / "README_Stubs.md"
-#         c_path.write_text(self._stub_c_source(symbols), encoding="utf-8")
-#         h_path.write_text(self._stub_header(symbols), encoding="utf-8")
-#         manifest.write_text(self._manifest_json(backend, source, symbols), encoding="utf-8")
-#         readme.write_text(self._stub_readme(backend, source, symbols), encoding="utf-8")
-        
-#         generated_paths = [c_path, h_path, manifest, readme]
-#         copied_includes = self._recursively_find_and_copy_includes(source, stub_include_dir, include_dirs or [])
-        
-#         return StubHarnessResult(
-#             backend=backend,
-#             stub_symbols=symbols,
-#             generated_paths=[*generated_paths, *copied_includes],
-#             source_files=[c_path],
-#             header_files=[h_path, *copied_includes],
-#         )
-
-#     def _referenced_calls(self, functions: list[FunctionInfo]) -> set[str]:
-#         calls: set[str] = set()
-#         for fn in functions:
-#             body = self._strip_comments_and_strings(fn.body)
-#             for match in self.call_pattern.finditer(body):
-#                 calls.add(match.group(1))
-#         return calls
-
-#     def _case_harness_calls(self, cases: list[TestCase]) -> set[str]:
-#         calls: set[str] = set()
-#         for case in cases:
-#             calls.update(self._case_stub_return_calls([case]))
-#         return calls
-
-#     @staticmethod
-#     def _case_stub_return_calls(cases: list[TestCase]) -> set[str]:
-#         calls: set[str] = set()
-#         for case in cases:
-#             for key in case.values:
-#                 if key.startswith("__stub_return."):
-#                     name = key.split(".", 1)[1]
-#                     if name:
-#                         calls.add(name)
-#         return calls
-
-#     def _defined_function_names(self, unit_sources: list[Path]) -> set[str]:
-#         result: set[str] = set()
-#         for source in unit_sources:
-#             if source.suffix.lower() not in C_SOURCE_EXTENSIONS and source.suffix.lower() not in HEADER_SOURCE_EXTENSIONS:
-#                 continue
-#             try:
-#                 text = source.read_text(encoding="utf-8", errors="replace")
-#             except OSError:
-#                 continue
-#             text = self._strip_comments_and_strings(text)
-#             result.update(match.group(1) for match in self.function_definition_pattern.finditer(text))
-#         return result
-
-#     @staticmethod
-#     def _analysis_sources_from_database(code_database: CodeDatabase | None) -> list[Path]:
-#         if code_database is None:
-#             return []
-#         paths: list[Path] = []
-#         for raw in (code_database.source_path, code_database.analysis_source_path):
-#             if not raw:
-#                 continue
-#             path = Path(raw).expanduser()
-#             if path.exists() and path.is_file():
-#                 paths.append(path)
-#         return paths
-
-#     def _prototype_map(
-#         self,
-#         source: Path,
-#         unit_sources: list[Path],
-#         include_dirs: list[Path],
-#     ) -> dict[str, tuple[str, str, bool]]:
-#         candidates: list[Path] = []
-#         for path in [source, source.with_suffix(".h"), *unit_sources, *(src.with_suffix(".h") for src in unit_sources)]:
-#             if path.exists() and path.is_file():
-#                 candidates.append(path)
-#         for include_dir in include_dirs:
-#             if include_dir.exists() and include_dir.is_dir():
-#                 for suffix in HEADER_SOURCE_EXTENSIONS:
-#                     candidates.extend(include_dir.rglob(f"*{suffix}"))
-#         result: dict[str, tuple[str, str, bool]] = {}
-#         seen: set[Path] = set()
-#         for path in candidates[:300]:
-#             resolved = path.resolve()
-#             if resolved in seen:
-#                 continue
-#             seen.add(resolved)
-#             try:
-#                 text = path.read_text(encoding="utf-8", errors="replace")
-#             except OSError:
-#                 continue
-#             text = self._strip_comments_and_strings(text)
-#             for match in self.prototype_pattern.finditer(text):
-#                 name = match.group("name")
-#                 rtype = match.group("rtype")
-#                 params = match.group("params")
-#                 if self._looks_like_statement_match(rtype, params):
-#                     continue
-#                 if name not in result and not self._should_ignore_call(name):
-#                     result[name] = (rtype, params, True)
-#         return result
-
-#     @staticmethod
-#     def _looks_like_statement_match(return_type: str, params: str) -> bool:
-#         first = (return_type or "").strip().split()[:1]
-#         if first and first[0] in {"return", "case", "if", "while", "for", "switch"}:
-#             return True
-#         for raw in StubHarnessEngine._split_params(params or ""):
-#             item = raw.strip()
-#             if item and re.match(r"[-+]?\d", item):
-#                 return True
-#         return False
-
-#     def _stub_c_source(self, symbols: list[StubSymbol]) -> str:
-#         lines = [
-#             "/* Generated by Testing Mate stub harness engine. */",
-#             "/* Review every stub before using the result as safety evidence. */",
-#             "#include <stddef.h>",
-#             "#include <stdint.h>",
-#             "#include <stdbool.h>",
-#             "",
-#             "#if defined(__GNUC__) || defined(__clang__)",
-#             "#define TESTING_MATE_WEAK __attribute__((weak))",
-#             "#else",
-#             "#define TESTING_MATE_WEAK",
-#             "#endif",
-#             "",
-#         ]
-#         lines.extend([
-#             "void TestingMate_StubsPresent(void)",
-#             "{",
-#             "    /* Link anchor for generated stub harness. */",
-#             "}",
-#             "",
-#         ])
-#         if not symbols:
-#             return "\n".join(lines)
-#         for symbol in symbols:
-#             safe = self._safe_identifier(symbol.name)
-#             params = symbol.params or ""
-#             lines.extend(
-#                 [
-#                     f"static unsigned g_TestingMate_{safe}_calls;",
-#                     f"static long long g_TestingMate_{safe}_return_value;",
-#                     f"unsigned {symbol.call_count_name}(void)",
-#                     "{",
-#                     f"    return g_TestingMate_{safe}_calls;",
-#                     "}",
-#                     f"void {symbol.return_control_name}(long long value)",
-#                     "{",
-#                     f"    g_TestingMate_{safe}_return_value = value;",
-#                     "}",
-#                     f"{symbol.return_type} TESTING_MATE_WEAK {symbol.name}({params})",
-#                     "{",
-#                     f"    ++g_TestingMate_{safe}_calls;",
-#                 ]
-#             )
-#             lines.extend(self._unused_param_lines(params))
-#             lines.extend(self._return_lines(symbol.return_type, safe))
-#             lines.extend(["}", ""])
-#         return "\n".join(lines)
-
-#     def _stub_header(self, symbols: list[StubSymbol]) -> str:
-#         lines = [
-#             "#ifndef TESTING_MATE_STUBS_H",
-#             "#define TESTING_MATE_STUBS_H",
-#             "",
-#             "#ifdef __cplusplus",
-#             "extern \"C\" {",
-#             "#endif",
-#             "",
-#             "void TestingMate_StubsPresent(void);",
-#         ]
-#         for symbol in symbols:
-#             lines.append(f"unsigned {symbol.call_count_name}(void);")
-#             lines.append(f"void {symbol.return_control_name}(long long value);")
-#             if not symbol.from_prototype:
-#                 # Fallback declaration for target C files that call an external symbol
-#                 # without a visible prototype. Known project prototypes are not repeated
-#                 # here to avoid conflicts with typed production headers.
-#                 lines.append("#ifdef __cplusplus")
-#                 lines.append(f"int {symbol.name}(...);")
-#                 lines.append("#else")
-#                 lines.append(f"int {symbol.name}();")
-#                 lines.append("#endif")
-#         lines.extend(
-#             [
-#                 "",
-#                 "#ifdef __cplusplus",
-#                 "}",
-#                 "#endif",
-#                 "",
-#                 "#endif /* TESTING_MATE_STUBS_H */",
-#                 "",
-#             ]
-#         )
-#         return "\n".join(lines)
-
-#     def _manifest_json(self, backend: str, source: Path, symbols: list[StubSymbol]) -> str:
-#         payload = {
-#             "version": "1.0",
-#             "backend": backend,
-#             "source": str(source),
-#             "stub_count": len(symbols),
-#             "symbols": [asdict(symbol) for symbol in symbols],
-#         }
-#         return json.dumps(payload, indent=2)
-
-#     def _stub_readme(self, backend: str, source: Path, symbols: list[StubSymbol]) -> str:
-#         lines = [
-#             "# Testing Mate Stub Harness",
-#             "",
-#             f"- Backend: `{backend}`",
-#             f"- Unit under test: `{source.name}`",
-#             f"- Generated stub count: `{len(symbols)}`",
-#             "",
-#             "The generated stubs are weak build-unblockers. Replace them with reviewed mocks/fakes before claiming test evidence.",
-#             "The main coverage report remains target-only; these stub files are not intended to contribute to unit coverage.",
-#             "",
-#             "## Symbols",
-#             "",
-#         ]
-#         if not symbols:
-#             lines.append("No external function calls were discovered.")
-#         else:
-#             lines.append("| Symbol | Return | Reason | Call-count accessor |")
-#             lines.append("|---|---|---|---|")
-#             for symbol in symbols:
-#                 lines.append(f"| `{symbol.name}` | `{symbol.return_type}` | {symbol.reason} | `{symbol.call_count_name}()` |")
-#         lines.append("")
-#         return "\n".join(lines)
-
-#     def _extract_includes(self, source: Path) -> set[str]:
-#         """Extract all #include directives from source files."""
-#         includes: set[str] = set()
-#         if not source.exists():
-#             return includes
-#         try:
-#             text = source.read_text(encoding="utf-8", errors="replace")
-#         except OSError:
-#             return includes
-#         for match in self.include_pattern.finditer(text):
-#             includes.add(match.group(1))
-#         return includes
-
-#     def _recursively_find_and_copy_includes(
-#         self,
-#         source: Path,
-#         dest_include_dir: Path,
-#         include_dirs: list[Path],
-#     ) -> list[Path]:
-#         """Recursively search include directories for missing includes and copy them.
-        
-#         Returns list of copied include file paths.
-#         """
-#         copied_files: list[Path] = []
-#         if not include_dirs:
-#             return copied_files
-        
-#         # Extract includes from the source file
-#         includes = self._extract_includes(source)
-#         if not includes:
-#             return copied_files
-        
-#         # Track already copied files to avoid duplicates
-#         copied_set: set[str] = set()
-        
-#         # For each include, search recursively in all include directories
-#         for include_name in includes:
-#             if include_name in copied_set:
-#                 continue
-            
-#             # Try to find the include file in the include directories
-#             found = False
-#             for include_dir in include_dirs:
-#                 if not include_dir.exists() or not include_dir.is_dir():
-#                     continue
-                
-#                 # Search recursively for the include file
-#                 for candidate in include_dir.rglob(include_name):
-#                     if candidate.is_file():
-#                         try:
-#                             # Determine destination path preserving relative structure
-#                             rel_path = candidate.relative_to(include_dir)
-#                             dest_file = dest_include_dir / rel_path
-#                             dest_file.parent.mkdir(parents=True, exist_ok=True)
-#                             shutil.copy2(candidate, dest_file)
-#                             copied_files.append(dest_file)
-#                             copied_set.add(include_name)
-#                             found = True
-#                             break
-#                         except (OSError, ValueError) as e:
-#                             continue
-                
-#                 if found:
-#                     break
-        
-#         return copied_files
-
-#     @staticmethod
-#     def _return_lines(return_type: str, safe: str = "") -> list[str]:
-#         clean = " ".join(return_type.replace("TESTING_MATE_WEAK", "").split()).strip()
-#         lowered = clean.lower().replace("const ", "").replace("volatile ", "")
-#         value = f"g_TestingMate_{safe}_return_value" if safe else "0"
-#         if lowered == "void":
-#             return ["    return;"]
-#         if "*" in clean:
-#             return [f"    return ({clean})(intptr_t){value};"]
-#         if lowered.startswith("struct ") or lowered.startswith("union "):
-#             return [f"    return ({clean}){{0}};"]
-#         if any(token in lowered for token in ("bool", "boolean")):
-#             return [f"    return {value} != 0;"]
-#         return [f"    return ({clean}){value};"]
-
-#     @staticmethod
-#     def _unused_param_lines(params: str) -> list[str]:
-#         if not params.strip() or params.strip() == "void":
-#             return []
-#         result = []
-#         for index, raw in enumerate(StubHarnessEngine._split_params(params)):
-#             name = StubHarnessEngine._param_name(raw, index)
-#             if name:
-#                 result.append(f"    (void){name};")
-#         return result
-
-#     @staticmethod
-#     def _definition_params(params: str) -> str:
-#         params = " ".join((params or "").replace("\n", " ").split()).strip()
-#         if not params or params == "void":
-#             return ""
-#         if "..." in params:
-#             return ""
-#         converted: list[str] = []
-#         for index, raw in enumerate(StubHarnessEngine._split_params(params)):
-#             raw = raw.strip()
-#             if not raw:
-#                 continue
-#             if StubHarnessEngine._param_name(raw, index):
-#                 converted.append(raw)
-#             else:
-#                 converted.append(f"{raw} p{index}")
-#         return ", ".join(converted)
-
-#     @staticmethod
-#     def _param_name(param: str, index: int) -> str:
-#         param = param.strip()
-#         if not param or param == "void":
-#             return ""
-#         array_match = re.search(r"\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\])\s*$", param)
-#         if array_match:
-#             return array_match.group(1)
-#         match = re.search(r"(?:\*|\s)([A-Za-z_]\w*)\s*$", param)
-#         if not match:
-#             return ""
-#         name = match.group(1)
-#         if name in {"char", "short", "int", "long", "float", "double", "void", "signed", "unsigned", "const", "volatile", "struct", "enum", "union"}:
-#             return ""
-#         return name
-
-#     @staticmethod
-#     def _split_params(params: str) -> list[str]:
-#         parts: list[str] = []
-#         depth = 0
-#         current: list[str] = []
-#         for ch in params:
-#             if ch in "([{" :
-#                 depth += 1
-#             elif ch in ")]}" :
-#                 depth = max(0, depth - 1)
-#             if ch == "," and depth == 0:
-#                 parts.append("".join(current).strip())
-#                 current = []
-#             else:
-#                 current.append(ch)
-#         tail = "".join(current).strip()
-#         if tail:
-#             parts.append(tail)
-#         return parts
-
-#     @staticmethod
-#     def _clean_return_type(return_type: str) -> str:
-#         clean = " ".join((return_type or "int").replace("\n", " ").split()).strip()
-#         clean = re.sub(r"\b(static|extern|inline|__inline|__inline__)\b", "", clean)
-#         clean = " ".join(clean.split()).strip()
-#         return clean or "int"
-
-#     def _should_ignore_call(self, name: str) -> bool:
-#         if name in self.ignored_calls:
-#             return True
-#         if name.startswith("__"):
-#             return True
-#         # Most all-uppercase function-like tokens are macros/constants, not link symbols.
-#         if name.isupper() and not name.startswith(("RTE_", "Rte_", "DEM_", "Dem_", "COM_", "Com_", "CAN_", "Can_")):
-#             return True
-#         return False
-
-#     @staticmethod
-#     def _safe_identifier(name: str) -> str:
-#         safe = re.sub(r"\W+", "_", name).strip("_")
-#         if not safe or safe[0].isdigit():
-#             safe = "stub_" + safe
-#         return safe
-
-#     @staticmethod
-#     def _strip_comments_and_strings(text: str) -> str:
-#         text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-#         text = re.sub(r"//.*", " ", text)
-#         text = re.sub(r'"(?:\\.|[^"\\])*"', '""', text)
-#         text = re.sub(r"'(?:\\.|[^'\\])*'", "''", text)
-#         return text
-
 
 from __future__ import annotations
 
@@ -608,13 +36,14 @@ class HeaderGlobal:
 class StubSymbol:
     name: str
     kind: str = "function"
-    return_type: str = "int"
+    return_type: str = "uint8"
     params: str = "void"
     array_suffix: str = ""
     reason: str = "external call"
     source: str = "analysis"
     from_prototype: bool = False
     prototype: str = ""
+    emit_declaration: bool = False
     header_path: str = ""
     header_include: str = ""
     call_count_name: str = ""
@@ -638,8 +67,8 @@ class StubHarnessEngine:
     """Create backend-specific stub harness artifacts for external C dependencies.
 
     Stub signatures are resolved from visible C header declarations first. Only when
-    no declaration can be found does the engine fall back to an old-style ``int``
-    declaration. This prevents broken AUTOSAR stubs such as ``int Dem_SetEventStatus()``
+    no declaration can be found does the engine create a generated ``uint8`` fallback
+    declaration. This prevents broken AUTOSAR stubs such as guessed ``int`` declarations
     when the header actually declares ``FUNC(void, DEM_CODE) Dem_SetEventStatus(...)``.
     """
 
@@ -703,12 +132,17 @@ class StubHarnessEngine:
         if code_database is not None:
             defined.update(record.name for record in code_database.functions)
 
-        prototypes = self._prototype_map(source, unit_sources, include_dirs)
-        global_declarations = self._global_declaration_map(source, unit_sources, include_dirs)
+        analysis_sources = self._analysis_sources_from_database(code_database)
+        primary_source_include = self._primary_source_include(source, unit_sources, include_dirs)
+
+        prototypes = self._prototype_map(source, unit_sources, include_dirs, analysis_sources)
+        dependency_prototypes = self._dependency_prototype_map(source, unit_sources, include_dirs)
+        global_declarations = self._global_declaration_map(source, unit_sources, include_dirs, analysis_sources)
+        dependency_globals = self._dependency_global_declaration_map(source, unit_sources, include_dirs)
         defined_globals = self._defined_global_names(unit_sources)
         calls = self._referenced_calls(functions)
         calls.update(self._case_harness_calls(cases))
-        controlled_returns = self._case_stub_return_calls(cases)
+        controlled_returns = self._case_stub_return_calls(cases) | self._function_fixit_stub_return_calls(functions)
         calls.update(controlled_returns)
 
         symbols: list[StubSymbol] = []
@@ -716,25 +150,28 @@ class StubHarnessEngine:
             if (name in defined and name not in controlled_returns) or self._should_ignore_call(name):
                 continue
 
-            proto = prototypes.get(name)
+            proto = prototypes.get(name) or dependency_prototypes.get(name)
             if proto is not None:
                 rtype = proto.return_type
                 params = proto.params
                 from_prototype = True
-                reason = f"external call declared in header {Path(proto.header_path).name}"
+                declaration_source = "header" if self._is_header_path(proto.header_path) else "preprocessed source"
+                reason = f"external call declared in {declaration_source} {Path(proto.header_path).name}"
                 prototype_text = proto.declaration
                 header_path = proto.header_path
-                header_include = proto.header_include
+                header_include = proto.header_include or primary_source_include
                 symbol_source = proto.header_path or str(source)
+                emit_declaration = not self._is_header_path(proto.header_path)
             else:
-                rtype = "int"
-                params = "void"
+                rtype = "uint8"
+                params = "..."
                 from_prototype = False
-                reason = "external call without visible prototype; fallback stub generated"
-                prototype_text = ""
+                reason = "external call without visible header declaration; uint8 fallback stub generated"
+                prototype_text = f"uint8 {name}(...);"
                 header_path = ""
                 header_include = ""
                 symbol_source = str(source)
+                emit_declaration = True
 
             safe = self._safe_identifier(name)
             symbol = StubSymbol(
@@ -746,6 +183,7 @@ class StubHarnessEngine:
                 source=symbol_source,
                 from_prototype=from_prototype,
                 prototype=prototype_text,
+                emit_declaration=emit_declaration,
                 header_path=header_path,
                 header_include=header_include,
                 call_count_name=f"TestingMate_{safe}_CallCount",
@@ -753,7 +191,8 @@ class StubHarnessEngine:
             )
             symbols.append(symbol)
 
-        for name in sorted(self._referenced_globals(functions, code_database)):
+        referenced_globals = self._referenced_globals(functions, code_database) | set(dependency_globals)
+        for name in sorted(referenced_globals):
             if name in defined_globals or name in C_KEYWORDS or name.startswith("__"):
                 continue
             declaration = global_declarations.get(name)
@@ -769,8 +208,9 @@ class StubHarnessEngine:
                 source=declaration.header_path or str(source),
                 from_prototype=True,
                 prototype=declaration.declaration,
+                emit_declaration=not self._is_header_path(declaration.header_path),
                 header_path=declaration.header_path,
-                header_include=declaration.header_include,
+                header_include=declaration.header_include or primary_source_include,
                 call_count_name="",
                 return_control_name="",
             )
@@ -824,7 +264,7 @@ class StubHarnessEngine:
         stub_include_dir.mkdir(parents=True, exist_ok=True)
 
         c_path = stub_src_dir / "testing_mate_stubs.c"
-        h_path = stub_include_dir / "testing_mate_stubs.h"
+        h_path = stub_include_dir / "stubs.h"
         manifest = stub_src_dir / "testing_mate_stub_manifest.json"
         readme = stub_src_dir / "README_Stubs.md"
 
@@ -837,7 +277,7 @@ class StubHarnessEngine:
         )
 
         c_path.write_text(self._stub_c_source(symbols), encoding="utf-8")
-        h_path.write_text(self._stub_header(symbols), encoding="utf-8")
+        h_path.write_text(self._stub_header(symbols, source, unit_sources or [source]), encoding="utf-8")
         manifest.write_text(self._manifest_json(backend, source, symbols), encoding="utf-8")
         readme.write_text(self._stub_readme(backend, source, symbols), encoding="utf-8")
 
@@ -889,6 +329,20 @@ class StubHarnessEngine:
         return calls
 
     @staticmethod
+    def _function_fixit_stub_return_calls(functions: list[FunctionInfo]) -> set[str]:
+        calls: set[str] = set()
+        for fn in functions:
+            for hint in getattr(fn, "fixit_hints", []) or []:
+                if not isinstance(hint, dict):
+                    continue
+                kind = str(hint.get("kind") or "").lower().replace("-", "_")
+                if kind not in {"stub", "stub_return", "mock_return"}:
+                    continue
+                name = str(hint.get("target") or hint.get("name") or hint.get("symbol") or "").strip()
+                if name:
+                    calls.add(name)
+        return calls
+    @staticmethod
     def _case_stub_return_calls(cases: list[TestCase]) -> set[str]:
         calls: set[str] = set()
         for case in cases:
@@ -911,6 +365,66 @@ class StubHarnessEngine:
             text = self._strip_comments_and_strings(text)
             result.update(match.group(1) for match in self.function_definition_pattern.finditer(text))
         return result
+
+    def _dependency_prototype_map(
+        self,
+        source: Path,
+        unit_sources: list[Path],
+        include_dirs: list[Path],
+    ) -> dict[str, HeaderPrototype]:
+        result: dict[str, HeaderPrototype] = {}
+        for path in self._dependency_header_candidates(source, unit_sources, include_dirs):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for proto in self._parse_header_prototypes(text, path, include_dirs, source.parent):
+                if proto.name not in result and not self._should_ignore_call(proto.name):
+                    result[proto.name] = proto
+        return result
+
+    def _dependency_global_declaration_map(
+        self,
+        source: Path,
+        unit_sources: list[Path],
+        include_dirs: list[Path],
+    ) -> dict[str, HeaderGlobal]:
+        result: dict[str, HeaderGlobal] = {}
+        for path in self._dependency_header_candidates(source, unit_sources, include_dirs):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for declaration in self._parse_header_globals(text, path, include_dirs, source.parent):
+                result.setdefault(declaration.name, declaration)
+        return result
+
+    def _dependency_header_candidates(
+        self,
+        source: Path,
+        unit_sources: list[Path],
+        include_dirs: list[Path],
+    ) -> list[Path]:
+        candidates: list[Path] = []
+        for path in [source.with_suffix(".h"), *(src.with_suffix(".h") for src in unit_sources)]:
+            if path.exists() and path.is_file():
+                candidates.append(path)
+        candidates.extend(self._collect_reachable_headers([source, *unit_sources], include_dirs))
+
+        deduped: list[Path] = []
+        seen: set[Path] = set()
+        for path in candidates:
+            if path.suffix.lower() not in HEADER_SOURCE_EXTENSIONS:
+                continue
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            deduped.append(path)
+        return deduped
 
     def _defined_global_names(self, unit_sources: list[Path]) -> set[str]:
         result: set[str] = set()
@@ -946,7 +460,7 @@ class StubHarnessEngine:
         if code_database is None:
             return []
         paths: list[Path] = []
-        for raw in (code_database.source_path, code_database.analysis_source_path):
+        for raw in (code_database.analysis_source_path, code_database.source_path):
             if not raw:
                 continue
             path = Path(raw).expanduser()
@@ -959,8 +473,9 @@ class StubHarnessEngine:
         source: Path,
         unit_sources: list[Path],
         include_dirs: list[Path],
+        declaration_sources: list[Path] | None = None,
     ) -> dict[str, HeaderPrototype]:
-        candidates = self._prototype_candidate_files(source, unit_sources, include_dirs)
+        candidates = [*(declaration_sources or []), *self._prototype_candidate_files(source, unit_sources, include_dirs)]
         result: dict[str, HeaderPrototype] = {}
         seen: set[Path] = set()
 
@@ -988,8 +503,9 @@ class StubHarnessEngine:
         source: Path,
         unit_sources: list[Path],
         include_dirs: list[Path],
+        declaration_sources: list[Path] | None = None,
     ) -> dict[str, HeaderGlobal]:
-        candidates = self._prototype_candidate_files(source, unit_sources, include_dirs)
+        candidates = [*(declaration_sources or []), *self._prototype_candidate_files(source, unit_sources, include_dirs)]
         result: dict[str, HeaderGlobal] = {}
         seen: set[Path] = set()
 
@@ -1061,7 +577,7 @@ class StubHarnessEngine:
             if proto is None:
                 continue
             proto.header_path = str(path)
-            proto.header_include = self._header_include_name(path, include_dirs, source_parent)
+            proto.header_include = self._header_include_name(path, include_dirs, source_parent) if self._is_header_path(path) else ""
             prototypes.append(proto)
         return prototypes
 
@@ -1081,7 +597,7 @@ class StubHarnessEngine:
             if declaration is None:
                 continue
             declaration.header_path = str(path)
-            declaration.header_include = self._header_include_name(path, include_dirs, source_parent)
+            declaration.header_include = self._header_include_name(path, include_dirs, source_parent) if self._is_header_path(path) else ""
             globals_.append(declaration)
         return globals_
 
@@ -1255,25 +771,19 @@ class StubHarnessEngine:
         return False
 
     def _stub_c_source(self, symbols: list[StubSymbol]) -> str:
-        production_includes = []
-        for symbol in symbols:
-            if symbol.header_include and symbol.header_include not in production_includes:
-                production_includes.append(symbol.header_include)
-
         lines = [
             "/* Generated by Testing Mate stub harness engine. */",
             "/* Review every stub before using the result as safety evidence. */",
             "#include <stddef.h>",
             "#include <stdint.h>",
             "#include <stdbool.h>",
-            "#include \"testing_mate_stubs.h\"",
+            "#include \"stubs.h\"",
         ]
-        for header in production_includes:
-            lines.append(f"#include \"{header}\"")
+
         lines.extend(
             [
                 "",
-                "#if defined(__GNUC__) || defined(__clang__)",
+                "#if (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32) && !defined(__MINGW32__)",
                 "#define TESTING_MATE_WEAK __attribute__((weak))",
                 "#else",
                 "#define TESTING_MATE_WEAK",
@@ -1344,28 +854,61 @@ class StubHarnessEngine:
         lines.extend(["}", ""])
         return "\n".join(lines)
 
-    def _stub_header(self, symbols: list[StubSymbol]) -> str:
+    def _stub_header(self, symbols: list[StubSymbol], source: Path, unit_sources: list[Path]) -> str:
+        production_includes: list[str] = []
+        seen_headers: set[str] = set()
+
+        for name, directive in self._collect_source_header_includes(source, unit_sources):
+            if name not in seen_headers:
+                production_includes.append(directive)
+                seen_headers.add(name)
+
+        for symbol in symbols:
+            if symbol.header_include and symbol.header_include not in seen_headers:
+                production_includes.append(f"#include \"{symbol.header_include}\"")
+                seen_headers.add(symbol.header_include)
+    
         lines = [
-            "#ifndef TESTING_MATE_STUBS_H",
-            "#define TESTING_MATE_STUBS_H",
-            "",
-            "#ifdef __cplusplus",
+            "#ifndef STUBS_H",
+            "#define STUBS_H\n",
+            ]
+        
+        for header in production_includes:
+            lines.append(header)
+
+        if production_includes:
+            lines.append("")
+        if any(symbol.kind == "function" and symbol.emit_declaration for symbol in symbols):
+            lines.extend(
+                [
+                    "#include <stdint.h>",
+                    "#include <stdbool.h>",
+                    "",
+                ]
+            )
+        lines.extend(["#ifdef __cplusplus",
             "extern \"C\" {",
             "#endif",
             "",
             "void TestingMate_StubsPresent(void);",
-            "void TestingMate_ResetStubs(void);",
-        ]
+            "void TestingMate_ResetStubs(void);",])
+        
         for symbol in symbols:
+            if symbol.kind == "global":
+                ctype = self._clean_variable_type(symbol.return_type)
+                lines.append(f"extern {ctype} {symbol.name}{symbol.array_suffix};")
+                continue
             if symbol.kind != "function":
                 continue
             lines.append(f"unsigned {symbol.call_count_name}(void);")
             lines.append(f"void {symbol.return_control_name}(long long value);")
-            if not symbol.from_prototype:
+            if symbol.emit_declaration and symbol.from_prototype and symbol.prototype:
+                lines.append(symbol.prototype)
+            elif symbol.emit_declaration:
                 lines.append("#ifdef __cplusplus")
-                lines.append(f"int {symbol.name}(...);")
+                lines.append(f"uint8 {symbol.name}(...);")
                 lines.append("#else")
-                lines.append(f"int {symbol.name}();")
+                lines.append(f"uint8 {symbol.name}();")
                 lines.append("#endif")
         lines.extend(
             [
@@ -1374,7 +917,7 @@ class StubHarnessEngine:
                 "}",
                 "#endif",
                 "",
-                "#endif /* TESTING_MATE_STUBS_H */",
+                "#endif /* STUBS_H */",
                 "",
             ]
         )
@@ -1399,7 +942,9 @@ class StubHarnessEngine:
             f"- Generated stub count: `{len(symbols)}`",
             "",
             "The generated stubs are weak build-unblockers. Replace them with reviewed mocks/fakes before claiming test evidence.",
-            "When a header declaration is available, the stub implementation uses that exact signature shape instead of guessing `int`.",
+            "When a header declaration is available, the stub implementation uses that exact signature shape instead of guessing.",
+            "When a preprocessed analysis source is available, Testing Mate also mines it for external function and variable declarations.",
+            "When no declaration is found, Testing Mate emits a generated `uint8 name(...)` fallback declaration and a buildable C stub.",
             "The main coverage report remains target-only; these stub files are not intended to contribute to unit coverage.",
             "",
             "## Symbols",
@@ -1429,6 +974,33 @@ class StubHarnessEngine:
             return includes
         for match in self.include_pattern.finditer(text):
             includes.add(match.group(2))
+        return includes
+
+    def _extract_include_directives(self, source: Path) -> list[tuple[str, str]]:
+        directives: list[tuple[str, str]] = []
+        if not source.exists():
+            return directives
+        try:
+            text = source.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return directives
+        for match in self.include_pattern.finditer(text):
+            delim = match.group(1)
+            name = match.group(2).strip()
+            close = ">" if delim == "<" else '"'
+            directives.append((name, f"#include {delim}{name}{close}"))
+        return directives
+
+    def _collect_source_header_includes(self, source: Path, unit_sources: list[Path]) -> list[tuple[str, str]]:
+        includes: list[tuple[str, str]] = []
+        seen_headers: set[str] = set()
+        for path in [source, *unit_sources]:
+            if not path.exists() or not path.is_file():
+                continue
+            for name, directive in self._extract_include_directives(path):
+                if name not in seen_headers:
+                    includes.append((name, directive))
+                    seen_headers.add(name)
         return includes
 
     def _collect_reachable_headers(
@@ -1551,6 +1123,30 @@ class StubHarnessEngine:
     @staticmethod
     def _header_include_name(header: Path, include_dirs: list[Path], source_parent: Path) -> str:
         return StubHarnessEngine._header_relative_path(header, include_dirs, source_parent).as_posix()
+
+    @staticmethod
+    def _is_header_path(path: str | Path) -> bool:
+        text = str(path or "")
+        return bool(text) and Path(text).suffix.lower() in HEADER_SOURCE_EXTENSIONS
+
+    def _primary_source_include(self, source: Path, unit_sources: list[Path], include_dirs: list[Path]) -> str:
+        unit_dirs = [item.parent for item in [source, *unit_sources] if item.exists()]
+        for seed in [source, *unit_sources]:
+            if not seed.exists() or not seed.is_file():
+                continue
+            try:
+                text = seed.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for match in self.include_pattern.finditer(text):
+                include_name = match.group(2).strip()
+                resolved = self._resolve_include(include_name, seed, include_dirs, unit_dirs)
+                if resolved is not None and self._is_header_path(resolved):
+                    return include_name.replace("\\", "/")
+        sibling = source.with_suffix(".h")
+        if sibling.exists() and sibling.is_file():
+            return self._header_include_name(sibling, include_dirs, source.parent)
+        return ""
 
     @staticmethod
     def _definition_return_prefix(return_type: str) -> str:

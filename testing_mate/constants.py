@@ -3,11 +3,10 @@ DEFAULT_COMPILER = "gcc"
 
 # LLM Enhancement Stages (environment variable: TESTMATE_LLM_STAGES)
 # Default stages: coverage_gap (existing), oracle (new), negative (new)
-# Can be overridden via env var: coverage_gap,oracle,negative,compliance
+# Can be overridden via env var: coverage_gap,oracle,negative
 # - coverage_gap: Close code coverage gaps detected from report feedback
 # - oracle: Generate expected values (C-literal/enum/cast) for test oracles  
 # - negative: Generate negative/security test cases (robustness/boundary/invalid-enum)
-# - compliance: Generate compliance-specific test cases (ISO 26262/21434)
 DEFAULT_LLM_STAGES = ["coverage_gap"]
 
 # Source input support. C++ is accepted as experimental by the current regex analyzer;
@@ -44,7 +43,7 @@ C_KEYWORDS = {
     "volatile",
 }
 
-DEFAULT_ENHANCEMENT_STAGES = ["coverage_gap", "oracle", "redundancy", "negative", "compliance"]
+DEFAULT_ENHANCEMENT_STAGES = ["coverage_gap", "oracle", "negative"]
 
 ISO_RECOMMENDATIONS: dict[str, dict[str, str]] = {
     "ASIL A": {"1j": "++", "1k": "++", "1l": "+", "1n": "+", "T8a": "++", "T8b": "+", "T8c": "+", "T8d": "+", "C0": "++", "C1": "+", "MC/DC": "+"},
@@ -66,4 +65,20 @@ ISO_EXECUTABLE_METHODS: dict[str, tuple[str, str]] = {
     "C0": ("Table 9", "Statement coverage"),
     "C1": ("Table 9", "Branch coverage"),
     "MC/DC": ("Table 9", "MC/DC"),
+}
+
+
+SCALAR_TOKENS = {
+"void", "char", "signed char", "unsigned char",
+"short", "short int", "signed short", "signed short int", "unsigned short", "unsigned short int",
+"int", "signed", "signed int", "unsigned", "unsigned int",
+"long", "long int", "signed long", "signed long int", "unsigned long", "unsigned long int",
+"long long", "long long int", "signed long long", "signed long long int",
+"unsigned long long", "unsigned long long int",
+"float", "double", "long double", "bool", "_bool",
+"uint8", "uint16", "uint32", "uint64",
+"int8", "int16", "int32", "int64",
+"uint8_t", "uint16_t", "uint32_t", "uint64_t",
+"int8_t", "int16_t", "int32_t", "int64_t",
+"size_t", "ssize_t", "Std_ReturnType", "boolean",
 }

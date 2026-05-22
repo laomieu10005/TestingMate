@@ -440,3 +440,5 @@ class CoverageReportParser:
             if value is None:
                 notes[metric] = f"{metric} was not provided by {source}; Testing Mate will list generated obligations but cannot prove this metric without backend evidence."
         return notes
+
+

@@ -9,6 +9,7 @@ import subprocess
 from testing_mate.constants import C_KEYWORDS, DEFAULT_COMPILER, C_SOURCE_EXTENSIONS, HEADER_SOURCE_EXTENSIONS, SOURCE_EXTENSIONS, EXCLUDED_SOURCE_DIRS
 
 from testing_mate.models import *
+from testing_mate.mc_coverage import MCDCAnalyzer
 from testing_mate.toolchain import toolchain_env
 
 
@@ -61,6 +62,309 @@ def _unique_paths(paths: list[Path]) -> list[Path]:
         seen.add(resolved)
         result.append(resolved)
     return result
+
+
+INCLUDE_FOLDER_NAMES = {"include", "includes", "inc", "header", "headers"}
+
+
+def discover_include_dirs_for_source(source: Path) -> list[str]:
+    """Return source-local include roots for GUI/orchestrator build context.
+
+    Discovery is deliberately small and deterministic:
+    1. the current parent folder of the source file;
+    2. the nearest ancestor that is itself named include/inc/header;
+    3. the nearest include/inc/header child folder while walking upward.
+    """
+    try:
+        source_path = Path(source).expanduser().resolve()
+    except OSError:
+        source_path = Path(source).expanduser()
+    start_dir = source_path.parent if source_path.suffix else source_path
+    candidates: list[Path] = []
+    if start_dir.exists() and start_dir.is_dir():
+        candidates.append(start_dir)
+    current = start_dir
+    visited: set[Path] = set()
+    while current and current not in visited:
+        visited.add(current)
+        if current.exists() and current.is_dir() and current.name.lower() in INCLUDE_FOLDER_NAMES:
+            candidates.append(current)
+            break
+        found_child: Path | None = None
+        for child in current.iterdir() if current.exists() and current.is_dir() else []:
+            if child.is_dir() and child.name.lower() in INCLUDE_FOLDER_NAMES:
+                found_child = child
+                break
+        if found_child is not None:
+            candidates.append(found_child)
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return [str(path) for path in _unique_paths(candidates)]
+
+
+def _unique_strings_for_cbackend(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        clean = str(value).strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        result.append(clean)
+    return result
+
+
+def discover_include_dirs_for_sources(sources: list[Path]) -> list[str]:
+    discovered: list[Path] = []
+    for source in sources:
+        for item in discover_include_dirs_for_source(source):
+            path = Path(item).expanduser()
+            if path.exists() and path.is_dir():
+                discovered.append(path)
+    return [str(path) for path in _unique_paths(discovered)]
+
+
+def _tm_strip_comments_and_strings(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", " ", text or "", flags=re.S)
+    text = re.sub(r"//.*", " ", text)
+    text = re.sub(r'"(?:\\.|[^"\\])*"', '""', text)
+    text = re.sub(r"'(?:\\.|[^'\\])*'", "''", text)
+    return text
+
+
+def _tm_split_top_level_commas(text: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in text or "":
+        if ch in "([{" :
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _tm_cpp_literal(value: str) -> str:
+    value = (value or "").strip()
+    value = re.sub(r"\s*(?:;|,)$", "", value).strip()
+    value = value.strip("` ")
+    if not value or value.lower() in {"void", "n/a", "na", "none", "unknown", "todo"}:
+        return ""
+    if re.fullmatch(r"[-+]?0[xX][0-9A-Fa-f]+[uUlL]*", value):
+        return value
+    if re.fullmatch(r"[-+]?\d+(?:[uUlL]*)", value):
+        return value
+    if re.fullmatch(r"[-+]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][-+]?\d+)?[fFlL]?", value):
+        return value
+    if value in {"true", "false", "TRUE", "FALSE", "NULL", "nullptr"}:
+        return value
+    if re.fullmatch(r"'.'", value) or re.fullmatch(r"'\\.'", value):
+        return value
+    if re.fullmatch(r"[A-Za-z_]\w*(?:::[A-Za-z_]\w*)?", value):
+        return value
+    return ""
+
+
+def _tm_local_variable_names(body: str) -> set[str]:
+    clean = _tm_strip_comments_and_strings(body)
+    names: set[str] = set()
+    declaration = re.compile(
+        r"\b(?:const\s+|volatile\s+|static\s+|unsigned\s+|signed\s+|long\s+|short\s+|struct\s+\w+\s+|enum\s+\w+\s+|union\s+\w+\s+|"
+        r"char\s+|int\s+|float\s+|double\s+|bool\s+|uint\d+_t\s+|int\d+_t\s+|size_t\s+|[A-Za-z_]\w+_t\s+|[A-Za-z_]\w+\s+)+"
+        r"[*\s]*(?P<decls>[^;]+);"
+    )
+    for match in declaration.finditer(clean):
+        for item in _tm_split_top_level_commas(match.group("decls")):
+            item = item.split("=", 1)[0].strip()
+            name_match = re.search(r"(?:\*\s*)?([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?$", item)
+            if name_match:
+                names.add(name_match.group(1))
+    macro_decl = re.compile(
+        r"\b(?:VAR|CONST|P2VAR|P2CONST|CONSTP2VAR|P2FUNC)\s*\([^;()]*\)\s*"
+        r"(?P<name>[A-Za-z_]\w*)\s*(?:=|;|\[)"
+    )
+    for match in macro_decl.finditer(clean):
+        names.add(match.group("name"))
+    return names
+def _tm_function_internal_local_names(fn) -> set[str]:
+    body = getattr(fn, "body", "") or ""
+    locals_ = set(_tm_local_variable_names(body))
+    clean = _tm_strip_comments_and_strings(body)
+    for match in re.finditer(r"\breturn\s+([A-Za-z_]\w*)\s*;", clean):
+        returned = match.group(1)
+        if returned in locals_ or returned.lower() in {"ret", "retval", "returnvalue", "result", "status"}:
+            locals_.add(returned)
+    return locals_
+def _tm_split_toplevel_statements(text: str) -> list[str]:
+    clean = _tm_strip_comments_and_strings(text or "")
+    clean = re.sub(r"^\s*#.*$", "", clean, flags=re.MULTILINE)
+    result: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in clean:
+        if ch == "{":
+            depth += 1
+            current.clear()
+            continue
+        if ch == "}":
+            depth = max(0, depth - 1)
+            current.clear()
+            continue
+        if depth != 0:
+            continue
+        current.append(ch)
+        if ch == ";":
+            statement = "".join(current).strip()
+            current.clear()
+            if statement:
+                result.append(statement)
+    return result
+def _tm_parse_global_declaration(statement: str) -> tuple[str, str] | None:
+    statement = re.sub(r"\b(?:extern|static|volatile)\b", " ", statement or "").strip()
+    if "(" in statement or not statement.endswith(";"):
+        return None
+    statement = statement[:-1].strip()
+    if "=" in statement:
+        statement = statement.split("=", 1)[0].strip()
+    match = re.match(r"(?P<type>.+?)(?P<ptr>\*\s*)?(?P<name>[A-Za-z_]\w*)\s*(?:\[[^\]]*\])?$", statement)
+    if not match:
+        return None
+    name = match.group("name")
+    ctype = (match.group("type") + (" *" if match.group("ptr") else "")).strip()
+    if not re.fullmatch(r"[A-Za-z_]\w*", name):
+        return None
+    if ctype.split()[:1] and ctype.split()[0] in {"return", "if", "for", "while", "switch", "case", "typedef"}:
+        return None
+    return name, " ".join(ctype.split())
+def _tm_global_variable_type_map(text: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for statement in _tm_split_toplevel_statements(text):
+        parsed = _tm_parse_global_declaration(statement)
+        if parsed:
+            name, ctype = parsed
+            result.setdefault(name, ctype)
+    return result
+def _tm_probably_global_name(name: str) -> bool:
+    return bool(re.match(r"(?:g_|s_|m_|G_|S_|M_|global_|Global|g[A-Z]).+", name or ""))
+def _tm_function_scope_sets(fn) -> tuple[set[str], set[str], set[str]]:
+    params = {getattr(param, "name", "") for param in getattr(fn, "parameters", []) or []}
+    locals_ = _tm_function_internal_local_names(fn)
+    global_types = getattr(fn, "global_variable_types", None) or getattr(fn, "global_symbols", None) or {}
+    if isinstance(global_types, dict):
+        globals_ = set(global_types.keys())
+    elif isinstance(global_types, (set, list, tuple)):
+        globals_ = set(str(item) for item in global_types)
+    else:
+        globals_ = set()
+    return params, locals_, globals_
+
+
+def _tm_is_real_global_symbol(fn, name: str) -> bool:
+    params, locals_, globals_ = _tm_function_scope_sets(fn)
+    return bool(name and name not in params and name not in locals_ and (name in globals_ or _tm_probably_global_name(name)))
+
+
+def _tm_local_assignments(body: str) -> dict[str, str]:
+    clean = _tm_strip_comments_and_strings(body)
+    result: dict[str, str] = {}
+    for match in re.finditer(r"(?<![!<>=])\b([A-Za-z_]\w*)\b\s*=\s*([^;]+);", clean):
+        literal = _tm_cpp_literal(match.group(2))
+        if literal:
+            result[match.group(1)] = literal
+    return result
+
+
+def build_fixit_hints_for_function(fn, source: str = "analysis") -> list[dict[str, str]]:
+    """Create FixItHint-style deterministic test-oracle hints from analyzed C body.
+
+    The hints are conservative. They cover simple, directly observable behavior only:
+    expected return literals, pointer/output assignments, global/state assignments,
+    and basic increments. Vector generation decides which conditional hint applies.
+    """
+    body = getattr(fn, "body", "") or ""
+    clean = _tm_strip_comments_and_strings(body)
+    params = {getattr(param, "name", "") for param in getattr(fn, "parameters", [])}
+    pointer_params = {getattr(param, "name", "") for param in getattr(fn, "parameters", []) if getattr(param, "kind", "") == "pointer"}
+    locals_ = _tm_function_internal_local_names(fn)
+    local_assignments = _tm_local_assignments(body)
+    hints: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    def add(kind: str, target: str, value: str, condition: str = "") -> None:
+        literal = _tm_cpp_literal(value)
+        if not literal or not target:
+            return
+        key = (kind, target, literal, condition)
+        if key in seen:
+            return
+        seen.add(key)
+        item = {"kind": kind, "target": target, "value": literal, "source": source}
+        if condition:
+            item["condition"] = condition.strip()
+        hints.append(item)
+
+    # if (cond) return A; else return B;
+    for match in re.finditer(r"\bif\s*\((?P<cond>[^{};]+)\)\s*return\s+(?P<yes>[^;]+);\s*else\s*return\s+(?P<no>[^;]+);", clean):
+        cond = " ".join(match.group("cond").split())
+        add("expected_return", "return", match.group("yes"), cond)
+        add("expected_return", "return", match.group("no"), f"!({cond})")
+
+    for match in re.finditer(r"\breturn\s+([^;]+);", clean):
+        expr = match.group(1).strip()
+        add("expected_return", "return", local_assignments.get(expr, expr))
+
+    for param in pointer_params:
+        escaped = re.escape(param)
+        for match in re.finditer(rf"\*\s*{escaped}\s*=\s*([^;]+);", clean):
+            add("expected_output", param, match.group(1))
+        for match in re.finditer(rf"\b{escaped}\s*->\s*([A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*)\s*=\s*([^;]+);", clean):
+            field = re.sub(r"\s+", "", match.group(1))
+            add("expected_output", f"{param}.{field}", match.group(2))
+        for match in re.finditer(rf"\b{escaped}\s*\[\s*0\s*\]\s*=\s*([^;]+);", clean):
+            add("expected_output", param, match.group(1))
+
+    ignored = {getattr(fn, "name", ""), *params, *locals_, "return", "sizeof", "true", "false", "NULL", "nullptr"}
+    for match in re.finditer(r"(?<![.>])\b([A-Za-z_]\w*)\b\s*=\s*([^;]+);", clean):
+        name = match.group(1)
+        if name in ignored or name in C_KEYWORDS or not _tm_is_real_global_symbol(fn, name):
+            continue
+        prefix = clean[max(0, match.start(1) - 8):match.start(1)]
+        if re.search(r"(?:->|\.)\s*$", prefix):
+            continue
+        add("expected_global", name, match.group(2))
+    for match in re.finditer(r"(?<![.>])\b([A-Za-z_]\w*)\b\s*(?:\+\+|--)", clean):
+        name = match.group(1)
+        if name not in ignored and name not in C_KEYWORDS and _tm_is_real_global_symbol(fn, name):
+            add("expected_global", name, "1")
+    for match in re.finditer(r"(?:\+\+|--)\s*(?<![.>])\b([A-Za-z_]\w*)\b", clean):
+        name = match.group(1)
+        if name not in ignored and name not in C_KEYWORDS and _tm_is_real_global_symbol(fn, name):
+            add("expected_global", name, "1")
+    return hints
+
+
+def attach_fixit_hints(fn, source: str = "analysis"):
+    hints = build_fixit_hints_for_function(fn, source=source)
+    try:
+        existing = getattr(fn, "fixit_hints", []) or []
+        if isinstance(existing, list):
+            fn.fixit_hints = [*existing, *hints]
+        else:
+            fn.fixit_hints = hints
+    except Exception:
+        pass
+    return fn
 
 
 class ProjectScanner:
@@ -197,7 +501,7 @@ class CompileCommandsDatabase:
 class CPreprocessor:
     def __init__(self, compiler: str = DEFAULT_COMPILER, include_dirs: list[str] | None = None, defines: list[str] | None = None, stub_dir: Path | None = None):
         self.compiler = compiler.strip() or DEFAULT_COMPILER
-        self.include_dirs = include_dirs or []
+        self.include_dirs = _unique_strings_for_cbackend([*(include_dirs or [])])
         self.defines = defines or []
         self.stub_dir = Path(stub_dir).expanduser() if stub_dir else None
         self._preprocess_cache: dict[str, Path] = {}  # Cache by source path
@@ -236,7 +540,7 @@ class CPreprocessor:
         env = toolchain_env()
         
         # Build include directories, prioritizing stub_dir if available
-        include_dirs = self.include_dirs.copy()
+        include_dirs = _unique_strings_for_cbackend([*self.include_dirs, *discover_include_dirs_for_source(source)])
         if self.stub_dir and self.stub_dir.exists():
             stub_include = self.stub_dir / "stub" / "include"
             if stub_include.exists():
@@ -427,6 +731,7 @@ class CAnalyzer:
 
     def analyze(self, source: Path, include_static_functions: bool = False, include_main: bool = False) -> list[FunctionInfo]:
         text = source.read_text(encoding="utf-8", errors="replace")
+        file_global_types = _tm_global_variable_type_map(text)
         enum_types = self._enum_types(text)
         line_starts = self._line_offsets(text)
         functions: list[FunctionInfo] = []
@@ -462,6 +767,9 @@ class CAnalyzer:
                 body=body,
             )
             fn.conditions = self._conditions(body, start_line)
+            fn.global_variable_types = dict(file_global_types)
+            fn.global_symbols = set(file_global_types)
+            attach_fixit_hints(fn, source="c_backend")
             functions.append(fn)
             seen.add((name, start_line))
         for item in self._scan_brace_function_definitions(text, line_starts):
@@ -482,6 +790,9 @@ class CAnalyzer:
                 body=body,
             )
             fn.conditions = self._conditions(body, start_line)
+            fn.global_variable_types = dict(file_global_types)
+            fn.global_symbols = set(file_global_types)
+            attach_fixit_hints(fn, source="c_backend")
             functions.append(fn)
             seen.add(key)
         functions.sort(key=lambda fn: (fn.start_line, fn.name))
@@ -712,13 +1023,13 @@ class CAnalyzer:
             line = start_line + body[: match.start()].count("\n")
             depth = self._block_depth(body, match.start())
             
-            # Split decisions by && and ||, stripping wrapping parentheses from each
             decisions = [
-                self._strip_wrapping_parentheses(piece.strip())
-                for piece in re.split(r"&&|\|\|", expr)
-                if piece.strip()
+                atom.text
+                for atom in MCDCAnalyzer().extract_atomic_conditions(
+                    Condition(text=expr.strip(), line=line, depth=depth)
+                )
+                if atom.text
             ]
-            decisions = [d for d in decisions if d]  # Remove empty decisions
             
             conditions.append(
                 Condition(

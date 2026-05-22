@@ -9,12 +9,13 @@ Implements Step B, C, D of MC/DC evidence collection:
 from __future__ import annotations
 
 import hashlib
-import re
+import re, json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from testing_mate.models import Condition
+from testing_mate.boolean_expression import ConditionEvaluator
 
 
 @dataclass
@@ -75,7 +76,7 @@ class MCDCDecision:
             return None
         total = len(self.atomic_conditions)
         covered = len(self.covered_conditions)
-        return (covered / total) * 100.0 if total > 0 else None
+        return (covered / total) * 100.0 if total > 0 else 100.0
     
     @property
     def uncovered_vectors(self) -> list[ExecutedVector]:
@@ -133,55 +134,17 @@ class MCDCAnalyzer:
     def extract_atomic_conditions(self, decision: Condition) -> list[AtomicCondition]:
         """Extract atomic conditions from a decision statement.
         
-        Splits by && and || operators, preserving order.
+        Uses the shared condition evaluator's atom parser so precedence and
+        nested expressions stay consistent with condition truth checks.
         """
         text = decision.text.strip()
         
         # Handle switch statements specially
         if text.startswith("switch"):
             return [AtomicCondition(0, text, "")]
-        
-        # Split by && and || while preserving operator positions
-        atoms: list[AtomicCondition] = []
-        current_atom = ""
-        paren_depth = 0
-        index = 0
-        operator = ""
-        
-        for i, char in enumerate(text):
-            if char in "({[":
-                paren_depth += 1
-            elif char in ")}]":
-                paren_depth = max(0, paren_depth - 1)
-            
-            if paren_depth == 0 and i + 1 < len(text):
-                # Check for && or ||
-                if char == "&" and text[i + 1] == "&":
-                    if current_atom.strip():
-                        atoms.append(AtomicCondition(index, current_atom.strip(), operator))
-                        index += 1
-                    current_atom = ""
-                    operator = "&&"
-                    continue
-                elif char == "|" and text[i + 1] == "|":
-                    if current_atom.strip():
-                        atoms.append(AtomicCondition(index, current_atom.strip(), operator))
-                        index += 1
-                    current_atom = ""
-                    operator = "||"
-                    continue
-            
-            current_atom += char
-        
-        # Add final atom
-        if current_atom.strip():
-            atoms.append(AtomicCondition(index, current_atom.strip(), operator))
-        
-        # If no atoms extracted, treat whole expression as one
-        if not atoms:
-            atoms.append(AtomicCondition(0, text, ""))
-        
-        return atoms
+
+        atoms = ConditionEvaluator.atoms(text)
+        return [AtomicCondition(index, atom, "") for index, atom in enumerate(atoms or [text])]
     
     def normalize_vectors(self, executed_vectors: list[ExecutedVector]) -> list[ExecutedVector]:
         """Deduplicate and normalize executed vectors.
@@ -343,3 +306,372 @@ class MCDCAnalyzer:
             pass
         
         return []
+
+
+from testing_mate.boolean_expression import BooleanExpressionEvaluator
+from testing_mate.reporter import CoverageReportParser
+from testing_mate.models import CoverageFeedback, FunctionInfo, TestCase
+from testing_mate.vector_generator import TestVectorGenerator
+
+
+class MCDCCoverageEngine:
+    compare_pattern = re.compile(
+        r"^\s*(?P<left>[A-Za-z_]\w*(?:\s*(?:->|\.)\s*[A-Za-z_]\w*)*)\s*"
+        r"(?P<op>==|!=|>=|<=|>|<)\s*"
+        r"(?P<right>[-+]?\d+(?:\.\d+)?[uUlLfF]*|'[^']*'|\"[^\"]*\"|true|false|TRUE|FALSE|[A-Za-z_]\w*(?:\s*(?:->|\.)\s*[A-Za-z_]\w*)*)\s*$"
+    )
+    reverse_compare_pattern = re.compile(
+        r"^\s*(?P<left>[-+]?\d+(?:\.\d+)?[uUlLfF]*|'[^']*'|\"[^\"]*\"|true|false|TRUE|FALSE)\s*"
+        r"(?P<op>==|!=|>=|<=|>|<)\s*"
+        r"(?P<right>[A-Za-z_]\w*(?:\s*(?:->|\.)\s*[A-Za-z_]\w*)*)\s*$"
+    )
+
+    def analyze(self, functions: list[FunctionInfo], cases: list[TestCase], source: str = "generated test vectors") -> CoverageFeedback:
+        case_by_function: dict[str, list[TestCase]] = {}
+        for case in cases:
+            case_by_function.setdefault(case.function, []).append(case)
+
+        total = 0
+        covered = 0
+        uncovered: list[str] = []
+        notes: list[str] = []
+        for fn in functions:
+            fn_cases = case_by_function.get(fn.name, [])
+            if not fn_cases:
+                continue
+            for condition in fn.conditions:
+                decisions = condition.decisions or [condition.text]
+                evaluations = self.evaluations(condition, decisions, fn_cases)
+                for index, decision in enumerate(decisions):
+                    total += 1
+                    pair = self._independence_pair(evaluations, index)
+                    if pair:
+                        covered += 1
+                        notes.append(
+                            f"MC/DC covered {fn.name} line {condition.line} decision `{decision}` by {pair[0].test_id}/{pair[1].test_id}."
+                        )
+                    else:
+                        uncovered.append(
+                            f"Uncovered MC/DC: {fn.name} line {condition.line} decision `{decision}` has no independent-effect pair in generated cases."
+                        )
+        percent = (covered / total) * 100.0 if total else 100.0
+        metric_note = (
+            f"Calculated by Testing Mate from generated vectors: {covered}/{total} atomic conditions have an independent-effect pair."
+            if total
+            else "No branch/condition obligations were discovered; MC/DC is complete by definition."
+        )
+        return CoverageFeedback(
+            source=source,
+            raw_text="\n".join(notes + uncovered)[:12000],
+            coverage_percent=percent,
+            metrics={"C0": None, "C1": None, "MC/DC": percent},
+            metric_notes={"MC/DC": metric_note},
+            uncovered_items=uncovered[:80],
+            failures=[],
+        )
+
+    @staticmethod
+    def merge(feedback: CoverageFeedback, mcdc: CoverageFeedback) -> CoverageFeedback:
+        metrics = dict(feedback.metrics)
+        metric_notes = dict(feedback.metric_notes)
+        use_generated_items = False
+        if metrics.get("MC/DC") is None and mcdc.metrics.get("MC/DC") is not None:
+            metrics["MC/DC"] = mcdc.metrics["MC/DC"]
+            metric_notes["MC/DC"] = mcdc.metric_notes.get("MC/DC", "")
+            use_generated_items = True
+        else:
+            metric_notes.setdefault("MC/DC", mcdc.metric_notes.get("MC/DC", ""))
+        return CoverageFeedback(
+            source=feedback.source if feedback.source != "none" else mcdc.source,
+            raw_text=(feedback.raw_text + ("\n" + mcdc.raw_text if use_generated_items else "")).strip()[:12000],
+            coverage_percent=CoverageReportParser()._best_percent("", metrics),
+            metrics=metrics,
+            metric_notes=metric_notes,
+            uncovered_items=(feedback.uncovered_items + (mcdc.uncovered_items if use_generated_items else []))[:80],
+            failures=feedback.failures,
+        )
+
+    def evaluations(self, condition: Condition, decisions: list[str], cases: list[TestCase]) -> list[tuple[TestCase, list[bool] | None, bool | None]]:
+        result: list[tuple[TestCase, list[bool] | None, bool | None]] = []
+        for case in cases:
+            decision_values = [self._eval_decision(decision, case.values) for decision in decisions]
+            if any(value is None for value in decision_values):
+                result.append((case, None, None))
+                continue
+            bool_values = [bool(value) for value in decision_values]
+            result.append((case, bool_values, self._combine(condition.text, decisions, bool_values)))
+        return result
+
+    def _evaluations(self, condition: Condition, decisions: list[str], cases: list[TestCase]) -> list[tuple[TestCase, list[bool] | None, bool | None]]:
+        return self.evaluations(condition, decisions, cases)
+
+    @staticmethod
+    def _combine(condition_text: str, decisions: list[str], values: list[bool]) -> bool:
+        return BooleanExpressionEvaluator().combine(condition_text, decisions, values)
+
+    @staticmethod
+    def _independence_pair(evaluations: list[tuple[TestCase, list[bool] | None, bool | None]], target_index: int) -> tuple[TestCase, TestCase] | None:
+        valid = [(case, decisions, outcome) for case, decisions, outcome in evaluations if decisions is not None and outcome is not None]
+        for left_index, (left_case, left_decisions, left_outcome) in enumerate(valid):
+            for right_case, right_decisions, right_outcome in valid[left_index + 1 :]:
+                if left_outcome == right_outcome:
+                    continue
+                if left_decisions[target_index] == right_decisions[target_index]:
+                    continue
+                other_same = all(
+                    left_decisions[index] == right_decisions[index]
+                    for index in range(len(left_decisions))
+                    if index != target_index
+                )
+                if other_same:
+                    return left_case, right_case
+        return None
+
+    def _eval_decision(self, decision: str, values: dict[str, str]) -> bool | None:
+        clean = TestVectorGenerator._strip_wrapping_parentheses(decision)
+        return ConditionEvaluator().evaluate(clean, values)
+
+    @staticmethod
+    def _lookup_value(name: str, values: dict[str, str]) -> str | None:
+        key = re.sub(r"\s*(?:->|\.)\s*", ".", name.strip())
+        if key in values:
+            return values[key]
+        suffix = "." + key.split(".", 1)[1] if "." in key else ""
+        if suffix:
+            for existing, value in values.items():
+                if existing.endswith(suffix):
+                    return value
+        return values.get(name.strip())
+
+    def _compare(self, actual_raw: str, expected_raw: str, op: str, values: dict[str, str] | None = None) -> bool | None:
+        actual = self._literal(actual_raw)
+        expected_value = self._resolve_operand(expected_raw, values or {})
+        expected = self._literal(expected_value)
+        if actual is None or expected is None:
+            actual = str(actual_raw).strip()
+            expected = str(expected_value).strip()
+            if op == "==":
+                return actual == expected
+            if op == "!=":
+                return actual != expected
+            return None
+        if op == "==":
+            return actual == expected
+        if op == "!=":
+            return actual != expected
+        if op == ">":
+            return actual > expected
+        if op == "<":
+            return actual < expected
+        if op == ">=":
+            return actual >= expected
+        if op == "<=":
+            return actual <= expected
+        return None
+
+    @classmethod
+    def _resolve_operand(cls, raw: str, values: dict[str, str]) -> str:
+        operand = str(raw).strip().strip("()")
+        if operand in values:
+            return values[operand]
+        lookup = cls._lookup_value(operand, values)
+        if lookup is not None:
+            return lookup
+        mult = re.match(r"^(.+?)\s*\*\s*([-+]?\d+(?:\.\d+)?)$", operand)
+        if mult:
+            left = cls._resolve_operand(mult.group(1), values)
+            parsed = cls._literal(left)
+            if isinstance(parsed, float):
+                return str(parsed * float(mult.group(2)))
+        return operand
+
+    @staticmethod
+    def _literal(raw: str) -> float | str | None:
+        value = str(raw).strip()
+        if value.lower() in {"true", "false"}:
+            return 1.0 if value.lower() == "true" else 0.0
+        if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
+            return float(ord(value[1])) if len(value) >= 3 else 0.0
+        if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+            return value[1:-1]
+        value = re.sub(r"[uUlLfF]+$", "", value)
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _truthy(raw: str) -> bool:
+        parsed = MCDCCoverageEngine._literal(raw)
+        if isinstance(parsed, float):
+            return parsed != 0.0
+        return str(raw).strip() not in {"", "0", "false", "FALSE", "NULL", "nullptr"}
+
+    @staticmethod
+    def _reverse_operator(op: str) -> str:
+        return {">": "<", "<": ">", ">=": "<=", "<=": ">="}.get(op, op)
+
+
+class MCDCCoverageCollector:
+    """Collect and analyze MC/DC evidence from test execution outputs."""
+    
+    def __init__(self, log=None):
+        self.log = log or (lambda _: None)
+        self.analyzer = MCDCAnalyzer(log)
+    
+    def extract_mcdc_from_llvm_json(self, llvm_json_path: Path) -> MCDCReport | None:
+        """Extract MC/DC metrics from llvm-cov export JSON.
+        
+        Parses coverage.llvm.json to build MCDCReport with decision-level coverage.
+        """
+        if not llvm_json_path.exists():
+            return None
+        
+        try:
+            data = json.loads(llvm_json_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.log(f"Failed to parse llvm-cov JSON: {exc}")
+            return None
+        
+        # Extract functions and their MC/DC regions
+        decisions_list = []
+        
+        if isinstance(data, dict):
+            functions = data.get("data", [])
+        elif isinstance(data, list):
+            functions = data
+        else:
+            return None
+        
+        for func_data in functions:
+            if not isinstance(func_data, dict):
+                continue
+            
+            # Process MC/DC regions if available
+            regions = func_data.get("regions", [])
+            for region in regions:
+                # Region format: [line, col, endLine, endCol, count, fileID, expandedFileID, isGapRegion, isBranchRegion, isDecisionRegion]
+                if len(region) < 6:
+                    continue
+                
+                is_decision = len(region) > 9 and region[9]
+                if not is_decision:
+                    continue
+        
+        # Build report from extracted decisions
+        report = MCDCReport(
+            backend_source="clang_native",
+            decisions=decisions_list,
+        )
+        
+        return report if decisions_list else None
+    
+    def extract_mcdc_from_summary(self, summary_path: Path) -> dict[str, float | None]:
+        """Extract MC/DC metrics from llvm-cov report text summary.
+        
+        Parses coverage.summary.txt to extract overall MC/DC percentage.
+        """
+        if not summary_path.exists():
+            return {}
+        
+        metrics: dict[str, float | None] = {
+            "mc_dc": None,
+            "lines": None,
+            "branches": None,
+        }
+        
+        text = summary_path.read_text(encoding="utf-8", errors="replace")
+        
+        # Look for TOTAL line with percentages
+        for line in text.splitlines():
+            if "TOTAL" in line.upper():
+                percentages = [
+                    float(m) for m in re.findall(r"(\d+(?:\.\d+)?)\s*%", line)
+                ]
+                if len(percentages) >= 3:
+                    # Typically: Lines, Branches, MC/DC
+                    metrics["lines"] = percentages[0] if len(percentages) > 0 else None
+                    metrics["branches"] = percentages[1] if len(percentages) > 1 else None
+                    metrics["mc_dc"] = percentages[2] if len(percentages) > 2 else None
+        
+        # Extract MC/DC specific patterns
+        for line in text.splitlines():
+            if "MC/DC" in line or "MCDC" in line:
+                match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+                if match:
+                    metrics["mc_dc"] = float(match.group(1))
+        
+        return metrics
+
+
+
+class IndependencePairSolver:
+    def __init__(self):
+        self.evaluator = BooleanExpressionEvaluator()
+        self._cache: dict[str, list[WitnessPair]] = {}
+
+    def solve(self, decision_text: str, atoms: list[AtomicCondition] | list[str]) -> list[WitnessPair]:
+        atom_names = self._atom_names(atoms)
+        cache_key = f"{decision_text}:{'|'.join(atom_names)}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        pairs = []
+        for target_idx in range(len(atom_names)):
+            pair = self._find_pair(decision_text, atom_names, target_idx)
+            if pair:
+                pairs.append(pair)
+
+        self._cache[cache_key] = pairs
+        return pairs
+
+    def _find_pair(self, decision, atoms, target_idx) -> WitnessPair | None:
+        n = len(atoms)
+        for mask in range(1 << (n - 1)):
+            vals_true = self._build(mask, n, target_idx, True)
+            vals_false = self._build(mask, n, target_idx, False)
+           
+            res_true = self.evaluator.combine(decision, atoms, vals_true)
+            res_false = self.evaluator.combine(decision, atoms, vals_false)
+           
+            if res_true != res_false:
+                return WitnessPair(
+                    changing_condition_index=target_idx,
+                    test1=ExecutedVector(tuple(vals_true), res_true),
+                    test2=ExecutedVector(tuple(vals_false), res_false),
+                )
+        return None
+
+    @staticmethod
+    def _build(mask, n, target_idx, target_val) -> list[bool]:
+        values = []
+        bit = 0
+        for i in range(n):
+            if i == target_idx:
+                values.append(target_val)
+            else:
+                values.append(bool(mask & (1 << bit)))
+                bit += 1
+        return values
+
+    def minimum_vectors(self, decision: str, atoms: list[AtomicCondition] | list[str]) -> list[ExecutedVector]:
+        """Deduplicated minimum vector set for MC/DC (n+1 optimal)."""
+        pairs = self.solve(decision, atoms)
+        seen: set[tuple[bool, ...]] = set()
+        vectors = []
+        for pair in pairs:
+            for vec in (pair.test1, pair.test2):
+                if vec.condition_values not in seen:
+                    seen.add(vec.condition_values)
+                    vectors.append(vec)
+        return vectors
+
+    @staticmethod
+    def _atom_names(atoms: list[AtomicCondition] | list[str]) -> list[str]:
+        names: list[str] = []
+        for index, atom in enumerate(atoms):
+            if isinstance(atom, AtomicCondition):
+                names.append(f"D{atom.index}")
+            else:
+                names.append(str(atom) or f"D{index}")
+        return names

@@ -6,8 +6,9 @@ from pathlib import Path
 from testing_mate.boolean_expression import BooleanExpressionEvaluator
 from testing_mate.code_database import CodeDatabase, CodeFunctionRecord
 from testing_mate.constants import C_KEYWORDS
-from testing_mate.generation_workflow import TestGenerationWorkflow, VerificationObjective
+from testing_mate.generation_workflow import ClassificationResult, Complexity, TestGenerationWorkflow, VerificationObjective, classify
 from testing_mate.models import Condition, FunctionInfo, Parameter, TestCase
+from testing_mate.boolean_expression import ConditionEvaluator
 
 # Maximum vectors to generate per function to prevent explosion
 MAX_VECTORS_PER_FUNCTION = 512
@@ -318,6 +319,283 @@ class TestVectorGenerator:
             self._append_unique(vectors, vec)
         return vectors
 
+
+    @staticmethod
+    def _metadata_items(obj) -> list:
+        items: list = []
+        for attr in (
+            "fixit_hints", "fixits", "fix_it_hints", "fixItHints", "fixit",
+            "hints", "test_hints", "generation_hints", "expected_hints", "analysis_hints",
+        ):
+            value = getattr(obj, attr, None)
+            if isinstance(value, list):
+                items.extend(value)
+            elif value:
+                items.append(value)
+        metadata = getattr(obj, "metadata", None)
+        if isinstance(metadata, dict):
+            for key in ("fixit_hints", "generation_hints", "expected_hints", "analysis_hints"):
+                value = metadata.get(key)
+                if isinstance(value, list):
+                    items.extend(value)
+                elif value:
+                    items.append(value)
+        return items
+
+    @classmethod
+    def _fixit_hints_for(cls, fn: FunctionInfo, values: dict[str, str] | None = None) -> list[dict[str, str]]:
+        hints: list[dict[str, str]] = []
+        for item in cls._metadata_items(fn):
+            parsed = cls._normalize_fixit_hint(item)
+            if parsed:
+                hints.append(parsed)
+        if not hints:
+            hints.extend(cls._fallback_fixit_hints_from_body(fn))
+        return hints
+
+    @classmethod
+    def _normalize_fixit_hint(cls, item) -> dict[str, str] | None:
+        if isinstance(item, str):
+            return cls._parse_text_fixit_hint(item)
+        if isinstance(item, dict):
+            kind = str(item.get("kind") or item.get("action") or item.get("type") or item.get("category") or "").strip()
+            target = str(item.get("target") or item.get("name") or item.get("symbol") or item.get("field") or "").strip()
+            value = str(item.get("value") or item.get("replacement") or item.get("expected") or item.get("literal") or "").strip()
+            condition = str(item.get("condition") or item.get("when") or item.get("predicate") or "").strip()
+        else:
+            kind = str(getattr(item, "kind", "") or getattr(item, "action", "") or getattr(item, "type", "")).strip()
+            target = str(getattr(item, "target", "") or getattr(item, "name", "") or getattr(item, "symbol", "")).strip()
+            value = str(getattr(item, "value", "") or getattr(item, "replacement", "") or getattr(item, "expected", "")).strip()
+            condition = str(getattr(item, "condition", "") or getattr(item, "when", "") or "").strip()
+        if not kind and target and value:
+            kind = "expected_output" if "." in target else "input"
+        if not kind or not value:
+            return None
+        result = {"kind": kind, "target": target, "value": value}
+        if condition:
+            result["condition"] = condition
+        return result
+
+    @staticmethod
+    def _parse_text_fixit_hint(text: str) -> dict[str, str] | None:
+        clean = " ".join(str(text or "").strip().split())
+        patterns = [
+            (r"expected\s+return\s*[:=]\s*(.+)$", "expected_return", "return"),
+            (r"expected\s+(?:output|out)\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*[:=]\s*(.+)$", "expected_output", None),
+            (r"expected\s+(?:global|state)\s+([A-Za-z_]\w*)\s*[:=]\s*(.+)$", "expected_global", None),
+            (r"(?:input|param|parameter)\s+([A-Za-z_]\w*)\s*[:=]\s*(.+)$", "input", None),
+            (r"local\s+([A-Za-z_]\w*)\s*[:=]\s*(.+)$", "local", None),
+            (r"stub\s+([A-Za-z_]\w*)\s*[:=]\s*(.+)$", "stub_return", None),
+        ]
+        for pattern, kind, fixed_target in patterns:
+            match = re.match(pattern, clean, flags=re.I)
+            if not match:
+                continue
+            if fixed_target is None:
+                return {"kind": kind, "target": match.group(1), "value": match.group(2)}
+            return {"kind": kind, "target": fixed_target, "value": match.group(1)}
+        return None
+
+    @staticmethod
+    def _local_variable_names(fn: FunctionInfo | None) -> set[str]:
+        if fn is None:
+            return set()
+        body = TestVectorGenerator._strip_comments_and_strings(getattr(fn, "body", "") or "")
+        names: set[str] = set()
+        declaration = re.compile(
+            r"\b(?:const\s+|volatile\s+|static\s+|unsigned\s+|signed\s+|long\s+|short\s+|struct\s+\w+\s+|enum\s+\w+\s+|union\s+\w+\s+|"
+            r"char\s+|int\s+|float\s+|double\s+|bool\s+|uint\d+_t\s+|int\d+_t\s+|size_t\s+|[A-Za-z_]\w+_t\s+|[A-Za-z_]\w+\s+)+"
+            r"[*\s]*(?P<decls>[^;]+);"
+        )
+        for match in declaration.finditer(body):
+            for item in TestVectorGenerator._split_top_level_commas(match.group("decls")):
+                item = item.split("=", 1)[0].strip()
+                name_match = re.search(r"(?:\*\s*)?([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?$", item)
+                if name_match:
+                    names.add(name_match.group(1))
+        macro_decl = re.compile(
+            r"\b(?:VAR|CONST|P2VAR|P2CONST|CONSTP2VAR|P2FUNC)\s*\([^;()]*\)\s*"
+            r"(?P<name>[A-Za-z_]\w*)\s*(?:=|;|\[)"
+        )
+        for match in macro_decl.finditer(body):
+            names.add(match.group("name"))
+        for match in re.finditer(r"\breturn\s+([A-Za-z_]\w*)\s*;", body):
+            returned = match.group(1)
+            if returned in names or returned.lower() in {"ret", "retval", "returnvalue", "result", "status"}:
+                names.add(returned)
+        return names
+
+    @staticmethod
+    def _split_top_level_commas(text: str) -> list[str]:
+        parts: list[str] = []
+        depth = 0
+        current: list[str] = []
+        for ch in str(text or ""):
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                parts.append("".join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        tail = "".join(current).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    @staticmethod
+    def _parameter_names(fn: FunctionInfo | None) -> set[str]:
+        return {getattr(param, "name", "") for param in getattr(fn, "parameters", []) or [] if getattr(param, "name", "")} if fn is not None else set()
+
+    @staticmethod
+    def _pointer_parameter_names(fn: FunctionInfo | None) -> set[str]:
+        return {getattr(param, "name", "") for param in getattr(fn, "parameters", []) or [] if getattr(param, "name", "") and getattr(param, "kind", "") == "pointer"} if fn is not None else set()
+
+    @staticmethod
+    def _global_symbol_names(fn: FunctionInfo | None) -> set[str]:
+        if fn is None:
+            return set()
+        payload = getattr(fn, "global_variable_types", None) or getattr(fn, "global_symbols", None) or {}
+        if isinstance(payload, dict):
+            return {str(k) for k in payload}
+        if isinstance(payload, (set, list, tuple)):
+            return {str(item) for item in payload}
+        return set()
+
+    @staticmethod
+    def _looks_like_global_name(name: str) -> bool:
+        return bool(re.match(r"(?:g_|s_|m_|G_|S_|M_|global_|Global|g[A-Z]).+", name or ""))
+
+    @classmethod
+    def _scope_kind(cls, fn: FunctionInfo | None, name: str) -> str:
+        if not name:
+            return "unknown"
+        root = str(name).split(".", 1)[0]
+        if root in cls._parameter_names(fn):
+            return "parameter"
+        if root in cls._local_variable_names(fn):
+            return "local"
+        if root in cls._global_symbol_names(fn) or cls._looks_like_global_name(root):
+            return "global"
+        return "unknown"
+
+    @classmethod
+    def _is_local_symbol(cls, fn: FunctionInfo | None, name: str) -> bool:
+        return cls._scope_kind(fn, name) == "local"
+
+    @classmethod
+    def _apply_fixit_hints(cls, fn: FunctionInfo, values: dict[str, str]) -> dict[str, str]:
+        result = {str(k): str(v) for k, v in (values or {}).items()}
+        local_symbols = cls._local_variable_names(fn)
+        for hint in cls._fixit_hints_for(fn, result):
+            if not cls._fixit_condition_applies(hint.get("condition", ""), result):
+                continue
+            kind = hint.get("kind", "").lower().replace("-", "_").replace(" ", "_")
+            target = hint.get("target", "").strip()
+            value = hint.get("value", "").strip()
+            if not value:
+                continue
+            if kind in {"expected_return", "return", "return_value"}:
+                result.setdefault("__expected_return", value)
+            elif kind in {"expected_output", "output", "out_param", "parameter_output"} and target:
+                root = target.split(".", 1)[0]
+                if root in cls._pointer_parameter_names(fn):
+                    result.setdefault(f"__expected_output.{target}", value)
+            elif kind in {"expected_global", "expected_state", "global_expected", "state_expected"} and target:
+                if cls._scope_kind(fn, target) == "global":
+                    result.setdefault(f"__expected_global.{target}", value)
+            elif kind in {"input", "parameter", "param", "precondition"} and target:
+                scope = cls._scope_kind(fn, target)
+                if scope == "local":
+                    result.setdefault(f"__local.{target}", value)
+                elif scope == "global":
+                    result.setdefault(f"__global.{target}", value)
+                else:
+                    result.setdefault(target, value)
+            elif kind in {"local", "setup_local"} and target:
+                if cls._scope_kind(fn, target) != "parameter":
+                    result.setdefault(f"__local.{target}", value)
+            elif kind in {"global", "setup_global", "input_global"} and target:
+                if cls._scope_kind(fn, target) == "global":
+                    result.setdefault(f"__global.{target}", value)
+            elif kind in {"stub", "stub_return", "mock_return"} and target:
+                result.setdefault(f"__stub_return.{target}", value)
+        return result
+
+    @classmethod
+    def _fixit_condition_applies(cls, condition: str, values: dict[str, str]) -> bool:
+        condition = str(condition or "").strip()
+        if not condition:
+            return True
+        result = ConditionEvaluator().evaluate(condition, values)
+        return True if result is None else result
+
+    @staticmethod
+    def _lookup_vector_value(name: str, values: dict[str, str]) -> str | None:
+        key = re.sub(r"\s*(?:->|\.)\s*", ".", name.strip())
+        if key in values:
+            return values[key]
+        if key.startswith("tm_") and key[3:] in values:
+            return values[key[3:]]
+        return None
+
+    @staticmethod
+    def _compare_literal_values(actual_raw: str, expected_raw: str, op: str) -> bool | None:
+        def lit(raw: str):
+            value = str(raw).strip()
+            if value.lower() in {"true", "false"}:
+                return 1.0 if value.lower() == "true" else 0.0
+            if value in {"NULL", "nullptr"}:
+                return 0.0
+            value = re.sub(r"[uUlLfF]+$", "", value)
+            try:
+                return float(value)
+            except ValueError:
+                return str(raw).strip()
+        actual = lit(actual_raw)
+        expected = lit(expected_raw)
+        try:
+            if op == "==": return actual == expected
+            if op == "!=": return actual != expected
+            if op == ">": return actual > expected
+            if op == "<": return actual < expected
+            if op == ">=": return actual >= expected
+            if op == "<=": return actual <= expected
+        except TypeError:
+            return None
+        return None
+
+    @classmethod
+    def _fallback_fixit_hints_from_body(cls, fn: FunctionInfo) -> list[dict[str, str]]:
+        # Keep this fallback intentionally small; the analyzer/backend normally attach richer hints.
+        body = cls._strip_comments_and_strings(getattr(fn, "body", "") or "")
+        hints: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        def add(kind: str, target: str, value: str) -> None:
+            value = str(value).strip().rstrip(";")
+            if not value:
+                return
+            key = (kind, target, value)
+            if key in seen:
+                return
+            seen.add(key)
+            hints.append({"kind": kind, "target": target, "value": value})
+        for match in re.finditer(r"\breturn\s+([-+]?\d+[uUlL]*|[A-Za-z_]\w*|true|false|TRUE|FALSE|NULL|nullptr)\s*;", body):
+            add("expected_return", "return", match.group(1))
+        for param in getattr(fn, "parameters", []) or []:
+            if getattr(param, "kind", "") != "pointer":
+                continue
+            name = re.escape(getattr(param, "name", ""))
+            if not name:
+                continue
+            for match in re.finditer(rf"\*\s*{name}\s*=\s*([^;]+);", body):
+                add("expected_output", getattr(param, "name", ""), match.group(1))
+            for match in re.finditer(rf"\b{name}\s*->\s*([A-Za-z_]\w*)\s*=\s*([^;]+);", body):
+                add("expected_output", f"{getattr(param, 'name', '')}.{match.group(1)}", match.group(2))
+        return hints
+
     @staticmethod
     def _case(
         source_name: str,
@@ -330,21 +608,28 @@ class TestVectorGenerator:
         asil_level: str = "ASIL D",
         integration_calls: list[str] | None = None,
     ) -> TestCase:
+        values = TestVectorGenerator._apply_fixit_hints(fn, values)
         path_id = values.get("__path_id")
         expected_return = values.get("__expected_return")
         expected_calls = values.get("__expected_calls")
         case_values = {
             name: value
             for name, value in values.items()
-            if not name.startswith("__path_") and not name.startswith("__expected_")
+            if not name.startswith("__path_")
         }
         if path_id:
             rationale = f"Execution path {path_id}: {rationale}"
         if expected_calls:
             rationale = f"{rationale}; expected calls: {expected_calls}"
-        expected = "Review and replace with concrete expected output/test oracle"
+        expected_parts: list[str] = []
         if expected_return is not None and str(expected_return).strip() not in {"", "void"}:
-            expected = f"Expected return: {expected_return}"
+            expected_parts.append(f"Expected return: {expected_return}")
+        for key, value in sorted(case_values.items()):
+            if key.startswith("__expected_output."):
+                expected_parts.append(f"Expected output {key.split('.', 1)[1]}: {value}")
+            elif key.startswith("__expected_global.") or key.startswith("__expected_state."):
+                expected_parts.append(f"Expected global {key.split('.', 1)[1]}: {value}")
+        expected = "; ".join(expected_parts) if expected_parts else "Review and replace with concrete expected output/test oracle"
         coverage_id = re.sub(r"[^A-Za-z0-9]+", "_", coverage).strip("_").lower()
         audit = TestVectorGenerator._audit_fields(fn, coverage, level, index, case_values, rationale, asil_level, integration_calls or [])
         return TestCase(
@@ -393,10 +678,10 @@ class TestVectorGenerator:
                     f"and call-observation hooks for: {call_summary}."
                 ),
                 "test_steps": (
-                    f"1. Apply integration input vector: {param_summary}. "
-                    f"2. Invoke integration entry {fn.name}. "
-                    "3. Observe function-call arguments/order, return value, output parameters, shared data updates, and propagated status. "
-                    f"4. Trace interface/data-flow obligations and condition lines: {condition_lines}."
+                    f"1. Apply integration input vector: {param_summary}. \n"
+                    f"2. Invoke integration entry {fn.name}. \n"
+                    "3. Observe function-call arguments/order, return value, output parameters, shared data updates, and propagated status. \n"
+                    f"4. Trace interface/data-flow obligations and condition lines: {condition_lines}.\n"
                 ),
                 "teardown": "Reset integration stubs/mocks, call logs, shared data, output fixtures, and transient diagnostic state.",
                 "pass_fail_criteria": (
@@ -418,10 +703,10 @@ class TestVectorGenerator:
                 "and create valid fixture objects for pointer parameters where required."
             ),
             "test_steps": (
-                f"1. Apply input vector: {param_summary}. "
-                f"2. Invoke {fn.name}. "
-                "3. Capture return value and modified outputs. "
-                f"4. Check targeted coverage/condition evidence for lines: {condition_lines}."
+                f"1. Apply input vector: {param_summary}. \n"
+                f"2. Invoke {fn.name}. \n"
+                "3. Capture return value and modified outputs. \n"
+                f"4. Check targeted coverage/condition evidence for lines: {condition_lines}.\n"
             ),
             "teardown": "Reset mocks/stubs, clear transient diagnostic state, release fixtures, and restore default calibration values.",
             "pass_fail_criteria": (
@@ -434,20 +719,18 @@ class TestVectorGenerator:
         }
 
     def _vectors_for(self, fn: FunctionInfo, coverage: str) -> list[dict[str, str]]:
-        complexity = self._function_complexity(fn)
-        if complexity == "SIMPLE":
+        classification = self._function_classification(fn)
+        if classification.complexity == Complexity.SIMPLE:
             return self._simple_vectors_for(fn, coverage)[:MAX_VECTORS_PER_FUNCTION]
-        if complexity == "MODERATE":
+        if classification.complexity == Complexity.MODERATE:
             return self._moderate_vectors_for(fn, coverage)[:MAX_VECTORS_PER_FUNCTION]
         return self._deep_vectors_for(fn, coverage)[:MAX_VECTORS_PER_FUNCTION]
 
-    @staticmethod
-    def _function_complexity(fn: FunctionInfo) -> str:
-        if len(fn.conditions) <= SIMPLE_CONDITION_LIMIT and len(fn.parameters) <= SIMPLE_PARAMETER_LIMIT:
-            return "SIMPLE"
-        if len(fn.conditions) <= MODERATE_CONDITION_LIMIT:
-            return "MODERATE"
-        return "COMPLEX"
+    def _function_classification(self, fn: FunctionInfo) -> ClassificationResult:
+        return classify(fn, self._record_for(fn))
+
+    def _function_complexity(self, fn: FunctionInfo) -> str:
+        return self._function_classification(fn).complexity.name
 
     def _base_vector_for(self, fn: FunctionInfo) -> dict[str, str]:
         params = fn.parameters
@@ -493,6 +776,12 @@ class TestVectorGenerator:
         if coverage in {"C0/C1", "C1"}:
             for condition in fn.conditions:
                 for vec in self._condition_vectors(params, condition, coverage):
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
+        if coverage == "MC/DC":
+            for condition in fn.conditions:
+                for vec in self._mcdc_pair_vectors(params, condition):
                     merged = dict(base)
                     merged.update(vec)
                     self._append_unique(vectors, merged)
@@ -664,31 +953,29 @@ class TestVectorGenerator:
         base.update(self._pointer_field_defaults_from_params(params, condition.text))
         decisions = condition.decisions or [condition.text]
         vectors: list[dict[str, str]] = []
-        for target_index in range(len(decisions)):
-            assignments = self._mcdc_boolean_assignments(condition.text, decisions, target_index)
-            for assignment in assignments:
-                vec = dict(base)
-                for decision, desired in zip(decisions, assignment):
-                    self._drive_decision(vec, decision, desired)
-                self._append_unique(vectors, vec)
+        for assignment in self._mcdc_boolean_assignments(condition.text, decisions):
+            vec = dict(base)
+            for decision, desired in zip(decisions, assignment):
+                self._drive_decision(vec, decision, desired)
+            self._append_unique(vectors, vec)
         return vectors
 
     @staticmethod
-    def _mcdc_boolean_assignments(condition_text: str, decisions: list[str], target_index: int) -> list[tuple[bool, ...]]:
+    def _mcdc_boolean_assignments(condition_text: str, decisions: list[str], target_index: int | None = None) -> list[tuple[bool, ...]]:
         if not decisions:
             return []
-        engine = BooleanExpressionEvaluator()
-        result = TestVectorGenerator._direct_mcdc_pair(condition_text, decisions, target_index, engine)
-        if result:
-            return result
+        expr = str(condition_text or "")
+        atom_names = [f"D{index}" for index in range(len(decisions))]
+        for index, decision in enumerate(decisions):
+            expr = re.sub(re.escape(decision), atom_names[index], expr, count=1)
+        from testing_mate.mc_coverage import IndependencePairSolver
 
-        for left in TestVectorGenerator._mcdc_candidate_contexts(len(decisions), target_index):
-            right_list = list(left)
-            right_list[target_index] = not right_list[target_index]
-            right = tuple(right_list)
-            if engine.combine(condition_text, decisions, list(left)) == engine.combine(condition_text, decisions, list(right)):
-                continue
-            return [left, right]
+        solver = IndependencePairSolver()
+        if target_index is None:
+            return [vector.condition_values for vector in solver.minimum_vectors(expr, atom_names)]
+        for pair in solver.solve(expr, atom_names):
+            if pair.changing_condition_index == target_index:
+                return [pair.test1.condition_values, pair.test2.condition_values]
         return []
 
     @staticmethod
