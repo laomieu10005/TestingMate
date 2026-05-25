@@ -9,7 +9,7 @@ import subprocess
 from testing_mate.constants import C_KEYWORDS, DEFAULT_COMPILER, C_SOURCE_EXTENSIONS, HEADER_SOURCE_EXTENSIONS, SOURCE_EXTENSIONS, EXCLUDED_SOURCE_DIRS
 
 from testing_mate.models import *
-from testing_mate.mc_coverage import MCDCAnalyzer
+from testing_mate.mcdc_engine import MCDCAnalyzer
 from testing_mate.toolchain import toolchain_env
 
 
@@ -28,7 +28,7 @@ def validate_toolchain(compiler: str = DEFAULT_COMPILER, log_fn=None) -> tuple[b
         status_lines.append(f"✓ Compiler ({compiler}): {compiler_path}")
     else:
         status_lines.append(f"✗ Compiler ({compiler}): NOT FOUND")
-        status_lines.append("  Hint: Install GCC/Clang or set TESTMATE_TOOLCHAIN_PATH")
+        status_lines.append(r"  Hint: Install MSYS2 MinGW64 at C:\msys64\mingw64 or select the mingw64 folder in the GUI")
         return False, "\n".join(status_lines)
     
     # Check for supporting tools

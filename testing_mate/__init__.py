@@ -6,7 +6,7 @@ from testing_mate.clang_analyzer import ClangEnhancedAnalyzer
 from testing_mate.code_database import CodeDatabase, CodeFunctionRecord
 from testing_mate.analysis import AstCache
 from testing_mate.generation_workflow import ClassificationResult, Complexity, TestGenerationWorkflow, VerificationObjective, classify
-from testing_mate.mc_coverage import ExecutedVector, MCDCAnalyzer, MCDCCoverageEngine, MCDCReport
+from testing_mate.mcdc_engine import ExecutedVector, MCDCAnalyzer, MCDCCoverageEngine, MCDCReport
 from testing_mate.boolean_expression import ConditionEvaluator
 from testing_mate.vector_generator import TestVectorGenerator
 

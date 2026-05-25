@@ -264,7 +264,7 @@ class StubHarnessEngine:
         stub_include_dir.mkdir(parents=True, exist_ok=True)
 
         source_ext = ".cpp" if backend in {"CppUTest", "GoogleTest"} else ".c"
-        c_path = stub_src_dir / f"testing_mate_stubs{source_ext}"
+        c_path = stub_src_dir / f"stubs{source_ext}"
         h_path = stub_include_dir / "stubs.h"
         manifest = stub_src_dir / "testing_mate_stub_manifest.json"
         readme = stub_src_dir / "README_Stubs.md"
@@ -1083,8 +1083,8 @@ class StubHarnessEngine:
         )
         lines.append("#ifdef __cplusplus")
         function_symbols = [symbol for symbol in symbols if symbol.kind == "function"]
-        if function_symbols:
-            lines.extend(self._mock_header_lines(backend, function_symbols))
+        # if function_symbols:
+        lines.extend(self._mock_header_lines(backend, function_symbols))
         lines.extend(
             [
                 "#endif /* __cplusplus */",

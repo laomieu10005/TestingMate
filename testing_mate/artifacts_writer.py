@@ -6,7 +6,7 @@ from pathlib import Path
 from datetime import datetime
 from testing_mate.models import CoverageFeedback, CoverageGap, Condition, FunctionInfo, Parameter, RunResult, TestCase
 from testing_mate.code_database import CodeDatabase
-from testing_mate.mc_coverage import MCDCCoverageEngine
+from testing_mate.mcdc_engine import MCDCCoverageEngine
 from testing_mate.c1_engine import C1CoverageEngine
 from testing_mate.constants import DEFAULT_ENHANCEMENT_STAGES
 from testing_mate.generator import TestVectorGenerator, TestBackendGenerator
@@ -15,6 +15,12 @@ from dataclasses import asdict
 from testing_mate.llm import OllamaTestRefiner
 import json 
 import re
+
+
+def _has_executed_coverage_evidence(feedback: CoverageFeedback) -> bool:
+    if feedback.source in {"none", "generated test vectors"}:
+        return False
+    return bool(feedback.raw_text.strip() or any(value is not None for value in feedback.metrics.values()))
 
 
 class ArtifactWriter:
@@ -39,10 +45,47 @@ class ArtifactWriter:
         code_database: CodeDatabase | None = None,
     ) -> list[Path]:
         active_feedback = feedback or CoverageFeedback(source="none", raw_text="")
+        had_executed_coverage = _has_executed_coverage_evidence(active_feedback)
+        had_executed_mcdc = active_feedback.metrics.get("MC/DC") is not None
         if any(case.coverage in {"C0/C1", "C1", "MC/DC"} for case in cases) and active_feedback.metrics.get("C1") is None:
             active_feedback = C1CoverageEngine.merge(active_feedback, C1CoverageEngine().analyze(functions, cases))
-        if any(case.coverage == "MC/DC" for case in cases) and active_feedback.metrics.get("MC/DC") is None:
+        if (
+            any(case.coverage == "MC/DC" for case in cases)
+            and active_feedback.metrics.get("MC/DC") is None
+        ):
             active_feedback = MCDCCoverageEngine.merge(active_feedback, MCDCCoverageEngine().analyze(functions, cases))
+            if had_executed_coverage and not had_executed_mcdc and active_feedback.metrics.get("MC/DC") is not None:
+                notes = dict(active_feedback.metric_notes)
+                generated_note = notes.get("MC/DC", "")
+                notes["MC/DC"] = (
+                    "Generated-vector MC/DC estimate because executed coverage did not include MC/DC counters; "
+                    "not executed MC/DC proof."
+                    + (f" {generated_note}" if generated_note else "")
+                )
+                active_feedback = CoverageFeedback(
+                    source=active_feedback.source,
+                    raw_text=active_feedback.raw_text,
+                    coverage_percent=active_feedback.coverage_percent,
+                    metrics=active_feedback.metrics,
+                    metric_notes=notes,
+                    uncovered_items=active_feedback.uncovered_items,
+                    failures=active_feedback.failures,
+                )
+        elif any(case.coverage == "MC/DC" for case in cases) and active_feedback.metrics.get("MC/DC") is None:
+            notes = dict(active_feedback.metric_notes)
+            notes.setdefault(
+                "MC/DC",
+                "Executed coverage report did not include MC/DC counters; generated-vector MC/DC is not used as executed coverage.",
+            )
+            active_feedback = CoverageFeedback(
+                source=active_feedback.source,
+                raw_text=active_feedback.raw_text,
+                coverage_percent=active_feedback.coverage_percent,
+                metrics=active_feedback.metrics,
+                metric_notes=notes,
+                uncovered_items=active_feedback.uncovered_items,
+                failures=active_feedback.failures,
+            )
         paths = [
             self._write_code_database(source, code_database),
             self._write_json(source, functions, cases, code_database),

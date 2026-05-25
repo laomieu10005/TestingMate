@@ -9,7 +9,7 @@ from pathlib import Path
 
 from testing_mate.code_database import CodeDatabase
 from testing_mate.constants import C_SOURCE_EXTENSIONS, SCALAR_TOKENS
-from testing_mate.mc_coverage import MCDCCoverageCollector
+from testing_mate.mcdc_engine import MCDCCoverageCollector
 from testing_mate.models import FunctionInfo, Parameter, RunResult, TestCase, Condition
 from testing_mate.boolean_expression import ConditionEvaluator
 from testing_mate.stub_engine import StubHarnessEngine, StubSymbol
@@ -2882,13 +2882,13 @@ class TestBackendGenerator:
                 "set -euo pipefail",
                 'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
                 'cd "$SCRIPT_DIR"',
-                f'tool_mingw_bin="{local_mingw}"',
-                'if [ -d "$tool_mingw_bin" ] && [ -x "$tool_mingw_bin/cmake" ] && "$tool_mingw_bin/cmake" --version >/dev/null 2>&1; then',
-                '  export PATH="$tool_mingw_bin:/mingw64/bin:/ucrt64/bin:/clang64/bin:/usr/bin:$PATH"',
-                '  echo "Using tool MinGW: $tool_mingw_bin"',
+                f'mingw_bin="{local_mingw}"',
+                'if [ -d "$mingw_bin" ]; then',
+                '  export PATH="$mingw_bin:/usr/bin:$PATH"',
+                '  echo "Using MSYS2 MinGW64: $mingw_bin"',
                 'else',
-                '  export PATH="/mingw64/bin:/ucrt64/bin:/clang64/bin:/usr/bin:$PATH"',
-                '  echo "Tool MinGW unavailable at $tool_mingw_bin; using system MSYS2 PATH"',
+                '  export PATH="/mingw64/bin:/usr/bin:$PATH"',
+                '  echo "MSYS2 MinGW64 not found at $mingw_bin; using /mingw64/bin"',
                 'fi',
                 'mkdir -p "$SCRIPT_DIR/.tmp" "$SCRIPT_DIR/.home"',
                 'export TMPDIR="$SCRIPT_DIR/.tmp"',
@@ -3080,7 +3080,7 @@ class TestBackendRunner:
         if bash.lower().endswith("bash.exe"):
             work_dir = windows_to_msys_path(script.parent)
             mingw_dir = windows_to_msys_path(local_mingw_bin())
-            return self._run_command([bash, "-lc", f"export MSYSTEM=MINGW64; export HOME='{work_dir}/.home'; export TMPDIR='{work_dir}/.tmp'; export PATH='{mingw_dir}':/mingw64/bin:/usr/bin:$PATH; bash '{msys_script}'"], backend, command_label)
+            return self._run_command([bash, "-lc", f"export MSYSTEM=MINGW64; export HOME='{work_dir}/.home'; export TMPDIR='{work_dir}/.tmp'; export PATH='{mingw_dir}':/usr/bin:$PATH; bash '{msys_script}'"], backend, command_label)
         return self._run_command([bash, "-defterm", "-no-start", "-mingw64", "-c", f"bash '{msys_script}'"], backend, command_label)
 
     def _run_command(self, cmd: list[str], backend: str, command_label: str) -> RunResult:

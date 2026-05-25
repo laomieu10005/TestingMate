@@ -2,8 +2,10 @@ import unittest
 from itertools import combinations
 
 from testing_mate.c1_engine import C1CoverageEngine
-from testing_mate.mc_coverage import MCDCCoverageEngine
-from testing_mate.models import Condition, FunctionInfo, Parameter, TestCase
+from testing_mate.mcdc_engine import MCDCCoverageEngine
+from testing_mate.models import Condition, CoverageFeedback, FunctionInfo, Parameter, TestCase
+from testing_mate.reporter import CoverageReportParser
+from testing_mate.utilities import collect_backend_feedback, merge_generated_coverage_feedback
 
 
 def make_function():
@@ -77,6 +79,54 @@ class CoverageMetricsTests(unittest.TestCase):
                     c1 + 1e-9,
                     f"MC/DC {mc} should not exceed C1 {c1} for subset {[c.values for c in subset]}",
                 )
+
+    def test_generated_mcdc_fills_executed_report_without_mcdc_counters_as_estimate(self):
+        function = make_function()
+        cases = [
+            make_case("t1", False, False),
+            make_case("t2", True, False),
+            make_case("t3", False, True),
+            make_case("t4", True, True),
+        ]
+        executed = CoverageFeedback(
+            source="lcov tracefile",
+            raw_text="TN:\nSF:sample.c\nLF:10\nLH:5\nBRF:4\nBRH:2\nend_of_record\n",
+            coverage_percent=50.0,
+            metrics={"C0": 50.0, "C1": 50.0, "MC/DC": None},
+            metric_notes={"MC/DC": "lcov did not emit MC/DC counters."},
+        )
+
+        feedback = merge_generated_coverage_feedback(executed, [function], cases, "MC/DC")
+
+        self.assertEqual(feedback.metrics.get("MC/DC"), 100.0)
+        self.assertIn("Generated-vector MC/DC estimate", feedback.metric_notes.get("MC/DC", ""))
+        self.assertIn("not executed MC/DC proof", feedback.metric_notes.get("MC/DC", ""))
+
+    def test_backend_collection_prefers_llvm_summary_mcdc_over_lcov_missing_mcdc(self):
+        with self.subTest("GoogleTest llvm summary is collected before lcov"):
+            import tempfile
+            from pathlib import Path
+
+            with tempfile.TemporaryDirectory() as tmp:
+                out_dir = Path(tmp)
+                source = out_dir / "GatewaySwc.c"
+                base = out_dir / "GatewaySwc_gtest"
+                base.mkdir(parents=True)
+                (base / "coverage.summary.txt").write_text(
+                    "Filename Regions Missed Regions Cover Functions Missed Functions Executed Lines Missed Lines Cover Branches Missed Branches Cover MC/DC Cover\n"
+                    "TOTAL 10 0 100.00% 1 0 100.00% 20 0 100.00% 8 2 75.00% 5 1 80.00%\n",
+                    encoding="utf-8",
+                )
+                (base / "coverage.info").write_text(
+                    "TN:\nSF:GatewaySwc.c\nLF:10\nLH:5\nBRF:4\nBRH:2\nend_of_record\n",
+                    encoding="utf-8",
+                )
+
+                feedback = collect_backend_feedback(CoverageReportParser(), out_dir, source, "GoogleTest")
+
+                self.assertIsNotNone(feedback)
+                self.assertEqual(feedback.metrics.get("MC/DC"), 80.0)
+                self.assertIn("llvm-cov", feedback.metric_notes.get("MC/DC", ""))
 
 
 if __name__ == "__main__":
