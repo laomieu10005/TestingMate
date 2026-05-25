@@ -1,6 +1,6 @@
 from testing_mate.coverage_gap import CoverageGap
 from testing_mate.models import * 
-from testing_mate.mc_coverage import MCDCCoverageEngine
+from testing_mate.mcdc_engine import MCDCCoverageEngine
 from testing_mate.reporter import *
 
 class C1CoverageEngine:

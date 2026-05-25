@@ -1032,7 +1032,7 @@ class TestVectorGenerator:
         atom_names = [f"D{index}" for index in range(len(decisions))]
         for index, decision in enumerate(decisions):
             expr = re.sub(re.escape(decision), atom_names[index], expr, count=1)
-        from testing_mate.mc_coverage import IndependencePairSolver
+        from testing_mate.mcdc_engine import IndependencePairSolver
 
         solver = IndependencePairSolver()
         if target_index is None:

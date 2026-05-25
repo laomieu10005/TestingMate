@@ -4,7 +4,7 @@ import os
 from pathlib import Path    
 from testing_mate.reporter import CoverageReportParser
 from testing_mate.c1_engine import C1CoverageEngine
-from testing_mate.mc_coverage import MCDCCoverageEngine
+from testing_mate.mcdc_engine import MCDCCoverageEngine
 from typing import Callable
 
 def has_report_evidence(feedback: CoverageFeedback) -> bool:
@@ -86,6 +86,11 @@ def complete_no_obligation_metrics(feedback: CoverageFeedback, functions: list[F
         failures=feedback.failures,
     )
 
+def has_executed_coverage_evidence(feedback: CoverageFeedback) -> bool:
+    if feedback.source in {"none", "generated test vectors"}:
+        return False
+    return bool(feedback.raw_text.strip() or any(value is not None for value in feedback.metrics.values()))
+
 def merge_cases(existing: list[TestCase], candidates: list[TestCase]) -> int:
     signatures = {(case.function, tuple(sorted(case.values.items()))) for case in existing}
     added = 0
@@ -99,11 +104,31 @@ def merge_cases(existing: list[TestCase], candidates: list[TestCase]) -> int:
     return added
 
 
-def merge_generated_coverage_feedback(feedback: CoverageFeedback, functions: list[FunctionInfo], cases: list[TestCase], coverage: str) -> CoverageFeedback:
+def merge_generated_coverage_feedback(
+    feedback: CoverageFeedback,
+    functions: list[FunctionInfo],
+    cases: list[TestCase],
+    coverage: str,
+    allow_generated_mcdc: bool | None = None,
+) -> CoverageFeedback:
+    if allow_generated_mcdc is None:
+        allow_generated_mcdc = False
     if coverage in {"C0/C1", "MC/DC"}:
         feedback = C1CoverageEngine.merge(feedback, C1CoverageEngine().analyze(functions, cases))
-    if coverage == "MC/DC":
+    if coverage == "MC/DC" and allow_generated_mcdc:
         feedback = MCDCCoverageEngine.merge(feedback, MCDCCoverageEngine().analyze(functions, cases))
+    elif coverage == "MC/DC" and feedback.metrics.get("MC/DC") is None:
+        notes = dict(feedback.metric_notes)
+        notes["MC/DC"] = "MC/DC unavailable: LLVM native MC/DC records were not found. LCOV/gcov branch counters and generated vectors are not used as official MC/DC coverage."
+        feedback = CoverageFeedback(
+            source=feedback.source,
+            raw_text=feedback.raw_text,
+            coverage_percent=feedback.coverage_percent,
+            metrics=feedback.metrics,
+            metric_notes=notes,
+            uncovered_items=feedback.uncovered_items,
+            failures=feedback.failures,
+        )
     return complete_no_obligation_metrics(feedback, functions)
 
 def load_coverage_feedback(report: Path | None, parser: CoverageReportParser, log: Callable[[str], None] | None = None) -> CoverageFeedback:
@@ -123,18 +148,44 @@ def collect_backend_feedback(parser: CoverageReportParser, out_dir: Path, source
     target_files: list[Path] = [source]
     if backend == "CppUTest":
         base_dir = out_dir / f"{source.stem}_cpputest"
-        candidates.append(base_dir / "coverage.info")
         target_files.append(base_dir / "src" / source.name)
     elif backend == "GoogleTest":
         base_dir = out_dir / f"{source.stem}_gtest"
-        candidates.append(base_dir / "coverage.info")
         target_files.append(base_dir / "src" / source.name)
+    else:
+        base_dir = out_dir
+    candidates.extend(
+        [
+            base_dir / "coverage.json",
+            base_dir / "coverage.llvm.json",
+            base_dir / "llvm_report.txt",
+            base_dir / "coverage.summary.txt",
+            base_dir / "coverage.info",
+        ]
+    )
     for candidate in candidates:
         if candidate.exists():
             feedback = parser.parse_file(candidate, target_files=target_files)
             if log:
                 source_note = "lcov tracefile" if candidate.suffix.lower() in {".info", ".lcov"} else "backend coverage"
                 log(f"Parsed {source_note}: {candidate} ({coverage_log_summary(feedback)})")
+            if feedback.metrics.get("MC/DC") is None and candidate.name != "coverage.info" and (base_dir / "coverage.info").exists():
+                lcov_feedback = parser.parse_file(base_dir / "coverage.info", target_files=target_files)
+                metrics = dict(feedback.metrics)
+                notes = dict(feedback.metric_notes)
+                for metric in ("C0", "C1"):
+                    if metrics.get(metric) is None and lcov_feedback.metrics.get(metric) is not None:
+                        metrics[metric] = lcov_feedback.metrics[metric]
+                        notes[metric] = lcov_feedback.metric_notes.get(metric, notes.get(metric, ""))
+                feedback = CoverageFeedback(
+                    source=feedback.source,
+                    raw_text=feedback.raw_text,
+                    coverage_percent=CoverageReportParser()._best_percent(feedback.raw_text, metrics),
+                    metrics=metrics,
+                    metric_notes=notes,
+                    uncovered_items=(feedback.uncovered_items + lcov_feedback.uncovered_items)[:80],
+                    failures=feedback.failures + [item for item in lcov_feedback.failures if item not in feedback.failures],
+                )
             return feedback
     if log:
         log(f"No backend coverage artifact found for {backend}; report remains based on selected input only.")

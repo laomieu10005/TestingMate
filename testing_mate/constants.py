@@ -1,5 +1,5 @@
-APP_NAME = "Testing Mate v5.0"
-DEFAULT_COMPILER = "gcc"
+APP_NAME = "Testing Mate v5.1"
+DEFAULT_COMPILER = "clang"
 
 # LLM Enhancement Stages (environment variable: TESTMATE_LLM_STAGES)
 # Default stages: coverage_gap (existing), oracle (new), negative (new)

@@ -156,10 +156,8 @@ class CoverageReportParser:
         targets = self._normalize_targets(target_files)
         line_hits: dict[tuple[str, int], int] = {}
         branch_hits: dict[tuple[str, int, str, str], int] = {}
-        mcdc_hits: dict[tuple[str, int, str, str, str, str], int] = {}
         fallback_lines_found = fallback_lines_hit = 0
         fallback_branches_found = fallback_branches_hit = 0
-        fallback_mcdc_found = fallback_mcdc_hit = 0
 
         for raw_line in text.splitlines():
             line = raw_line.strip()
@@ -180,10 +178,6 @@ class CoverageReportParser:
                 fallback_branches_found += self._lcov_hit_count(line[4:])
             elif line.startswith("BRH:"):
                 fallback_branches_hit += self._lcov_hit_count(line[4:])
-            elif line.startswith("MRF:"):
-                fallback_mcdc_found += self._lcov_hit_count(line[4:])
-            elif line.startswith("MRH:"):
-                fallback_mcdc_hit += self._lcov_hit_count(line[4:])
             elif line.startswith("DA:"):
                 parts = line[3:].split(",")
                 if len(parts) >= 2 and parts[0].isdigit():
@@ -194,20 +188,13 @@ class CoverageReportParser:
                 if len(parts) >= 4 and parts[0].isdigit():
                     key = (current_file, int(parts[0]), parts[1], parts[2])
                     branch_hits[key] = branch_hits.get(key, 0) + self._lcov_hit_count(parts[3])
-            elif line.startswith("MCDC:"):
-                record = self._parse_mcdc_record(line[5:], current_file)
-                if record:
-                    key, hit = record
-                    mcdc_hits[key] = max(mcdc_hits.get(key, 0), hit)
 
         lines_found = len(line_hits) if line_hits else fallback_lines_found
         lines_hit = sum(1 for count in line_hits.values() if count > 0) if line_hits else fallback_lines_hit
         branches_found = len(branch_hits) if branch_hits else fallback_branches_found
         branches_hit = sum(1 for count in branch_hits.values() if count > 0) if branch_hits else fallback_branches_hit
-        mcdc_found = len(mcdc_hits) if mcdc_hits else fallback_mcdc_found
-        mcdc_hit = sum(1 for count in mcdc_hits.values() if count > 0) if mcdc_hits else fallback_mcdc_hit
 
-        if not any((lines_found, branches_found, mcdc_found)):
+        if not any((lines_found, branches_found)):
             return None
 
         uncovered: list[str] = []
@@ -217,23 +204,16 @@ class CoverageReportParser:
         for (path, line_no, block, branch), count in sorted(branch_hits.items(), key=lambda item: (item[0][0].lower(), item[0][1], item[0][2], item[0][3])):
             if count <= 0:
                 uncovered.append(f"Uncovered C1 branch line {line_no} block {block} branch {branch} in {path}")
-        for (path, line_no, group_size, sense, index, expression), count in sorted(mcdc_hits.items(), key=lambda item: (item[0][0].lower(), item[0][1], item[0][4])):
-            if count <= 0:
-                expr = f" expression `{expression}`" if expression else ""
-                uncovered.append(
-                    f"Uncovered MC/DC condition line {line_no} group-size {group_size} index {index} sense {sense}{expr} in {path}"
-                )
-
         metrics = {
             "C0": self._percent(lines_hit, lines_found),
             "C1": self._percent(branches_hit, branches_found),
-            "MC/DC": self._percent(mcdc_hit, mcdc_found),
+            "MC/DC": None,
         }
         notes = self._metric_notes(metrics, source)
         target_note = self._target_note(targets)
         notes["C0"] = f"From lcov LF/LH counters{target_note}: {lines_hit}/{lines_found} lines hit." if lines_found else f"lcov did not emit line counters{target_note}."
         notes["C1"] = f"From lcov BRF/BRH counters{target_note}: {branches_hit}/{branches_found} branches hit." if branches_found else f"lcov did not emit branch counters{target_note}."
-        notes["MC/DC"] = f"From lcov MRF/MRH or MCDC records{target_note}: {mcdc_hit}/{mcdc_found} MC/DC conditions covered." if mcdc_found else f"lcov did not emit MC/DC counters{target_note}."
+        notes["MC/DC"] = "MC/DC unavailable: LCOV/gcov branch counters do not contain executed condition vectors."
         raw_text = "\n".join(filtered_lines) if targets else text
         return CoverageFeedback(
             source=source,
@@ -304,6 +284,8 @@ class CoverageReportParser:
             total = totals.get({"C0": "lines", "C1": "branches", "MC/DC": "mcdc"}[key])
             if total:
                 notes[key] = f"From llvm-cov JSON{target_note}: {int(total.get('covered', 0))}/{int(total.get('count', 0))} {label} covered."
+        if metrics.get("MC/DC") is None:
+            notes["MC/DC"] = "LLVM coverage exists, but no MC/DC records were found. Rebuild target sources with -fcoverage-mcdc and rerun tests."
         return CoverageFeedback(
             source=source,
             raw_text=text[:12000],
@@ -316,6 +298,41 @@ class CoverageReportParser:
 
     def _extract_llvm_json_totals(self, payload: object, targets: list[str]) -> dict[str, dict[str, float]]:
         totals = {"lines": {"count": 0.0, "covered": 0.0}, "branches": {"count": 0.0, "covered": 0.0}, "mcdc": {"count": 0.0, "covered": 0.0}}
+
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            block = data[0]
+            files = block.get("files")
+            if isinstance(files, list):
+                for file_item in files:
+                    if not isinstance(file_item, dict):
+                        continue
+                    filename = str(file_item.get("filename") or file_item.get("name") or "")
+                    if filename and not self._path_matches_targets(filename, targets):
+                        continue
+                    summary = file_item.get("summary")
+                    if not isinstance(summary, dict):
+                        continue
+                    for json_key, kind in (("lines", "lines"), ("branches", "branches"), ("mcdc", "mcdc")):
+                        metric = summary.get(json_key)
+                        if isinstance(metric, dict):
+                            count = self._first_number(metric, ("count", "num", "found", "total"))
+                            covered = self._first_number(metric, ("covered", "hit", "executed"))
+                            percent = self._first_number(metric, ("percent", "coverage", "ratio"))
+                            if count is None:
+                                if covered is not None and percent not in (None, 0):
+                                    count = covered * 100.0 / percent
+                                else:
+                                    notcovered = self._first_number(metric, ("notcovered", "not_covered", "missed"))
+                                    if covered is not None and notcovered is not None:
+                                        count = covered + notcovered
+                            if count is None:
+                                continue
+                            if covered is None:
+                                covered = count * percent / 100.0 if percent is not None else 0.0
+                            totals[kind]["count"] += float(count)
+                            totals[kind]["covered"] += float(covered)
+                return {key: value for key, value in totals.items() if value["count"] > 0}
 
         def add_metric(kind: str, node: object) -> None:
             if not isinstance(node, dict):
@@ -440,5 +457,3 @@ class CoverageReportParser:
             if value is None:
                 notes[metric] = f"{metric} was not provided by {source}; Testing Mate will list generated obligations but cannot prove this metric without backend evidence."
         return notes
-
-

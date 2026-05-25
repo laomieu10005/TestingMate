@@ -9,7 +9,7 @@ from pathlib import Path
 
 from testing_mate.code_database import CodeDatabase
 from testing_mate.constants import C_SOURCE_EXTENSIONS, SCALAR_TOKENS
-from testing_mate.mc_coverage import MCDCCoverageCollector
+from testing_mate.mcdc_engine import MCDCCoverageCollector
 from testing_mate.models import FunctionInfo, Parameter, RunResult, TestCase, Condition
 from testing_mate.boolean_expression import ConditionEvaluator
 from testing_mate.stub_engine import StubHarnessEngine, StubSymbol
@@ -513,31 +513,46 @@ class TestBackendGenerator:
                     f"project({source.stem}_cpputest C CXX)",
                     "set(CMAKE_CXX_STANDARD 11)",
                     "enable_testing()",
-                    "include(CheckCCompilerFlag)",
-                    "include(CheckCXXCompilerFlag)",
-                    "if(CMAKE_C_COMPILER_ID MATCHES \"GNU\")",
+                    "option(TESTING_MATE_LLVM_COVERAGE \"Enable Clang/LLVM source-based coverage\" ON)",
+                    "option(TESTING_MATE_LLVM_MCDC \"Enable Clang/LLVM MC/DC coverage\" ON)",
+                    "option(TESTING_MATE_LEGACY_LCOV \"Enable legacy gcov/lcov C0/C1 coverage\" OFF)",
+                    "if(TESTING_MATE_LLVM_COVERAGE)",
+                    "  if(NOT CMAKE_C_COMPILER_ID MATCHES \"Clang\")",
+                    "    message(FATAL_ERROR \"TESTING_MATE_LLVM_COVERAGE requires Clang\")",
+                    "  endif()",
+                    "  add_compile_options(-O0 -g -fprofile-instr-generate -fcoverage-mapping)",
+                    "  add_link_options(-fprofile-instr-generate)",
+                    "  if(TESTING_MATE_LLVM_MCDC)",
+                    "    add_compile_options(-fcoverage-mcdc)",
+                    "    add_compile_options(\"SHELL:-Xclang -fmcdc-max-conditions=32\")",
+                    "    add_compile_options(\"SHELL:-Xclang -fmcdc-max-test-vectors=4096\")",
+                    "  endif()",
+                    "elseif(TESTING_MATE_LEGACY_LCOV AND CMAKE_C_COMPILER_ID MATCHES \"GNU\")",
                     "  add_compile_options(--coverage -O0 -g)",
                     "  add_link_options(--coverage)",
-                    "  check_c_compiler_flag(\"-fcondition-coverage\" TESTING_MATE_C_HAS_CONDITION_COVERAGE)",
-                    "  check_cxx_compiler_flag(\"-fcondition-coverage\" TESTING_MATE_CXX_HAS_CONDITION_COVERAGE)",
-                    "  if(TESTING_MATE_C_HAS_CONDITION_COVERAGE)",
-                    "    add_compile_options($<$<COMPILE_LANGUAGE:C>:-fcondition-coverage>)",
-                    "  endif()",
-                    "  if(TESTING_MATE_CXX_HAS_CONDITION_COVERAGE)",
-                    "    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fcondition-coverage>)",
-                    "  endif()",
-                    "elseif(CMAKE_C_COMPILER_ID MATCHES \"Clang\")",
-                    "  add_compile_options(-O0 -g -fprofile-instr-generate -fcoverage-mapping -fcoverage-mcdc)",
-                    "  add_link_options(-fprofile-instr-generate -fcoverage-mapping -fcoverage-mcdc)",
                     "endif()",
                     "if(MINGW)",
                     "  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wa,-mbig-obj>)",
                     "endif()",
                     "find_package(CppUTest REQUIRED)",
+                    'message(STATUS "C compiler: ${CMAKE_C_COMPILER}")',
+                    'message(STATUS "CXX compiler: ${CMAKE_CXX_COMPILER}")',
+                    'message(STATUS "CMAKE_PREFIX_PATH: ${CMAKE_PREFIX_PATH}")',
+                    'message(STATUS "CppUTest_DIR: ${CppUTest_DIR}")',
+                    'if(CMAKE_CXX_COMPILER MATCHES "clang64" AND CppUTest_DIR MATCHES "mingw64")',
+                    '  message(FATAL_ERROR "Invalid mixed environment: CLANG64 compiler with MINGW64 CppUTest")',
+                    'endif()',
+                    'if(CMAKE_CXX_COMPILER MATCHES "mingw64" AND CppUTest_DIR MATCHES "clang64")',
+                    '  message(FATAL_ERROR "Invalid mixed environment: MINGW64 compiler with CLANG64 CppUTest")',
+                    'endif()',
                     f"add_executable({source.stem}_cpputest {test_file.name} {c_sources})",
                     f"target_include_directories({source.stem}_cpputest PRIVATE {include_dirs})",
                     f"target_compile_options({source.stem}_cpputest PRIVATE $<$<COMPILE_LANGUAGE:C>:-include> $<$<COMPILE_LANGUAGE:C>:stubs.h>)",
-                    f"target_link_libraries({source.stem}_cpputest CppUTest CppUTestExt)",
+                    'if(TARGET CppUTest::CppUTest)',
+                    f'  target_link_libraries({source.stem}_cpputest CppUTest::CppUTest CppUTest::CppUTestExt)',
+                    'else()',
+                    f'  target_link_libraries({source.stem}_cpputest CppUTest CppUTestExt)',
+                    'endif()',
                     f"add_test(NAME {source.stem}_cpputest COMMAND {source.stem}_cpputest)",
                 ]
             ),
@@ -577,27 +592,38 @@ class TestBackendGenerator:
                     f"project({source.stem}_gtest C CXX)",
                     "set(CMAKE_CXX_STANDARD 14)",
                     "enable_testing()",
-                    "include(CheckCCompilerFlag)",
-                    "include(CheckCXXCompilerFlag)",
-                    "if(CMAKE_C_COMPILER_ID MATCHES \"GNU\")",
+                    "option(TESTING_MATE_LLVM_COVERAGE \"Enable Clang/LLVM source-based coverage\" ON)",
+                    "option(TESTING_MATE_LLVM_MCDC \"Enable Clang/LLVM MC/DC coverage\" ON)",
+                    "option(TESTING_MATE_LEGACY_LCOV \"Enable legacy gcov/lcov C0/C1 coverage\" OFF)",
+                    "if(TESTING_MATE_LLVM_COVERAGE)",
+                    "  if(NOT CMAKE_C_COMPILER_ID MATCHES \"Clang\")",
+                    "    message(FATAL_ERROR \"TESTING_MATE_LLVM_COVERAGE requires Clang\")",
+                    "  endif()",
+                    "  add_compile_options(-O0 -g -fprofile-instr-generate -fcoverage-mapping)",
+                    "  add_link_options(-fprofile-instr-generate)",
+                    "  if(TESTING_MATE_LLVM_MCDC)",
+                    "    add_compile_options(-fcoverage-mcdc)",
+                    "    add_compile_options(\"SHELL:-Xclang -fmcdc-max-conditions=32\")",
+                    "    add_compile_options(\"SHELL:-Xclang -fmcdc-max-test-vectors=4096\")",
+                    "  endif()",
+                    "elseif(TESTING_MATE_LEGACY_LCOV AND CMAKE_C_COMPILER_ID MATCHES \"GNU\")",
                     "  add_compile_options(--coverage -O0 -g)",
                     "  add_link_options(--coverage)",
-                    "  check_c_compiler_flag(\"-fcondition-coverage\" TESTING_MATE_C_HAS_CONDITION_COVERAGE)",
-                    "  check_cxx_compiler_flag(\"-fcondition-coverage\" TESTING_MATE_CXX_HAS_CONDITION_COVERAGE)",
-                    "  if(TESTING_MATE_C_HAS_CONDITION_COVERAGE)",
-                    "    add_compile_options($<$<COMPILE_LANGUAGE:C>:-fcondition-coverage>)",
-                    "  endif()",
-                    "  if(TESTING_MATE_CXX_HAS_CONDITION_COVERAGE)",
-                    "    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fcondition-coverage>)",
-                    "  endif()",
-                    "elseif(CMAKE_C_COMPILER_ID MATCHES \"Clang\")",
-                    "  add_compile_options(-O0 -g -fprofile-instr-generate -fcoverage-mapping -fcoverage-mcdc)",
-                    "  add_link_options(-fprofile-instr-generate -fcoverage-mapping -fcoverage-mcdc)",
                     "endif()",
                     "if(MINGW)",
                     "  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wa,-mbig-obj>)",
                     "endif()",
                     "find_package(GTest REQUIRED)",
+                    'message(STATUS "C compiler: ${CMAKE_C_COMPILER}")',
+                    'message(STATUS "CXX compiler: ${CMAKE_CXX_COMPILER}")',
+                    'message(STATUS "CMAKE_PREFIX_PATH: ${CMAKE_PREFIX_PATH}")',
+                    'message(STATUS "GTest_DIR: ${GTest_DIR}")',
+                    'if(CMAKE_CXX_COMPILER MATCHES "clang64" AND GTest_DIR MATCHES "mingw64")',
+                    '  message(FATAL_ERROR "Invalid mixed environment: CLANG64 compiler with MINGW64 GTest")',
+                    'endif()',
+                    'if(CMAKE_CXX_COMPILER MATCHES "mingw64" AND GTest_DIR MATCHES "clang64")',
+                    '  message(FATAL_ERROR "Invalid mixed environment: MINGW64 compiler with CLANG64 GTest")',
+                    'endif()',
                     f"add_executable({source.stem}_gtest {test_file.name} {c_sources})",
                     f"target_include_directories({source.stem}_gtest PRIVATE {include_dirs})",
                     f"target_compile_options({source.stem}_gtest PRIVATE $<$<COMPILE_LANGUAGE:C>:-include> $<$<COMPILE_LANGUAGE:C>:stubs.h>)",
@@ -2874,189 +2900,445 @@ class TestBackendGenerator:
 
     @staticmethod
     def _cmake_runner(target: str, target_source: str | None = None) -> str:
-        target_source = (target_source or "").replace('"', '\\"')
-        local_mingw = windows_to_msys_path(local_mingw_bin()).replace('"', '\\"')
-        return "\n".join(
-            [
-                "#!/usr/bin/env bash",
-                "set -euo pipefail",
-                'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
-                'cd "$SCRIPT_DIR"',
-                f'tool_mingw_bin="{local_mingw}"',
-                'if [ -d "$tool_mingw_bin" ] && [ -x "$tool_mingw_bin/cmake" ] && "$tool_mingw_bin/cmake" --version >/dev/null 2>&1; then',
-                '  export PATH="$tool_mingw_bin:/mingw64/bin:/ucrt64/bin:/clang64/bin:/usr/bin:$PATH"',
-                '  echo "Using tool MinGW: $tool_mingw_bin"',
-                'else',
-                '  export PATH="/mingw64/bin:/ucrt64/bin:/clang64/bin:/usr/bin:$PATH"',
-                '  echo "Tool MinGW unavailable at $tool_mingw_bin; using system MSYS2 PATH"',
-                'fi',
-                'mkdir -p "$SCRIPT_DIR/.tmp" "$SCRIPT_DIR/.home"',
-                'export TMPDIR="$SCRIPT_DIR/.tmp"',
-                'export TMP="$SCRIPT_DIR/.tmp"',
-                'export TEMP="$SCRIPT_DIR/.tmp"',
-                'export HOME="$SCRIPT_DIR/.home"',
-                'install_msys2_packages() {',
-                '  if ! command -v pacman >/dev/null 2>&1; then',
-                '    echo "MSYS2 pacman not found; cannot install missing package(s): $*"',
-                '    exit 127',
-                '  fi',
-                '  echo "Installing missing MSYS2 package(s): $*"',
-                '  pacman -Sy --needed --noconfirm "$@"',
-                '}',
-                'ensure_tool() {',
-                '  tool_name="$1"',
-                '  shift',
-                '  if command -v "$tool_name" >/dev/null 2>&1; then',
-                '    return 0',
-                '  fi',
-                '  for package_name in "$@"; do',
-                '    if install_msys2_packages "$package_name"; then',
-                '      if command -v "$tool_name" >/dev/null 2>&1; then',
-                '        return 0',
-                '      fi',
-                '    fi',
-                '  done',
-                '  if [ "$#" -eq 0 ]; then',
-                '    echo "No package mapping is available for missing tool: ${tool_name}"',
-                '  else',
-                '    echo "Required tool still not found after install attempt: ${tool_name}"',
-                '  fi',
-                '  exit 127',
-                '}',
-                'coverage_backend="${TESTING_MATE_COVERAGE_BACKEND:-gcc_lcov}"',
-                'case "$coverage_backend" in',
-                '  clang|clang_llvmcov|llvmcov)',
-                '    export CC="${TESTING_MATE_CC:-clang}"',
-                '    export CXX="${TESTING_MATE_CXX:-clang++}"',
-                '    coverage_backend="clang_llvmcov"',
-                '    ;;',
-                '  *)',
-                '    export CC="${TESTING_MATE_CC:-gcc}"',
-                '    export CXX="${TESTING_MATE_CXX:-g++}"',
-                '    coverage_backend="gcc_lcov"',
-                '    ;;',
-                'esac',
-                'echo "shell: ${MSYSTEM:-unknown}"',
-                'echo "coverage backend: ${coverage_backend}"',
-                'echo "cc: ${CC} -> $(command -v "$CC" || true)"',
-                'echo "cxx: ${CXX} -> $(command -v "$CXX" || true)"',
-                'echo "cmake: $(command -v cmake || true)"',
-                'echo "ninja: $(command -v ninja || true)"',
-                'if [ "$coverage_backend" = "clang_llvmcov" ]; then',
-                '  compiler_package="mingw-w64-x86_64-clang"',
-                'else',
-                '  compiler_package="mingw-w64-x86_64-gcc"',
-                'fi',
-                'ensure_tool cmake mingw-w64-x86_64-cmake',
-                'ensure_tool ninja mingw-w64-x86_64-ninja',
-                'ensure_tool "$CC" "$compiler_package"',
-                'ensure_tool "$CXX" "$compiler_package"',
-                'echo "resolved cc: ${CC} -> $(command -v "$CC")"',
-                'echo "resolved cxx: ${CXX} -> $(command -v "$CXX")"',
-                'echo "resolved cmake: $(command -v cmake)"',
-                'echo "resolved ninja: $(command -v ninja)"',
-                f'report_base="{target}"',
-                'report_base="${report_base%_cpputest}"',
-                'report_base="${report_base%_gtest}"',
-                f'target_source="{target_source}"',
-                'echo "coverage target source: ${target_source}"',
-                f'target="{target}"',
-                'build_dir="build"',
-                'if [ -e "$build_dir" ]; then',
-                '  if ! rm -rf "$build_dir"; then',
-                '    build_dir="build_${target}_$(date +%Y%m%d%H%M%S)_$$"',
-                '    echo "Existing build directory is locked; using fresh build directory: ${build_dir}"',
-                '  fi',
-                'fi',
-                'mkdir -p "$build_dir"',
-                'export LLVM_PROFILE_FILE="$SCRIPT_DIR/${build_dir}/${target}-%p.profraw"',
-                'cmake -S . -B "$build_dir" -G Ninja -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" -DCMAKE_MAKE_PROGRAM="$(command -v ninja)"',
-                'cmake --build "$build_dir"',
-                'ctest --test-dir "$build_dir" --output-on-failure',
-                'exe_path=""',
-                'if [ -x "${build_dir}/${target}.exe" ]; then exe_path="${build_dir}/${target}.exe"; fi',
-                'if [ -z "$exe_path" ] && [ -x "${build_dir}/${target}" ]; then exe_path="${build_dir}/${target}"; fi',
-                'if [ -n "$exe_path" ]; then "$exe_path"; fi',
-                'if [ "$coverage_backend" = "clang_llvmcov" ]; then',
-                '  if [ -z "$exe_path" ]; then echo "Cannot find test executable for llvm-cov"; exit 1; fi',
-                '  ensure_tool llvm-profdata mingw-w64-x86_64-llvm',
-                '  ensure_tool llvm-cov mingw-w64-x86_64-llvm',
-                '  shopt -s nullglob',
-                '  profraw_files=("${build_dir}"/*.profraw)',
-                '  if [ "${#profraw_files[@]}" -eq 0 ]; then',
-                '    echo "No .profraw files were produced. Check that -fprofile-instr-generate was applied."',
-                '    exit 1',
-                '  fi',
-                '  llvm-profdata merge --sparse "${profraw_files[@]}" -o coverage.profdata',
-                '  llvm_source_args=()',
-                '  if [ -n "$target_source" ] && [ -f "$target_source" ]; then',
-                '    llvm_source_args+=("$target_source")',
-                '  fi',
-                '  llvm-cov report "$exe_path" -instr-profile=coverage.profdata -show-branch-summary -show-mcdc-summary -show-mcdc-non-executed-vectors "${llvm_source_args[@]}" > coverage.summary.txt',
-                '  cat coverage.summary.txt',
-                '  llvm-cov show "$exe_path" -instr-profile=coverage.profdata -show-branches=count -show-mcdc -format=html -output-dir="${report_base}_llvmcov" "${llvm_source_args[@]}"',
-                '  llvm-cov export -format=text -instr-profile=coverage.profdata "$exe_path" "${llvm_source_args[@]}" > coverage.llvm.json',
-                '  if command -v llvm2lcov >/dev/null 2>&1; then',
-                '    ensure_tool genhtml mingw-w64-x86_64-lcov lcov',
-                '    ensure_tool perl perl',
-                '    llvm2lcov --branch --mcdc -o coverage.raw.info coverage.llvm.json',
-                '    if [ -n "$target_source" ]; then',
-                '      export TESTMATE_TARGET_SOURCE="$target_source"',
-                "      perl -0777 -ne 'BEGIN { $target = lc($ENV{\"TESTMATE_TARGET_SOURCE\"}); $target =~ s!\\\\!/!g; $target =~ s!^\\./!!; } for $rec (split(/end_of_record\\n?/, $_)) { next unless $rec =~ /\\S/; if ($rec =~ /^SF:(.+)$/m) { $sf = lc($1); $sf =~ s!\\\\!/!g; $sf =~ s!^\\./!!; if ($sf eq $target || $sf =~ /\\Q$target\\E$/) { print $rec; print \"end_of_record\\n\"; } } }' coverage.raw.info > coverage.info.tmp",
-                '      if grep -q "^SF:" coverage.info.tmp; then',
-                '        mv coverage.info.tmp coverage.info',
-                '        echo "Filtered LCOV to target source basename: ${target_source}"',
-                '      else',
-                '        echo "No LCOV records found for target source ${target_source}; available source records were:"',
-                '        sed -n "s#^SF:##p" coverage.raw.info | head -80',
-                '        rm -f coverage.info coverage.info.tmp',
-                '      fi',
-                '    else',
-                '      cp coverage.raw.info coverage.info',
-                '    fi',
-                '    if [ -f coverage.info ] && command -v genhtml >/dev/null 2>&1; then',
-                '      genhtml coverage.info --branch-coverage --mcdc --title "${report_base} target-only" --output-directory "${report_base}_lcov"',
-                '    fi',
-                '  else',
-                '    echo "llvm2lcov not found; generated coverage.summary.txt, coverage.llvm.json and ${report_base}_llvmcov/index.html instead."',
-                '  fi',
-                'else',
-                '  ensure_tool lcov mingw-w64-x86_64-lcov lcov',
-                '  ensure_tool genhtml mingw-w64-x86_64-lcov lcov',
-                '  ensure_tool perl perl',
-                '  if command -v lcov >/dev/null 2>&1 && command -v genhtml >/dev/null 2>&1; then',
-                '    rm -f coverage.raw.info coverage.info',
-                '    if lcov --help 2>&1 | grep -q -- "--mcdc"; then',
-                '      lcov --capture --directory "$build_dir" --base-directory . --branch-coverage --mcdc --output-file coverage.raw.info',
-                '      genhtml_mcdc_opt="--mcdc"',
-                '    else',
-                '      lcov --capture --directory "$build_dir" --base-directory . --rc lcov_branch_coverage=1 --rc branch_coverage=1 --output-file coverage.raw.info',
-                '      genhtml_mcdc_opt=""',
-                '    fi',
-                '    if [ -n "$target_source" ]; then',
-                '      export TESTMATE_TARGET_SOURCE="$target_source"',
-                "      perl -0777 -ne 'BEGIN { $target = lc($ENV{\"TESTMATE_TARGET_SOURCE\"}); $target =~ s!\\\\!/!g; $target =~ s!^\\./!!; } for $rec (split(/end_of_record\\n?/, $_)) { next unless $rec =~ /\\S/; if ($rec =~ /^SF:(.+)$/m) { $sf = lc($1); $sf =~ s!\\\\!/!g; $sf =~ s!^\\./!!; if ($sf eq $target || $sf =~ /\\Q$target\\E$/) { print $rec; print \"end_of_record\\n\"; } } }' coverage.raw.info > coverage.info.tmp",
-                '      if grep -q "^SF:" coverage.info.tmp; then',
-                '        mv coverage.info.tmp coverage.info',
-                '        echo "Filtered LCOV to target source basename: ${target_source}"',
-                '      else',
-                '        echo "No LCOV records found for target source ${target_source}; available source records were:"',
-                '        sed -n "s#^SF:##p" coverage.raw.info | head -80',
-                '        rm -f coverage.info coverage.info.tmp',
-                '      fi',
-                '    else',
-                '      cp coverage.raw.info coverage.info',
-                '    fi',
-                '    if [ -f coverage.info ]; then',
-                '      genhtml coverage.info --branch-coverage ${genhtml_mcdc_opt} --title "${report_base} target-only" --output-directory "${report_base}_lcov"',
-                '      echo "Generated target-only coverage.info and ${report_base}_lcov/index.html with lcov/genhtml"',
-                '    fi',
-                '  else',
-                "    echo 'lcov/genhtml not found; install lcov before using backend coverage. Testing Mate will keep generated-vector evidence only.'",
-                '  fi',
-                'fi',
-                "",
-            ]
+        import textwrap
+
+        def bash_dq(value: str) -> str:
+            return (
+                (value or "")
+                .replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("$", "\\$")
+                .replace("`", "\\`")
+            )
+
+        raw_target_source = target_source or ""
+        if re.match(r"^[A-Za-z]:[\\/]", raw_target_source):
+            target_source_msys = windows_to_msys_path(raw_target_source)
+        else:
+            target_source_msys = raw_target_source.replace("\\", "/")
+
+        script = r'''
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+target="@@TARGET@@"
+target_source="@@TARGET_SOURCE@@"
+
+report_base="${target}"
+report_base="${report_base%_cpputest}"
+report_base="${report_base%_gtest}"
+
+mkdir -p "$SCRIPT_DIR/.tmp" "$SCRIPT_DIR/.home"
+export TMPDIR="$SCRIPT_DIR/.tmp"
+export TMP="$SCRIPT_DIR/.tmp"
+export TEMP="$SCRIPT_DIR/.tmp"
+export HOME="$SCRIPT_DIR/.home"
+
+unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH LD_LIBRARY_PATH || true
+
+install_msys2_packages() {
+  if ! command -v pacman >/dev/null 2>&1; then
+    echo "MSYS2 pacman not found; cannot install missing package(s): $*"
+    exit 127
+  fi
+
+  echo "Installing missing MSYS2 package(s): $*"
+  pacman -S --needed --noconfirm "$@"
+}
+
+ensure_package() {
+  package_name="$1"
+
+  if ! command -v pacman >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if pacman -Q "$package_name" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  install_msys2_packages "$package_name"
+}
+
+ensure_tool() {
+  tool_name="$1"
+  shift
+
+  if command -v "$tool_name" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  for package_name in "$@"; do
+    install_msys2_packages "$package_name"
+
+    if command -v "$tool_name" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+
+  echo "Required tool not found: ${tool_name}"
+  exit 127
+}
+
+coverage_backend="${TESTING_MATE_COVERAGE_BACKEND:-llvm}"
+
+case "$coverage_backend" in
+  legacy_lcov|lcov)
+    coverage_backend="legacy_lcov"
+    ;;
+  *)
+    coverage_backend="clang_llvmcov"
+    ;;
+esac
+
+choose_tool_prefix() {
+  if [ -n "${TESTING_MATE_MSYS_PREFIX:-}" ]; then
+    tool_prefix="${TESTING_MATE_MSYS_PREFIX}"
+    return 0
+  fi
+
+  if [ "$coverage_backend" = "clang_llvmcov" ]; then
+    if [ -d "/clang64/bin" ]; then
+      tool_prefix="/clang64"
+    elif [ -d "/mingw64/bin" ]; then
+      tool_prefix="/mingw64"
+    else
+      echo "No MSYS2 /clang64 or /mingw64 prefix found."
+      exit 127
+    fi
+  else
+    if [ -d "/mingw64/bin" ]; then
+      tool_prefix="/mingw64"
+    elif [ -d "/clang64/bin" ]; then
+      tool_prefix="/clang64"
+    else
+      echo "No MSYS2 /mingw64 or /clang64 prefix found."
+      exit 127
+    fi
+  fi
+}
+
+choose_tool_prefix
+
+export PATH="${tool_prefix}/bin:/usr/bin:$PATH"
+export CMAKE_PREFIX_PATH="${tool_prefix}"
+
+case "$tool_prefix" in
+  /clang64*)
+    pkg_prefix="mingw-w64-clang-x86_64"
+    ignore_prefix="/mingw64"
+    ;;
+  /mingw64*)
+    pkg_prefix="mingw-w64-x86_64"
+    ignore_prefix="/clang64"
+    ;;
+  *)
+    pkg_prefix="mingw-w64-x86_64"
+    ignore_prefix=""
+    ;;
+esac
+
+cmake_pkg="${pkg_prefix}-cmake"
+ninja_pkg="${pkg_prefix}-ninja"
+llvm_pkg="${pkg_prefix}-llvm"
+clang_pkg="${pkg_prefix}-clang"
+compiler_rt_pkg="${pkg_prefix}-compiler-rt"
+gcc_pkg="${pkg_prefix}-gcc"
+gtest_pkg="${pkg_prefix}-gtest"
+cpputest_pkg="${pkg_prefix}-cpputest"
+
+if [ "$coverage_backend" = "clang_llvmcov" ]; then
+  export CC="${TESTING_MATE_CC:-${tool_prefix}/bin/clang.exe}"
+  export CXX="${TESTING_MATE_CXX:-${tool_prefix}/bin/clang++.exe}"
+else
+  export CC="${TESTING_MATE_CC:-${tool_prefix}/bin/gcc.exe}"
+  export CXX="${TESTING_MATE_CXX:-${tool_prefix}/bin/g++.exe}"
+fi
+
+echo "shell: ${MSYSTEM:-unknown}"
+echo "tool prefix: ${tool_prefix}"
+echo "coverage backend: ${coverage_backend}"
+echo "target: ${target}"
+echo "coverage target source: ${target_source}"
+echo "CC: ${CC}"
+echo "CXX: ${CXX}"
+
+ensure_tool cmake "$cmake_pkg"
+ensure_tool ninja "$ninja_pkg"
+
+if [ "$coverage_backend" = "clang_llvmcov" ]; then
+  ensure_package "$clang_pkg"
+  ensure_package "$compiler_rt_pkg"
+  ensure_tool llvm-profdata "$llvm_pkg"
+  ensure_tool llvm-cov "$llvm_pkg"
+else
+  ensure_package "$gcc_pkg"
+  ensure_tool lcov lcov
+  ensure_tool genhtml lcov
+  ensure_tool perl perl
+fi
+
+case "$target" in
+  *_gtest)
+    ensure_package "$gtest_pkg"
+    ;;
+  *_cpputest)
+    ensure_package "$cpputest_pkg"
+    ;;
+esac
+
+echo "resolved cmake: $(command -v cmake)"
+echo "resolved ninja: $(command -v ninja)"
+echo "resolved llvm-cov: $(command -v llvm-cov || true)"
+echo "resolved llvm-profdata: $(command -v llvm-profdata || true)"
+
+if [ "$coverage_backend" = "clang_llvmcov" ]; then
+  echo "clang version:"
+  "$CXX" --version || true
+
+  resource_dir="$("$CXX" -print-resource-dir 2>/dev/null || true)"
+  runtime_dir="$("$CXX" -print-runtime-dir 2>/dev/null || true)"
+
+  echo "clang resource dir: ${resource_dir}"
+  echo "clang runtime dir: ${runtime_dir}"
+
+  shopt -s nullglob
+  profile_runtime_candidates=(
+    "${runtime_dir}"/libclang_rt.profile*.a
+    "${resource_dir}"/lib/windows/libclang_rt.profile*.a
+    "${resource_dir}"/lib/x86_64-w64-windows-gnu/libclang_rt.profile*.a
+  )
+
+  profile_runtime_found=0
+  for profile_runtime in "${profile_runtime_candidates[@]}"; do
+    if [ -f "$profile_runtime" ]; then
+      echo "found profile runtime: ${profile_runtime}"
+      profile_runtime_found=1
+      break
+    fi
+  done
+
+  if [ "$profile_runtime_found" -eq 0 ]; then
+    echo "Missing Clang profile runtime library."
+    echo "Install matching compiler-rt package:"
+    echo "  pacman -S --needed ${compiler_rt_pkg}"
+    exit 1
+  fi
+fi
+
+build_dir="build-clang-cov"
+if [ "$coverage_backend" = "legacy_lcov" ]; then
+  build_dir="build-lcov"
+fi
+
+if [ -e "$build_dir" ]; then
+  if ! rm -rf "$build_dir"; then
+    build_dir="build_${target}_$(date +%Y%m%d%H%M%S)_$$"
+    echo "Existing build directory is locked; using fresh build directory: ${build_dir}"
+  fi
+fi
+
+mkdir -p "$build_dir"
+
+cmake_extra_args=()
+
+if [ "$coverage_backend" = "clang_llvmcov" ]; then
+  cmake_extra_args+=(
+    "-DTESTING_MATE_LLVM_COVERAGE=ON"
+    "-DTESTING_MATE_LLVM_MCDC=ON"
+    "-DTESTING_MATE_LEGACY_LCOV=OFF"
+  )
+else
+  cmake_extra_args+=(
+    "-DTESTING_MATE_LLVM_COVERAGE=OFF"
+    "-DTESTING_MATE_LLVM_MCDC=OFF"
+    "-DTESTING_MATE_LEGACY_LCOV=ON"
+  )
+fi
+
+cmake_configure_args=(
+  -S .
+  -B "$build_dir"
+  -G Ninja
+  "-DCMAKE_C_COMPILER=${CC}"
+  "-DCMAKE_CXX_COMPILER=${CXX}"
+  "-DCMAKE_PREFIX_PATH=${tool_prefix}"
+  "-DCMAKE_MAKE_PROGRAM=$(command -v ninja)"
+)
+
+if [ -n "$ignore_prefix" ]; then
+  cmake_configure_args+=("-DCMAKE_IGNORE_PREFIX_PATH=${ignore_prefix}")
+fi
+
+cmake_configure_args+=("${cmake_extra_args[@]}")
+
+export LLVM_PROFILE_FILE="$SCRIPT_DIR/${build_dir}/${target}-%p.profraw"
+
+cmake "${cmake_configure_args[@]}"
+cmake --build "$build_dir"
+
+test_status=0
+ctest --test-dir "$build_dir" --output-on-failure || test_status=$?
+
+exe_path=""
+if [ -x "${build_dir}/${target}.exe" ]; then
+  exe_path="${build_dir}/${target}.exe"
+elif [ -x "${build_dir}/${target}" ]; then
+  exe_path="${build_dir}/${target}"
+fi
+
+if [ "$coverage_backend" = "clang_llvmcov" ]; then
+  if [ -z "$exe_path" ]; then
+    echo "Cannot find test executable for llvm-cov."
+    exit 1
+  fi
+
+  shopt -s nullglob
+  profraw_files=("${build_dir}"/*.profraw)
+
+  if [ "${#profraw_files[@]}" -eq 0 ]; then
+    echo "No .profraw files were produced."
+    echo "Check that -fprofile-instr-generate was applied and the test binary actually ran."
+    exit 1
+  fi
+
+  llvm-profdata merge --sparse "${profraw_files[@]}" -o coverage.profdata
+
+  llvm_source_args=()
+  if [ -n "$target_source" ] && [ -f "$target_source" ]; then
+    llvm_source_args+=("$target_source")
+  elif [ -n "$target_source" ]; then
+    echo "Warning: target source does not exist from MSYS2 shell: ${target_source}"
+    echo "LLVM report will run without source filter."
+  fi
+
+  report_opts=("-show-branch-summary")
+
+  if llvm-cov report --help 2>&1 | grep -q -- "show-mcdc-summary"; then
+    report_opts+=("-show-mcdc-summary")
+  else
+    echo "Warning: this llvm-cov does not support -show-mcdc-summary."
+  fi
+
+  llvm-cov report "$exe_path" \
+    -instr-profile=coverage.profdata \
+    "${report_opts[@]}" \
+    "${llvm_source_args[@]}" \
+    > llvm_report.txt
+
+  cp llvm_report.txt coverage.summary.txt
+  cat llvm_report.txt
+
+  show_opts=(
+    "-format=html"
+    "-output-dir=llvm_html"
+    "-show-line-counts-or-regions"
+    "-show-branches=count"
+  )
+
+  if llvm-cov show --help 2>&1 | grep -q -- "show-mcdc"; then
+    show_opts+=("-show-mcdc")
+  fi
+
+  if llvm-cov show --help 2>&1 | grep -q -- "show-mcdc-non-executed-vectors"; then
+    show_opts+=("-show-mcdc-non-executed-vectors")
+  else
+    echo "Info: this llvm-cov does not support -show-mcdc-non-executed-vectors."
+  fi
+
+  llvm-cov show "$exe_path" \
+    -instr-profile=coverage.profdata \
+    "${show_opts[@]}" \
+    "${llvm_source_args[@]}"
+
+  rm -rf "${report_base}_llvmcov"
+  cp -R llvm_html "${report_base}_llvmcov"
+
+  llvm-cov export "$exe_path" \
+    -instr-profile=coverage.profdata \
+    -format=text \
+    "${llvm_source_args[@]}" \
+    > coverage.json
+
+  cp coverage.json coverage.llvm.json
+
+  echo "Generated LLVM coverage:"
+  echo "  llvm_report.txt"
+  echo "  coverage.json"
+  echo "  llvm_html/index.html"
+  echo "  ${report_base}_llvmcov/index.html"
+else
+  if command -v lcov >/dev/null 2>&1 && command -v genhtml >/dev/null 2>&1; then
+    rm -f coverage.raw.info coverage.info coverage.info.tmp
+
+    lcov \
+      --capture \
+      --directory "$build_dir" \
+      --base-directory . \
+      --rc lcov_branch_coverage=1 \
+      --rc branch_coverage=1 \
+      --output-file coverage.raw.info
+
+    if [ -n "$target_source" ]; then
+      export TESTMATE_TARGET_SOURCE="$target_source"
+
+      perl -0777 -ne 'BEGIN {
+        $target = lc($ENV{"TESTMATE_TARGET_SOURCE"});
+        $target =~ s!\\!/!g;
+        $target =~ s!^\./!!;
+      }
+      for $rec (split(/end_of_record\n?/, $_)) {
+        next unless $rec =~ /\S/;
+        if ($rec =~ /^SF:(.+)$/m) {
+          $sf = lc($1);
+          $sf =~ s!\\!/!g;
+          $sf =~ s!^\./!!;
+          if ($sf eq $target || $sf =~ /\Q$target\E$/) {
+            print $rec;
+            print "end_of_record\n";
+          }
+        }
+      }' coverage.raw.info > coverage.info.tmp
+
+      if grep -q "^SF:" coverage.info.tmp; then
+        mv coverage.info.tmp coverage.info
+        echo "Filtered LCOV to target source: ${target_source}"
+      else
+        echo "No LCOV records found for target source ${target_source}; available records:"
+        sed -n "s#^SF:##p" coverage.raw.info | head -80
+        rm -f coverage.info coverage.info.tmp
+      fi
+    else
+      cp coverage.raw.info coverage.info
+    fi
+
+    if [ -f coverage.info ]; then
+      genhtml \
+        coverage.info \
+        --branch-coverage \
+        --title "${report_base} legacy target-only" \
+        --output-directory "${report_base}_lcov"
+
+      echo "Generated legacy C0/C1 coverage:"
+      echo "  coverage.info"
+      echo "  ${report_base}_lcov/index.html"
+    fi
+  else
+    echo "lcov/genhtml not found; install lcov before using legacy C0/C1 coverage."
+  fi
+fi
+
+exit "$test_status"
+'''
+
+        return (
+            textwrap.dedent(script)
+            .lstrip()
+            .replace("@@TARGET@@", bash_dq(target))
+            .replace("@@TARGET_SOURCE@@", bash_dq(target_source_msys))
         )
 
 class TestBackendRunner:
@@ -3080,7 +3362,7 @@ class TestBackendRunner:
         if bash.lower().endswith("bash.exe"):
             work_dir = windows_to_msys_path(script.parent)
             mingw_dir = windows_to_msys_path(local_mingw_bin())
-            return self._run_command([bash, "-lc", f"export MSYSTEM=MINGW64; export HOME='{work_dir}/.home'; export TMPDIR='{work_dir}/.tmp'; export PATH='{mingw_dir}':/mingw64/bin:/usr/bin:$PATH; bash '{msys_script}'"], backend, command_label)
+            return self._run_command([bash, "-lc", f"export MSYSTEM=MINGW64; export HOME='{work_dir}/.home'; export TMPDIR='{work_dir}/.tmp'; export PATH='{mingw_dir}':/usr/bin:$PATH; bash '{msys_script}'"], backend, command_label)
         return self._run_command([bash, "-defterm", "-no-start", "-mingw64", "-c", f"bash '{msys_script}'"], backend, command_label)
 
     def _run_command(self, cmd: list[str], backend: str, command_label: str) -> RunResult:
@@ -3112,7 +3394,9 @@ class TestBackendRunner:
             if not test_dir.exists():
                 continue
             
-            summary_file = test_dir / "coverage.summary.txt"
+            summary_file = test_dir / "llvm_report.txt"
+            if not summary_file.exists():
+                summary_file = test_dir / "coverage.summary.txt"
             if summary_file.exists():
                 return collector.extract_mcdc_from_summary(summary_file)
         

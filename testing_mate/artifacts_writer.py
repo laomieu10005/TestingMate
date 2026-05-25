@@ -6,7 +6,6 @@ from pathlib import Path
 from datetime import datetime
 from testing_mate.models import CoverageFeedback, CoverageGap, Condition, FunctionInfo, Parameter, RunResult, TestCase
 from testing_mate.code_database import CodeDatabase
-from testing_mate.mc_coverage import MCDCCoverageEngine
 from testing_mate.c1_engine import C1CoverageEngine
 from testing_mate.constants import DEFAULT_ENHANCEMENT_STAGES
 from testing_mate.generator import TestVectorGenerator, TestBackendGenerator
@@ -42,7 +41,17 @@ class ArtifactWriter:
         if any(case.coverage in {"C0/C1", "C1", "MC/DC"} for case in cases) and active_feedback.metrics.get("C1") is None:
             active_feedback = C1CoverageEngine.merge(active_feedback, C1CoverageEngine().analyze(functions, cases))
         if any(case.coverage == "MC/DC" for case in cases) and active_feedback.metrics.get("MC/DC") is None:
-            active_feedback = MCDCCoverageEngine.merge(active_feedback, MCDCCoverageEngine().analyze(functions, cases))
+            notes = dict(active_feedback.metric_notes)
+            notes["MC/DC"] = "MC/DC unavailable: LLVM native MC/DC records were not found. LCOV/gcov branch counters and generated vectors are not used as official MC/DC coverage."
+            active_feedback = CoverageFeedback(
+                source=active_feedback.source,
+                raw_text=active_feedback.raw_text,
+                coverage_percent=active_feedback.coverage_percent,
+                metrics=active_feedback.metrics,
+                metric_notes=notes,
+                uncovered_items=active_feedback.uncovered_items,
+                failures=active_feedback.failures,
+            )
         paths = [
             self._write_code_database(source, code_database),
             self._write_json(source, functions, cases, code_database),
@@ -503,7 +512,7 @@ class ArtifactWriter:
         }
         for metric in ("C0", "C1", "MC/DC"):
             value = metrics.get(metric)
-            display = f"{value:.2f}%" if value is not None else "Missing"
+            display = f"{value:.2f}%" if value is not None else ("N/A" if metric == "MC/DC" else "Missing")
             note = notes.get(metric) or f"Static obligations: {obligation_counts[metric]}"
             cards.append(
                 f'<div class="card">{html.escape(metric)}<div class="metric">{html.escape(display)}</div>'
@@ -520,11 +529,41 @@ class ArtifactWriter:
     ) -> str:
         if backend not in {"CppUTest", "GoogleTest"}:
             return (
-                "<section><h2>LCOV Source Trace</h2>"
-                "<p class=\"note\">LCOV source trace is available for CppUTest and GoogleTest runs.</p>"
+                "<section><h2>LLVM Source Coverage</h2>"
+                "<p class=\"note\">LLVM source coverage is available for CppUTest and GoogleTest runs.</p>"
                 "</section>"
             )
         base_name = f"{source.stem}_cpputest" if backend == "CppUTest" else f"{source.stem}_gtest"
+        base_dir = self.out_dir / base_name
+        llvm_dir = base_dir / "llvm_html"
+        legacy_llvm_dir = base_dir / f"{source.stem}_llvmcov"
+        if not (llvm_dir / "index.html").exists() and (legacy_llvm_dir / "index.html").exists():
+            llvm_dir = legacy_llvm_dir
+        llvm_index = llvm_dir / "index.html"
+        llvm_json = base_dir / "coverage.json"
+        llvm_legacy_json = base_dir / "coverage.llvm.json"
+        llvm_report = base_dir / "llvm_report.txt"
+        llvm_legacy_report = base_dir / "coverage.summary.txt"
+        if llvm_index.exists():
+            links = [f'<a class="trace-link" href="{html.escape(self._relative_href(llvm_index))}">Open LLVM HTML Report</a>']
+            if llvm_json.exists():
+                links.append(f'<a class="trace-link" href="{html.escape(self._relative_href(llvm_json))}">Open coverage.json</a>')
+            elif llvm_legacy_json.exists():
+                links.append(f'<a class="trace-link" href="{html.escape(self._relative_href(llvm_legacy_json))}">Open coverage.llvm.json</a>')
+            if llvm_report.exists():
+                links.append(f'<a class="trace-link" href="{html.escape(self._relative_href(llvm_report))}">Open llvm_report.txt</a>')
+            elif llvm_legacy_report.exists():
+                links.append(f'<a class="trace-link" href="{html.escape(self._relative_href(llvm_legacy_report))}">Open coverage.summary.txt</a>')
+            trace_rows = self._lcov_trace_rows(self._relative_href(llvm_index), feedback, functions)
+            return (
+                "<section><h2>LLVM Source Coverage</h2>"
+                "<p class=\"note\">Trace executed and uncovered C lines back to clang/llvm-cov source-based coverage. MC/DC is native only when LLVM exported MC/DC records.</p>"
+                f"<div class=\"trace-actions\">{''.join(links)}</div>"
+                f"{trace_rows}"
+                f'<iframe class="lcov-frame" src="{html.escape(self._relative_href(llvm_index))}" title="LLVM source coverage"></iframe>'
+                "</section>"
+            )
+
         lcov_dir = self.out_dir / base_name / f"{source.stem}_lcov"
         index_path = lcov_dir / "index.html"
         source_page = self._find_lcov_source_page(lcov_dir, source)
@@ -532,10 +571,10 @@ class ArtifactWriter:
         source_href = self._relative_href(source_page) if source_page and source_page.exists() else ""
         coverage_info = self.out_dir / base_name / "coverage.info"
         if not index_href:
-            expected = f"{base_name}/{source.stem}_lcov/index.html"
+            expected = f"{base_name}/llvm_html/index.html"
             return (
-                "<section><h2>LCOV Source Trace</h2>"
-                f"<p class=\"note\">LCOV source page is not generated yet. Run the backend with lcov/genhtml, then this report will embed <code>{html.escape(expected)}</code>.</p>"
+                "<section><h2>LLVM Source Coverage</h2>"
+                f"<p class=\"note\">LLVM source page is not generated yet. Run the backend with clang/llvm-cov, then this report will embed <code>{html.escape(expected)}</code>.</p>"
                 "</section>"
             )
 
@@ -547,8 +586,8 @@ class ArtifactWriter:
             links.append(f'<a class="trace-link" href="{html.escape(self._relative_href(coverage_info))}">Open coverage.info</a>')
         iframe_src = source_href or index_href
         return (
-            "<section><h2>LCOV Source Trace</h2>"
-            "<p class=\"note\">Trace executed and uncovered C lines back to the lcov/genhtml source coverage page.</p>"
+            "<section><h2>Legacy LCOV Source Trace</h2>"
+            "<p class=\"note\">Legacy lcov/genhtml source coverage is C0/C1 only. MC/DC is N/A in legacy lcov mode.</p>"
             f"<div class=\"trace-actions\">{''.join(links)}</div>"
             f"{trace_rows}"
             f'<iframe class="lcov-frame" src="{html.escape(iframe_src)}" title="LCOV source coverage"></iframe>'
@@ -646,7 +685,7 @@ class ArtifactWriter:
                 f"<td>{html.escape(fn.name)}</td>"
                 f"<td>{fn.start_line}-{fn.end_line}</td>"
                 "<td>Statement/line execution over function body</td>"
-                "<td>lcov LF/LH line counters when available</td>"
+                "<td>LLVM source-based line coverage from llvm-cov export/report</td>"
                 "</tr>"
             )
             for condition in fn.conditions:
@@ -657,7 +696,7 @@ class ArtifactWriter:
                     f"<td>{html.escape(fn.name)}</td>"
                     f"<td>{condition.line}</td>"
                     f"<td>Decision/branch outcomes for <code>{html.escape(condition.text)}</code></td>"
-                    "<td>lcov BRF/BRH branch counters when available</td>"
+                    "<td>LLVM source-based branch coverage from llvm-cov export/report</td>"
                     "</tr>"
                 )
                 for decision in decisions:
@@ -667,7 +706,7 @@ class ArtifactWriter:
                         f"<td>{html.escape(fn.name)}</td>"
                         f"<td>{condition.line}</td>"
                         f"<td>Independent effect pair for <code>{html.escape(decision)}</code></td>"
-                        "<td>Generated-vector MC/DC evidence; lcov does not prove executed MC/DC independence</td>"
+                        "<td>LLVM native MC/DC from -fcoverage-mcdc; N/A when LLVM MC/DC records are absent</td>"
                         "</tr>"
                     )
         return "".join(rows)
@@ -754,9 +793,9 @@ class ArtifactWriter:
                 f"<td>{len(functions)}</td>"
                 f"<td>{sum(len(fn.conditions) for fn in functions)}</td>"
                 f"<td>{len(cases)}</td>"
-                f"<td>{html.escape(self._metric_display(metrics.get('C0')))}</td>"
-                f"<td>{html.escape(self._metric_display(metrics.get('C1')))}</td>"
-                f"<td>{html.escape(self._metric_display(metrics.get('MC/DC')))}</td>"
+                f"<td>{html.escape(self._metric_display(metrics.get('C0'), 'C0'))}</td>"
+                f"<td>{html.escape(self._metric_display(metrics.get('C1'), 'C1'))}</td>"
+                f"<td>{html.escape(self._metric_display(metrics.get('MC/DC'), 'MC/DC'))}</td>"
                 f"<td>{html.escape(status)}</td>"
                 f"<td>{link}</td>"
                 "</tr>"
@@ -818,8 +857,8 @@ class ArtifactWriter:
         return path
 
     @staticmethod
-    def _metric_display(value: float | None) -> str:
-        return f"{value:.2f}%" if value is not None else "Missing"
+    def _metric_display(value: float | None, metric: str = "") -> str:
+        return f"{value:.2f}%" if value is not None else ("N/A" if metric == "MC/DC" else "Missing")
 
     def _aggregate_metric_cells(self, items: list[dict]) -> str:
         cells: list[str] = []
@@ -829,7 +868,7 @@ class ArtifactWriter:
                 for item in items
                 if item.get("feedback") and item["feedback"].metrics.get(metric) is not None
             ]
-            display = self._metric_display(min(values) if values else None)
+            display = self._metric_display(min(values) if values else None, metric)
             cells.append(
                 f'<div class="card">Min {html.escape(metric)}<div class="metric">{html.escape(display)}</div>'
                 '<div class="note">Worst file-level metric across selected sources</div></div>'
@@ -844,8 +883,9 @@ class ArtifactWriter:
                 f"{source.stem}_cpputest/src/ (copied source/header environment)",
                 f"{source.stem}_cpputest/{source.stem}_cpputest_test.cpp",
                 f"{source.stem}_cpputest/run_cpputest.sh",
-                f"{source.stem}_cpputest/coverage.info (after run with lcov)",
-                f"{source.stem}_cpputest/{source.stem}_lcov/index.html (after run with lcov/genhtml)",
+                f"{source.stem}_cpputest/coverage.json (after clang/llvm-cov run)",
+                f"{source.stem}_cpputest/llvm_report.txt (after clang/llvm-cov run)",
+                f"{source.stem}_cpputest/llvm_html/index.html (after clang/llvm-cov run)",
             ]
         if backend == "GoogleTest":
             return [
@@ -853,8 +893,9 @@ class ArtifactWriter:
                 f"{source.stem}_gtest/src/ (copied source/header environment)",
                 f"{source.stem}_gtest/{source.stem}_gtest_test.cpp",
                 f"{source.stem}_gtest/run_gtest.sh",
-                f"{source.stem}_gtest/coverage.info (after run with lcov)",
-                f"{source.stem}_gtest/{source.stem}_lcov/index.html (after run with lcov/genhtml)",
+                f"{source.stem}_gtest/coverage.json (after clang/llvm-cov run)",
+                f"{source.stem}_gtest/llvm_report.txt (after clang/llvm-cov run)",
+                f"{source.stem}_gtest/llvm_html/index.html (after clang/llvm-cov run)",
             ]
         return []
 
@@ -881,7 +922,7 @@ class ArtifactWriter:
         notes = feedback.metric_notes if feedback else {}
         for metric in ("C0", "C1", "MC/DC"):
             value = metrics.get(metric)
-            display = f"{value:.2f}%" if value is not None else "missing"
+            display = f"{value:.2f}%" if value is not None else ("n/a" if metric == "MC/DC" else "missing")
             note = notes.get(metric, "No executed report has been parsed for this metric yet.")
             lines.append(f"- {metric}: {display} - {note}")
         lines.append("")

@@ -29,6 +29,7 @@ from testing_mate.llm import refine_with_ollama
 from testing_mate.coverage_gap import *
 from testing_mate.c1_engine import *
 from testing_mate.utilities import *
+from testing_mate.toolchain import DEFAULT_MINGW_ROOT, configure_mingw_root, configured_mingw_root, mingw_toolchain_available
 
 
 class TestingMateApp(tk.Tk):
@@ -481,6 +482,8 @@ class TestingMateApp(tk.Tk):
         if not self.sources and not self.compile_commands.get().strip():
             messagebox.showwarning(APP_NAME, "Add source files, a source folder, or compile_commands.json.")
             return
+        if not self._ensure_msys2_toolchain():
+            return
         thread = threading.Thread(target=self._run, daemon=True)
         thread.start()
 
@@ -492,6 +495,8 @@ class TestingMateApp(tk.Tk):
         if not report or not Path(report).exists():
             messagebox.showwarning(APP_NAME, "Select an existing coverage/fail report first.")
             return
+        if not self._ensure_msys2_toolchain():
+            return
         thread = threading.Thread(target=self._refine_and_run_from_report, daemon=True)
         thread.start()
 
@@ -499,8 +504,43 @@ class TestingMateApp(tk.Tk):
         if not self.sources and not self.compile_commands.get().strip():
             messagebox.showwarning(APP_NAME, "Add source files, a source folder, or compile_commands.json.")
             return
+        if not self._ensure_msys2_toolchain():
+            return
         thread = threading.Thread(target=self._rerun_existing_testcases, daemon=True)
         thread.start()
+
+    def _ensure_msys2_toolchain(self) -> bool:
+        if mingw_toolchain_available():
+            return True
+
+        default_text = str(DEFAULT_MINGW_ROOT)
+        messagebox.showwarning(
+            APP_NAME,
+            f"MSYS2 MinGW64 was not found at:\n{default_text}\n\n"
+            "Select your MSYS2 mingw64 folder, for example C:\\msys64\\mingw64.",
+        )
+        initial = DEFAULT_MINGW_ROOT.parent if DEFAULT_MINGW_ROOT.parent.exists() else Path.home()
+        selected = filedialog.askdirectory(
+            title="Select MSYS2 mingw64 folder",
+            initialdir=str(initial),
+        )
+        if not selected:
+            return False
+
+        root = configure_mingw_root(selected)
+        if mingw_toolchain_available():
+            self._append_log(f"MSYS2 MinGW64 path: {configured_mingw_root()}")
+            return True
+
+        messagebox.showerror(
+            APP_NAME,
+            "The selected folder is not a usable MSYS2 MinGW64 installation.\n\n"
+            f"Selected: {root}\n\n"
+            "Expected files:\n"
+            f"- {root / 'bin'}\n"
+            f"- {root.parent / 'usr' / 'bin' / 'bash.exe'}",
+        )
+        return False
 
     def _run(self) -> None:
         self._set_log("")
