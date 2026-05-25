@@ -26,6 +26,7 @@ class CodeFunctionRecord:
     branches: list[str] = field(default_factory=list)
     return_statements: list[dict] = field(default_factory=list)
     execution_paths: list[dict] = field(default_factory=list)
+    call_contexts: list[dict] = field(default_factory=list)
     data_dependencies: list[dict] = field(default_factory=list)
     mock_requirements: list[dict] = field(default_factory=list)
     pointer_fields: dict[str, str] = field(default_factory=dict)
@@ -60,6 +61,7 @@ class CodeDatabase:
             globals_read = global_reads(fn, locals_, globals_written, function_names)
             returns = return_statements(fn)
             paths = execution_paths(fn, function_names, max_paths=16)
+            contexts = call_contexts(fn, function_names)
             records.append(CodeFunctionRecord(
                 name=fn.name,
                 return_type=fn.return_type,
@@ -76,6 +78,7 @@ class CodeDatabase:
                 branches=[condition.text for condition in fn.conditions],
                 return_statements=returns,
                 execution_paths=paths,
+                call_contexts=contexts,
                 data_dependencies=data_dependencies(fn, locals_, function_names),
                 mock_requirements=mock_requirements(external),
                 pointer_fields=pointer_field_reads(fn),
@@ -402,6 +405,79 @@ def calls_before_line(fn: FunctionInfo, calls: list[str], line: int) -> list[str
             if call_line <= line and call not in result:
                 result.append(call)
     return result
+
+
+def call_contexts(fn: FunctionInfo, callable_names: set[str]) -> list[dict]:
+    """Map each function call to the branch conditions that dominate its line.
+
+    Clang/source analysis already gives us source lines and condition depth. This
+    helper keeps the relationship deterministic: a mock is expected only when all
+    guarding conditions for the call evaluate true for the testcase vector.
+    """
+    calls = function_calls(fn, callable_names)
+    if not calls:
+        return []
+    body = clean_code(fn.body)
+    depth_by_line = block_depth_by_line(fn)
+    conditions = sorted(fn.conditions, key=lambda condition: (condition.line, condition.depth))
+    contexts: list[dict] = []
+    seen: set[tuple[str, int, int]] = set()
+    for call in calls:
+        for match in re.finditer(rf"\b{re.escape(call)}\s*\((?P<args>[^;()]*)\)", body):
+            line = fn.start_line + body[: match.start()].count("\n")
+            call_depth = depth_by_line.get(line, 0)
+            guards = [
+                {"text": condition.text, "truth": True, "line": condition.line, "depth": condition.depth}
+                for condition in conditions
+                if condition.line < line and int(getattr(condition, "depth", 0)) < call_depth
+            ]
+            args = [
+                {"index": index, "text": arg}
+                for index, arg in enumerate(split_call_args(match.group("args")))
+            ]
+            key = (call, line, match.start())
+            if key in seen:
+                continue
+            seen.add(key)
+            contexts.append({
+                "function": call,
+                "line": line,
+                "depth": call_depth,
+                "guards": guards,
+                "arguments": args,
+            })
+    return contexts
+
+
+def block_depth_by_line(fn: FunctionInfo) -> dict[int, int]:
+    depth = 0
+    result: dict[int, int] = {}
+    for offset, line in enumerate(fn.body.splitlines()):
+        line_no = fn.start_line + offset
+        result[line_no] = depth
+        depth += line.count("{")
+        depth = max(0, depth - line.count("}"))
+    return result
+
+
+def split_call_args(args: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in args or "":
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return parts
 
 
 def path_priority(constraints: list[dict], calls: list[str], writes: list[str], expected_return: str) -> int:

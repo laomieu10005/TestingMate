@@ -12,7 +12,7 @@ from testing_mate.constants import C_SOURCE_EXTENSIONS, SCALAR_TOKENS
 from testing_mate.mc_coverage import MCDCCoverageCollector
 from testing_mate.models import FunctionInfo, Parameter, RunResult, TestCase, Condition
 from testing_mate.boolean_expression import ConditionEvaluator
-from testing_mate.stub_engine import StubHarnessEngine
+from testing_mate.stub_engine import StubHarnessEngine, StubSymbol
 from testing_mate.toolchain import local_mingw_bin, msys_bash_path, toolchain_env, windows_to_msys_path
 from testing_mate.vector_generator import TestVectorGenerator
 
@@ -249,6 +249,215 @@ class TestOracleFallback:
         return ""
 
 
+class TestMockFallback:
+    """Patch generated mock expectations from backend mock-failure evidence."""
+
+    @classmethod
+    def apply(cls, backend: str, out_dir: Path, source: Path, run_result: RunResult) -> tuple[int, list[str]]:
+        if run_result.returncode in (0, None):
+            return 0, []
+        test_source = TestOracleFallback._test_source_path(backend, out_dir, source)
+        if not test_source.exists():
+            return 0, [f"Mock fallback skipped: test source not found: {test_source}"]
+        try:
+            text = test_source.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return 0, [f"Mock fallback skipped: cannot read {test_source}: {exc}"]
+
+        failures = cls.mock_failures(run_result)
+        if not failures:
+            return 0, ["Mock fallback found no parseable mock failures."]
+
+        mock_info = cls._mock_info_map(test_source)
+        updated = 0
+        notes: list[str] = []
+        for failure in failures:
+            test_name = failure.get("test", "")
+            function = failure.get("function", "")
+            action = failure.get("action", "")
+            if not test_name or not function or action not in {"add", "remove"}:
+                continue
+            if action == "remove":
+                text, changed = cls._remove_mock_expectation(text, test_name, function)
+                if changed:
+                    updated += 1
+                    notes.append(f"Mock fallback removed redundant expectation: {test_name} -> {function}.")
+                else:
+                    notes.append(f"Mock fallback could not remove expectation: {test_name} -> {function}.")
+            else:
+                text, changed = cls._add_mock_expectation(text, backend, test_name, function, mock_info)
+                if changed:
+                    updated += 1
+                    notes.append(f"Mock fallback added missing expectation: {test_name} -> {function}.")
+                else:
+                    notes.append(f"Mock fallback could not add expectation: {test_name} -> {function}.")
+
+        if not updated:
+            return 0, notes or ["Mock fallback did not change any testcase."]
+        try:
+            test_source.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            return 0, [f"Mock fallback could not write {test_source}: {exc}"]
+        return updated, notes
+
+    @staticmethod
+    def mock_failures(run_result: RunResult) -> list[dict[str, str]]:
+        text = "\n".join(part for part in (run_result.stdout, run_result.stderr) if part)
+        if not text.strip():
+            return []
+        failures: list[dict[str, str]] = []
+        current_test = ""
+        cpputest_unfulfilled = False
+        unexpected_context = False
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            test_match = re.search(r"\bTEST(?:_F)?\s*\(\s*[^,]+,\s*([^)]+)\)", line)
+            if test_match:
+                current_test = test_match.group(1).strip()
+            run_match = re.search(r"^\[\s*RUN\s*\]\s+(.+)$", line)
+            if run_match:
+                current_test = run_match.group(1).strip().rsplit(".", 1)[-1]
+
+            if "EXPECTED calls that WERE NOT fulfilled" in line:
+                cpputest_unfulfilled = True
+                unexpected_context = False
+                continue
+            if "EXPECTED calls that WERE fulfilled" in line:
+                cpputest_unfulfilled = False
+                continue
+            if cpputest_unfulfilled:
+                call_match = re.search(r"^\s*([A-Za-z_]\w*)\s*->", line)
+                if call_match and current_test:
+                    failures.append({"test": current_test, "function": call_match.group(1), "action": "remove"})
+                continue
+
+            lower = line.lower()
+            unexpected_direct = re.search(
+                r"unexpected\s+(?:mock\s+)?(?:function\s+)?call(?:\s+to\s+function)?\s*:?\s*\"?([A-Za-z_]\w*)",
+                line,
+                re.I,
+            )
+            if unexpected_direct and current_test:
+                failures.append({"test": current_test, "function": unexpected_direct.group(1), "action": "add"})
+                continue
+            if "unexpected mock function call" in lower or ("mock failure" in lower and "unexpected" in lower):
+                unexpected_context = True
+            if unexpected_context:
+                call_match = re.search(r"(?:Function call:\s*|^\s*)([A-Za-z_]\w*)\s*(?:\(|->)", line)
+                if call_match and current_test and call_match.group(1) not in {"Mock", "Function"}:
+                    failures.append({"test": current_test, "function": call_match.group(1), "action": "add"})
+                    unexpected_context = False
+                    continue
+                if index + 1 < len(lines):
+                    next_match = re.search(r"^\s*([A-Za-z_]\w*)\s*(?:\(|->)", lines[index + 1])
+                    if next_match and current_test:
+                        failures.append({"test": current_test, "function": next_match.group(1), "action": "add"})
+                        unexpected_context = False
+                        continue
+
+            if "actual: never called" in lower:
+                window = "\n".join(lines[max(0, index - 8): index + 1])
+                for call_match in re.finditer(r"EXPECT_CALL\([^,]+,\s*([A-Za-z_]\w*)\s*\(", window):
+                    if current_test:
+                        failures.append({"test": current_test, "function": call_match.group(1), "action": "remove"})
+
+        unique: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in failures:
+            key = (item["test"], item["function"], item["action"])
+            if key not in seen:
+                unique.append(item)
+                seen.add(key)
+        return unique
+
+    @staticmethod
+    def _remove_mock_expectation(text: str, test_name: str, function: str) -> tuple[str, bool]:
+        span = TestOracleFallback._test_block_span(text, test_name)
+        if span is None:
+            return text, False
+        start, end = span
+        block = text[start:end]
+        safe = TestBackendGenerator._safe_identifier(function)
+        patterns = [
+            rf"(?m)^\s*mock\(\)\.expectOneCall\(\s*\"{re.escape(function)}\"\s*\).*?;\s*$\n?",
+            rf"(?m)^\s*EXPECT_CALL\(\s*TestingMate_Mock\(\)\s*,\s*{re.escape(safe)}\s*\(.*?;\s*$\n?",
+            rf"(?m)^\s*(?:CHECK|EXPECT_GT)\s*\(\s*TestingMate_{re.escape(safe)}_CallCount\(\).*?;\s*$\n?",
+        ]
+        changed = False
+        for pattern in patterns:
+            next_block, count = re.subn(pattern, "", block)
+            if count:
+                block = next_block
+                changed = True
+        return (text[:start] + block + text[end:], True) if changed else (text, False)
+
+    @staticmethod
+    def _add_mock_expectation(
+        text: str,
+        backend: str,
+        test_name: str,
+        function: str,
+        mock_info: dict[str, dict[str, str]],
+    ) -> tuple[str, bool]:
+        span = TestOracleFallback._test_block_span(text, test_name)
+        if span is None:
+            return text, False
+        start, end = span
+        block = text[start:end]
+        safe = TestBackendGenerator._safe_identifier(function)
+        if f'expectOneCall("{function}")' in block or f"EXPECT_CALL(TestingMate_Mock(), {safe}(" in block:
+            return text, False
+        info = mock_info.get(safe, {})
+        if backend == "CppUTest":
+            line = f'    mock().expectOneCall("{function}").ignoreOtherParameters();\n'
+        else:
+            arity = int(info.get("arity") or 0)
+            args = ", ".join("::testing::_" for _ in range(arity))
+            ret = info.get("return_type", "void")
+            if ret == "void":
+                line = f"    EXPECT_CALL(TestingMate_Mock(), {safe}({args}));\n"
+            else:
+                line = f"    EXPECT_CALL(TestingMate_Mock(), {safe}({args})).WillOnce(::testing::Return({cls_default_return(ret)}));\n"
+        marker = re.search(r"(?m)^(\s*/\*\s*PRECONDITION\s*\*/\s*\n)", block)
+        if marker:
+            insert_at = marker.end()
+        else:
+            marker = re.search(r"(?m)^(\s*/\*\s*ACTIONS\s*\*/)", block)
+            insert_at = marker.start() if marker else len(block) - 2
+        block = block[:insert_at] + line + block[insert_at:]
+        return text[:start] + block + text[end:], True
+
+    @staticmethod
+    def _mock_info_map(test_source: Path) -> dict[str, dict[str, str]]:
+        header = test_source.parent / "stub" / "include" / "stubs.h"
+        if not header.exists():
+            return {}
+        try:
+            text = header.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return {}
+        result: dict[str, dict[str, str]] = {}
+        for match in re.finditer(r"MOCK_METHOD\s*\(\s*([^,]+?)\s*,\s*([A-Za-z_]\w*)\s*,\s*\((.*?)\)\s*,", text, re.S):
+            params = match.group(3).strip()
+            arity = 0 if not params else len(StubHarnessEngine._split_params(params))
+            result[match.group(2)] = {"return_type": " ".join(match.group(1).split()), "arity": str(arity)}
+        return result
+
+
+def cls_default_return(return_type: str) -> str:
+    clean = " ".join((return_type or "").replace("const", "").replace("volatile", "").split()).strip()
+    lowered = clean.lower()
+    if not clean or lowered == "void":
+        return "0"
+    if "*" in clean:
+        return "nullptr"
+    if lowered in {"bool", "_bool", "boolean"}:
+        return "false"
+    if lowered.startswith(("struct ", "union ")):
+        return "{}"
+    return "0"
+
+
 class TestBackendGenerator:
     include_pattern = re.compile(r"^\s*#\s*include\s*[<\"]([^>\"]+)[>\"]", re.M)
 
@@ -293,7 +502,10 @@ class TestBackendGenerator:
         stub_result = StubHarnessEngine().write_for_backend("CppUTest", test_dir, source, functions, cases, harness_sources, self.include_dirs, code_database)
         c_sources = " ".join([*(f"src/{path.name}" for path in link_sources), *self._relative_cmake_paths(stub_result.source_files, test_dir)])
         include_dirs = self._cmake_include_dirs(source, harness_sources, [Path("src"), Path("stub/include")])
-        test_file.write_text(self._cpp_test_source("CppUTest", source, functions, cases, harness_sources), encoding="utf-8")
+        test_file.write_text(
+            self._cpp_test_source("CppUTest", source, functions, cases, harness_sources, stub_result.stub_symbols),
+            encoding="utf-8",
+        )
         cmake_file.write_text(
             "\n".join(
                 [
@@ -354,7 +566,10 @@ class TestBackendGenerator:
         stub_result = StubHarnessEngine().write_for_backend("GoogleTest", test_dir, source, functions, cases, harness_sources, self.include_dirs, code_database)
         c_sources = " ".join([*(f"src/{path.name}" for path in link_sources), *self._relative_cmake_paths(stub_result.source_files, test_dir)])
         include_dirs = self._cmake_include_dirs(source, harness_sources, [Path("src"), Path("stub/include")])
-        test_file.write_text(self._cpp_test_source("GoogleTest", source, functions, cases, harness_sources), encoding="utf-8")
+        test_file.write_text(
+            self._cpp_test_source("GoogleTest", source, functions, cases, harness_sources, stub_result.stub_symbols),
+            encoding="utf-8",
+        )
         cmake_file.write_text(
             "\n".join(
                 [
@@ -386,7 +601,11 @@ class TestBackendGenerator:
                     f"add_executable({source.stem}_gtest {test_file.name} {c_sources})",
                     f"target_include_directories({source.stem}_gtest PRIVATE {include_dirs})",
                     f"target_compile_options({source.stem}_gtest PRIVATE $<$<COMPILE_LANGUAGE:C>:-include> $<$<COMPILE_LANGUAGE:C>:stubs.h>)",
-                    f"target_link_libraries({source.stem}_gtest GTest::gtest GTest::gtest_main)",
+                    "if(TARGET GTest::gmock)",
+                    f"  target_link_libraries({source.stem}_gtest GTest::gmock GTest::gtest GTest::gtest_main)",
+                    "else()",
+                    f"  target_link_libraries({source.stem}_gtest GTest::gtest GTest::gtest_main)",
+                    "endif()",
                     f"add_test(NAME {source.stem}_gtest COMMAND {source.stem}_gtest)",
                 ]
             ),
@@ -468,14 +687,43 @@ class TestBackendGenerator:
         if path.suffix.lower() in {".c", ".h", ".hpp"}:
             queue.append(resolved)
 
-    def _cpp_test_source(self, backend: str, source: Path, functions: list[FunctionInfo], cases: list[TestCase], unit_sources: list[Path]) -> str:
+    def _cpp_test_source(
+        self,
+        backend: str,
+        source: Path,
+        functions: list[FunctionInfo],
+        cases: list[TestCase],
+        unit_sources: list[Path],
+        stub_symbols: list[StubSymbol] | None = None,
+    ) -> str:
         include = self._guess_header(source, unit_sources)
         struct_field_types = self._struct_field_type_map(source, unit_sources)
+        stubbed_calls = {symbol.name for symbol in (stub_symbols or []) if symbol.kind == "function"}
+        stub_symbols_by_name = {symbol.name: symbol for symbol in (stub_symbols or []) if symbol.kind == "function"}
         lines = []
         if backend == "CppUTest":
-            lines.extend(['#include "CppUTest/CommandLineTestRunner.h"', '#include "CppUTest/TestHarness.h"', '#include <string.h>', "", 'extern "C" {', f'#include "{include}"', '#include "stubs.h"', "}", ""])
+            lines.extend([
+                '#include "CppUTest/CommandLineTestRunner.h"',
+                '#include "CppUTest/TestHarness.h"',
+                '#include <string.h>',
+                "",
+                'extern "C" {',
+                f'#include "{include}"',
+                "}",
+                '#include "stubs.h"',
+                "",
+            ])
         else:
-            lines.extend(["#include <gtest/gtest.h>", "#include <string.h>", "", 'extern "C" {', f'#include "{include}"', '#include "stubs.h"', "}", ""])
+            lines.extend([
+                "#include <gtest/gtest.h>",
+                "#include <string.h>",
+                "",
+                'extern "C" {',
+                f'#include "{include}"',
+                "}",
+                '#include "stubs.h"',
+                "",
+            ])
         grouped: dict[str, list[TestCase]] = {}
         for case in cases:
             grouped.setdefault(case.function, []).append(case)
@@ -522,8 +770,8 @@ class TestBackendGenerator:
                 fixture_declarations.append(f"{safe_type} {safe_name};")
                 declared_fixture_names.add(safe_name)
 
-            setup_reset_lines: list[str] = ["TestingMate_ResetStubs();"]
-            teardown_reset_lines: list[str] = ["TestingMate_ResetStubs();"]
+            setup_reset_lines: list[str] = ["TestingMate_ResetStubs();", "TestingMate_AllowUnexpectedMockCalls();"]
+            teardown_reset_lines: list[str] = ["TestingMate_VerifyAndClearMocks();", "TestingMate_ResetStubs();"]
             call_args_by_param: dict[str, str] = {}
             pointer_fixtures: dict[str, str] = {}
             pointer_arg_names: dict[str, str] = {}
@@ -586,6 +834,9 @@ class TestBackendGenerator:
                     pointer_arg_names,
                     "    ",
                     struct_field_types,
+                    backend,
+                    stubbed_calls,
+                    stub_symbols_by_name,
                 )
                 lines.append("    /* PRECONDITION */")
                 lines.extend(precondition_lines if precondition_lines else ["    /* No explicit precondition values were generated. */"])
@@ -596,6 +847,14 @@ class TestBackendGenerator:
                 else:
                     lines.append(f"    {return_fixture_name} = {{}};")
                     lines.append(f"    {return_fixture_name} = {call};")
+                expected_call_lines = self._stub_call_assertion_lines(
+                    backend,
+                    self._expected_stub_call_names(case, stubbed_calls),
+                    "    ",
+                )
+                if expected_call_lines:
+                    lines.append("    /* EXPECTED CALLS */")
+                    lines.extend(expected_call_lines)
                 lines.append(f"    /* {case.rationale} */")
                 lines.append("}")
                 lines.append("")
@@ -608,17 +867,170 @@ class TestBackendGenerator:
         values = case if isinstance(case, dict) else (case.values or {})
         lines: list[str] = []
         for key, value in sorted(values.items()):
-            if key.startswith("__stub_return."):
-                symbol = key.split(".", 1)[1]
-                safe = TestBackendGenerator._safe_identifier(symbol)
-                lines.append(f"{indent}TestingMate_SetStubReturn_{safe}((long long)({value}));")
-                continue
             for prefix in ("__global.", "__set_global.", "__input_global.", "__setup_global.", "setup.global."):
                 if key.startswith(prefix):
                     symbol = key[len(prefix) :]
                     if TestBackendGenerator._is_c_identifier(symbol):
                         lines.append(f"{indent}{symbol} = {value};")
                     break
+        return lines
+
+    @staticmethod
+    def _stub_expectation_setup_lines(
+        backend: str,
+        call_names: list[str],
+        values: dict[str, str],
+        stub_symbols: dict[str, StubSymbol],
+        indent: str = "",
+    ) -> list[str]:
+        if backend not in {"CppUTest", "GoogleTest"}:
+            return []
+        lines: list[str] = []
+        for name in call_names:
+            symbol = stub_symbols.get(name)
+            safe = TestBackendGenerator._safe_identifier(name)
+            value = values.get(f"__stub_return.{name}", "0")
+            expected_args = TestBackendGenerator._expected_call_arg_values(name, values)
+            if backend == "CppUTest":
+                param_expectations = TestBackendGenerator._cpputest_expected_param_chain(symbol, expected_args)
+                ignore_params = ".ignoreOtherParameters()" if symbol and TestBackendGenerator._has_mock_params(symbol.params) and not param_expectations else ""
+                if symbol and TestBackendGenerator._is_void_return_type(symbol.return_type):
+                    lines.append(f"{indent}mock().expectOneCall(\"{name}\"){param_expectations}{ignore_params};")
+                else:
+                    return_type = TestBackendGenerator._mock_return_type(symbol.return_type if symbol else "")
+                    lines.append(f"{indent}mock().expectOneCall(\"{name}\"){param_expectations}{ignore_params}.andReturnValue({TestBackendGenerator._typed_value(return_type, str(value))});")
+            else:
+                args = TestBackendGenerator._gmock_argument_matchers(symbol.params if symbol else "void", expected_args)
+                if symbol and TestBackendGenerator._is_void_return_type(symbol.return_type):
+                    lines.append(f"{indent}EXPECT_CALL(TestingMate_Mock(), {safe}({args}));")
+                else:
+                    return_type = TestBackendGenerator._mock_return_type(symbol.return_type if symbol else "")
+                    typed_value = TestBackendGenerator._typed_value(return_type, str(value)) if symbol else str(value)
+                    lines.append(
+                        f"{indent}EXPECT_CALL(TestingMate_Mock(), {safe}({args})).WillOnce(::testing::Return({typed_value}));"
+                    )
+        return lines
+
+    @staticmethod
+    def _expected_stub_call_names(case: TestCase, stubbed_calls: set[str]) -> list[str]:
+        values = case.values or {}
+        names: list[str] = []
+
+        def add(raw: object) -> None:
+            for item in re.split(r"[,;\s]+", str(raw or "")):
+                clean = item.strip()
+                if clean in stubbed_calls and clean not in names:
+                    names.append(clean)
+
+        for key, value in sorted(values.items()):
+            if key in {"__expected_calls", "__expect_calls", "expected_calls", "expect_calls"}:
+                add(value)
+            elif key.startswith("__expected_call."):
+                add(key.split(".", 1)[1])
+            elif key.startswith("__stub_return."):
+                add(key.split(".", 1)[1])
+        return names
+
+    @staticmethod
+    def _gmock_argument_matchers(params: str, expected_args: dict[int, str] | None = None) -> str:
+        trimmed = str(params or "").strip()
+        if not trimmed or trimmed == "void" or trimmed == "...":
+            return ""
+        depth = 0
+        items: list[str] = []
+        current = ""
+        for ch in trimmed:
+            if ch == "," and depth == 0:
+                items.append(current.strip())
+                current = ""
+                continue
+            current += ch
+            if ch in "([{<":
+                depth += 1
+            elif ch in ")]}>":
+                depth = max(0, depth - 1)
+        if current.strip():
+            items.append(current.strip())
+        expected_args = expected_args or {}
+        matchers: list[str] = []
+        for index, item in enumerate(item for item in items if item and item != "void"):
+            value = expected_args.get(index)
+            if value is None:
+                matchers.append("::testing::_")
+                continue
+            name = StubHarnessEngine._param_name(item, index)
+            ctype = StubHarnessEngine._param_type(item, name) if name else item
+            if "*" in ctype and str(value).strip() not in {"0", "NULL", "nullptr"} and not str(value).strip().startswith("&"):
+                matchers.append("::testing::_")
+                continue
+            matchers.append(f"::testing::Eq({TestBackendGenerator._typed_value(ctype, value)})")
+        return ", ".join(matchers)
+
+    @staticmethod
+    def _expected_call_arg_values(call_name: str, values: dict[str, str]) -> dict[int, str]:
+        prefix = f"__expected_call_arg.{call_name}."
+        result: dict[int, str] = {}
+        for key, value in values.items():
+            if not key.startswith(prefix):
+                continue
+            raw = key[len(prefix):]
+            if raw.isdigit():
+                result[int(raw)] = str(value)
+        return result
+
+    @staticmethod
+    def _cpputest_expected_param_chain(symbol: StubSymbol | None, expected_args: dict[int, str]) -> str:
+        if symbol is None or not expected_args:
+            return ""
+        params = StubHarnessEngine._definition_params(symbol.params)
+        if params == "void":
+            return ""
+        parts: list[str] = []
+        for index, raw in enumerate(StubHarnessEngine._split_params(params)):
+            if index not in expected_args:
+                continue
+            name = StubHarnessEngine._param_name(raw, index) or f"p{index}"
+            ctype = StubHarnessEngine._param_type(raw, name)
+            call = TestBackendGenerator._cpputest_expected_param_call(ctype, name, expected_args[index])
+            if call:
+                parts.append(call)
+        return "".join(parts)
+
+    @staticmethod
+    def _cpputest_expected_param_call(ctype: str, name: str, value: str) -> str:
+        clean = " ".join((ctype or "").replace("const", "").replace("volatile", "").split()).strip()
+        lowered = clean.lower()
+        if "*" in clean:
+            if str(value).strip() not in {"0", "NULL", "nullptr"} and not str(value).strip().startswith("&"):
+                return ""
+            return f'.withPointerParameter("{name}", (void *){value})'
+        if lowered in {"float", "double"}:
+            return f'.withDoubleParameter("{name}", (double)({value}))'
+        if "unsigned" in lowered or re.fullmatch(r"u(?:int)?(?:8|16|32|64)(?:_t)?", lowered):
+            return f'.withUnsignedIntParameter("{name}", (unsigned int)({value}))'
+        if "long" in lowered or re.fullmatch(r"int(?:32|64)(?:_t)?", lowered):
+            return f'.withLongIntParameter("{name}", (long int)({value}))'
+        return f'.withIntParameter("{name}", (int)({value}))'
+
+    @staticmethod
+    def _has_mock_params(params: str) -> bool:
+        trimmed = str(params or "").strip()
+        return bool(trimmed and trimmed not in {"void", "..."})
+
+    @staticmethod
+    def _mock_return_type(return_type: str) -> str:
+        return StubHarnessEngine._mock_return_type(return_type or "int")
+
+    @staticmethod
+    def _stub_call_assertion_lines(backend: str, call_names: list[str], indent: str = "    ") -> list[str]:
+        lines: list[str] = []
+        for name in call_names:
+            safe = TestBackendGenerator._safe_identifier(name)
+            accessor = f"TestingMate_{safe}_CallCount()"
+            if backend == "CppUTest":
+                lines.append(f"{indent}CHECK({accessor} > 0U);")
+            else:
+                lines.append(f"{indent}EXPECT_GT({accessor}, 0U);")
         return lines
 
     @staticmethod
@@ -833,10 +1245,21 @@ class TestBackendGenerator:
         pointer_arg_names: dict[str, str],
         indent: str = "",
         struct_field_types: dict[str, dict[str, str]] | None = None,
+        backend: str = "",
+        stubbed_calls: set[str] | None = None,
+        stub_symbols: dict[str, StubSymbol] | None = None,
     ) -> list[str]:
         values = {**self._fixit_input_literals(fn, case), **(case.values or {})}
         lines: list[str] = []
         lines.extend(self._state_setup_lines(values, indent))
+        explicit_calls = self._expected_stub_call_names(case, stubbed_calls or set())
+        lines.extend(self._stub_expectation_setup_lines(
+            backend,
+            explicit_calls,
+            values,
+            stub_symbols or {},
+            indent,
+        ))
 
         for key, value in sorted(values.items()):
             local_name = self._fixture_local_key_name(key)

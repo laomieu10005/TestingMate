@@ -1,4 +1,4 @@
-APP_NAME = "Testing Mate v5"
+APP_NAME = "Testing Mate v5.0"
 DEFAULT_COMPILER = "gcc"
 
 # LLM Enhancement Stages (environment variable: TESTMATE_LLM_STAGES)

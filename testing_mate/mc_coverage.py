@@ -411,7 +411,10 @@ class MCDCCoverageEngine:
 
     @staticmethod
     def _independence_pair(evaluations: list[tuple[TestCase, list[bool] | None, bool | None]], target_index: int) -> tuple[TestCase, TestCase] | None:
+        # Filter to fully-evaluable rows
         valid = [(case, decisions, outcome) for case, decisions, outcome in evaluations if decisions is not None and outcome is not None]
+
+        # First pass: strict unique-cause pair (only target differs)
         for left_index, (left_case, left_decisions, left_outcome) in enumerate(valid):
             for right_case, right_decisions, right_outcome in valid[left_index + 1 :]:
                 if left_outcome == right_outcome:
@@ -425,6 +428,39 @@ class MCDCCoverageEngine:
                 )
                 if other_same:
                     return left_case, right_case
+
+        # Second pass: relaxed/masking acceptance.
+        # Accept a pair where target and outcome differ even if other conditions differ,
+        # provided we have evidence those other conditions are "masked" (i.e. flipping
+        # them alone does not change the overall decision outcome in the available data).
+        def is_masked(index: int) -> bool:
+            # search for any pair that differs only at `index` and has same outcome
+            for i, (case_a, dec_a, out_a) in enumerate(valid):
+                for case_b, dec_b, out_b in valid[i + 1 :]:
+                    if out_a != out_b:
+                        continue
+                    if dec_a[index] == dec_b[index]:
+                        continue
+                    # all other indices equal
+                    others_equal = all(
+                        dec_a[k] == dec_b[k] for k in range(len(dec_a)) if k != index
+                    )
+                    if others_equal:
+                        return True
+            return False
+
+        for left_index, (left_case, left_decisions, left_outcome) in enumerate(valid):
+            for right_case, right_decisions, right_outcome in valid[left_index + 1 :]:
+                if left_outcome == right_outcome:
+                    continue
+                if left_decisions[target_index] == right_decisions[target_index]:
+                    continue
+                # determine which other indices differ
+                mismatched = [i for i in range(len(left_decisions)) if i != target_index and left_decisions[i] != right_decisions[i]]
+                # require masking evidence for every mismatched other index
+                if all(is_masked(i) for i in mismatched):
+                    return left_case, right_case
+
         return None
 
     def _eval_decision(self, decision: str, values: dict[str, str]) -> bool | None:

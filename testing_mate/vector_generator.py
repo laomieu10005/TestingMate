@@ -596,8 +596,8 @@ class TestVectorGenerator:
                 add("expected_output", f"{getattr(param, 'name', '')}.{match.group(1)}", match.group(2))
         return hints
 
-    @staticmethod
     def _case(
+        self,
         source_name: str,
         fn: FunctionInfo,
         level: str,
@@ -609,6 +609,7 @@ class TestVectorGenerator:
         integration_calls: list[str] | None = None,
     ) -> TestCase:
         values = TestVectorGenerator._apply_fixit_hints(fn, values)
+        values = self._with_reachable_expected_calls(fn, values)
         path_id = values.get("__path_id")
         expected_return = values.get("__expected_return")
         expected_calls = values.get("__expected_calls")
@@ -645,6 +646,69 @@ class TestVectorGenerator:
             **audit,
         )
 
+    def _with_reachable_expected_calls(self, fn: FunctionInfo, values: dict[str, str]) -> dict[str, str]:
+        record = self._record_for(fn)
+        contexts = getattr(record, "call_contexts", []) if record else []
+        if not contexts:
+            return values
+        result = dict(values)
+        expected_calls: list[str] = []
+        for context in contexts:
+            if not self._call_context_reachable(context, result):
+                continue
+            name = str(context.get("function") or "").strip()
+            if not name:
+                continue
+            if name not in expected_calls:
+                expected_calls.append(name)
+            for arg in context.get("arguments", []) or []:
+                arg_text = str(arg.get("text") or "").strip()
+                resolved = self._resolve_call_argument_value(arg_text, result)
+                if resolved is None:
+                    continue
+                index = str(arg.get("index") or 0)
+                result.setdefault(f"__expected_call_arg.{name}.{index}", resolved)
+        if expected_calls:
+            result["__expected_calls"] = ",".join(expected_calls)
+        else:
+            result.pop("__expected_calls", None)
+            for key in list(result):
+                if key.startswith("__expected_call_arg."):
+                    result.pop(key, None)
+        return result
+
+    @staticmethod
+    def _call_context_reachable(context: dict, values: dict[str, str]) -> bool:
+        for guard in context.get("guards", []) or []:
+            text = str(guard.get("text") or "").strip()
+            if not text:
+                continue
+            evaluated = ConditionEvaluator().evaluate(text, values)
+            if evaluated is None:
+                return False
+            if bool(evaluated) != bool(guard.get("truth", True)):
+                return False
+        return True
+
+    @staticmethod
+    def _resolve_call_argument_value(arg_text: str, values: dict[str, str]) -> str | None:
+        clean = re.sub(r"\s+", "", str(arg_text or ""))
+        if not clean:
+            return None
+        aliases = [
+            clean,
+            clean.replace("->", "."),
+            clean.lstrip("&"),
+            clean.lstrip("*"),
+            clean.replace("[0]", ""),
+        ]
+        for key in aliases:
+            if key in values:
+                return str(values[key])
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?[uUlLfF]*|true|false|TRUE|FALSE|NULL|nullptr", clean):
+            return clean
+        return None
+
     @staticmethod
     def _audit_fields(
         fn: FunctionInfo,
@@ -678,10 +742,10 @@ class TestVectorGenerator:
                     f"and call-observation hooks for: {call_summary}."
                 ),
                 "test_steps": (
-                    f"1. Apply integration input vector: {param_summary}. \n"
-                    f"2. Invoke integration entry {fn.name}. \n"
-                    "3. Observe function-call arguments/order, return value, output parameters, shared data updates, and propagated status. \n"
-                    f"4. Trace interface/data-flow obligations and condition lines: {condition_lines}.\n"
+                    f"\n\t\t1. Apply integration input vector: {param_summary}."
+                    f"\n\t\t2. Invoke integration entry {fn.name}."
+                    "\n\t\t3. Observe function-call arguments/order, return value, output parameters, shared data updates, and propagated status. "
+                    f"\n\t\t4. Trace interface/data-flow obligations and condition lines: {condition_lines}.\n"
                 ),
                 "teardown": "Reset integration stubs/mocks, call logs, shared data, output fixtures, and transient diagnostic state.",
                 "pass_fail_criteria": (
@@ -703,10 +767,10 @@ class TestVectorGenerator:
                 "and create valid fixture objects for pointer parameters where required."
             ),
             "test_steps": (
-                f"1. Apply input vector: {param_summary}. \n"
-                f"2. Invoke {fn.name}. \n"
-                "3. Capture return value and modified outputs. \n"
-                f"4. Check targeted coverage/condition evidence for lines: {condition_lines}.\n"
+                f"\n\t\t1. Apply input vector: {param_summary}."
+                f"\n\t\t2. Invoke {fn.name}."
+                "\n\t\t3. Capture return value and modified outputs."
+                f"\n\t\t4. Check targeted coverage/condition evidence for lines: {condition_lines}.\n"
             ),
             "teardown": "Reset mocks/stubs, clear transient diagnostic state, release fixtures, and restore default calibration values.",
             "pass_fail_criteria": (

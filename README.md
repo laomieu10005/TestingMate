@@ -25,7 +25,7 @@ Recommended first run:
 3. Select level: `UT`, `IT`, or `ST`.
 4. Select backend: `GoogleTest` or `CppUTest`.
 5. Enable `Run after generate` when the MSYS2/MinGW toolchain is available.
-6. Click `Analyze & Generate`.
+6. Click `Generate`.
 7. Use `Open Report` to view the latest generated HTML report.
 
 ## Current Pipeline
@@ -323,6 +323,15 @@ Testing Mate generates a strong first pass, not a final safety certification pac
 - Coupled MC/DC decisions
 - Integration behavior across real RTE/BSW/MCAL layers
 - C++ parsing, which is accepted but still experimental compared with C
+
+### Recent fixes
+
+- Improved MC/DC independence-pair search: the analyzer now attempts a relaxed
+  masked-pair acceptance when strict unique-cause pairs are not available,
+  using evidence from available vectors to identify masked atomic conditions.
+  This reduces false negatives in MC/DC calculation while keeping strict
+  proof as the primary criterion. See `testing_mate/test_c1_mcdc.py` for
+  regression tests covering C1/MC/DC relationships.
 
 Path generation is intentionally prioritized rather than exhaustive. The tool focuses on return paths, error paths, boundary paths, branches with calls, global writes, interface paths, diagnostic paths, and uncovered paths to avoid path explosion.
 

@@ -702,6 +702,7 @@ def refine_with_ollama(
     level: str,
     backend: str,
     model: str,
+    timeout_seconds: int,
     target_percent: float,
     max_rounds: int,
     log: Callable[[str], None],
@@ -726,7 +727,7 @@ def refine_with_ollama(
         return cases
     if not has_report_evidence(feedback):
         log("Ollama generation enhancement: no coverage report yet, refining small per-function chunks.")
-        client = OllamaClient(model=model)
+        client = OllamaClient(model=model, timeout=timeout_seconds)
         refiner = OllamaTestRefiner(client)
         merged = list(cases)
         max_functions = OllamaClient._env_int("TESTMATE_LLM_MAX_FUNCTIONS", 8, minimum=1)
@@ -755,7 +756,7 @@ def refine_with_ollama(
     if feedback_meets_target(feedback, target_percent):
         log(f"Ollama skipped: parsed report already meets target {target_percent:.2f}%.")
         return cases
-    client = OllamaClient(model=model)
+    client = OllamaClient(model=model, timeout=timeout_seconds)
     refiner = OllamaTestRefiner(client)
     planner = CoverageGapPlanner()
     merged = list(cases)

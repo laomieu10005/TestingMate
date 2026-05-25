@@ -18,23 +18,30 @@ class C1CoverageEngine:
             if not fn_cases:
                 continue
             for condition in fn.conditions:
-                outcomes: set[bool] = set()
                 decisions = condition.decisions or [condition.text]
-                for _case, decision_values, outcome in evaluator.evaluations(condition, decisions, fn_cases):
-                    if decision_values is not None and outcome is not None:
-                        outcomes.add(outcome)
-                total += 2
-                covered += len(outcomes)
-                if True in outcomes and False in outcomes:
-                    notes.append(f"C1 covered {fn.name} line {condition.line}: true and false outcomes observed.")
-                else:
-                    missing = "true" if True not in outcomes else "false"
-                    uncovered.append(f"Uncovered C1: {fn.name} line {condition.line} missing {missing} outcome for `{condition.text}`.")
-                    if not outcomes:
-                        uncovered.append(f"Uncovered C1: {fn.name} line {condition.line} condition could not be evaluated from generated vectors.")
+                for index, decision in enumerate(decisions):
+                    observed: set[bool] = set()
+                    for _case, decision_values, outcome in evaluator.evaluations(condition, decisions, fn_cases):
+                        if decision_values is not None:
+                            observed.add(decision_values[index])
+                    total += 2
+                    covered += len(observed)
+                    if True in observed and False in observed:
+                        notes.append(
+                            f"C1 covered {fn.name} line {condition.line} atomic decision `{decisions[index]}`: true and false outcomes observed."
+                        )
+                    else:
+                        missing = "true" if True not in observed else "false"
+                        uncovered.append(
+                            f"Uncovered C1: {fn.name} line {condition.line} atomic decision `{decisions[index]}` missing {missing} outcome."
+                        )
+                        if not observed:
+                            uncovered.append(
+                                f"Uncovered C1: {fn.name} line {condition.line} atomic decision `{decisions[index]}` could not be evaluated from generated vectors."
+                            )
         percent = (covered / total) * 100.0 if total else 100.0
         note = (
-            f"Calculated by Testing Mate from generated vectors: {covered}/{total} decision outcomes covered."
+            f"Calculated by Testing Mate from generated vectors: {covered}/{total} atomic decision outcomes covered."
             if total
             else "No branch/decision obligations were discovered; C1 is complete by definition."
         )

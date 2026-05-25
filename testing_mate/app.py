@@ -15,17 +15,10 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable
 
-from testing_mate.constants import (
-    APP_NAME,
-    DEFAULT_COMPILER,
-    DEFAULT_ENHANCEMENT_STAGES,
-    C_SOURCE_EXTENSIONS,
-    HEADER_SOURCE_EXTENSIONS,
-    SOURCE_EXTENSIONS,
-)
+from testing_mate.constants import *
 from testing_mate.models import CoverageFeedback, CoverageGap, Condition, FunctionInfo, Parameter, RunResult, TestCase
 from testing_mate.c_backend import *
-from testing_mate.generator import TestBackendGenerator, TestBackendRunner, TestOracleFallback, backend_harness_path, format_run_result
+from testing_mate.generator import TestBackendGenerator, TestBackendRunner, TestMockFallback, TestOracleFallback, backend_harness_path, format_run_result
 from testing_mate.boolean_expression import BooleanExpressionEvaluator
 from testing_mate.clang_analyzer import ClangEnhancedAnalyzer
 from testing_mate.code_database import CodeDatabase
@@ -191,7 +184,12 @@ class TestingMateApp(tk.Tk):
         )
         self.source_list.pack(fill="x", pady=(10, 16))
 
-        ttk.Label(left, text="Coverage & Level", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+        coverage_title = ttk.Frame(left, style="Panel.TFrame")
+        coverage_title.pack(fill="x", pady=(0, 8))
+        ttk.Label(coverage_title, text="Coverage & Level", style="Section.TLabel").pack(side="left")
+        ttk.Label(coverage_title, text="Retry", style="Muted.TLabel").pack(side="right", padx=(8, 0))
+        self.mock_retry_limit = tk.StringVar(value="5")
+        ttk.Entry(coverage_title, textvariable=self.mock_retry_limit, width=4).pack(side="right")
         self.coverage = tk.StringVar(value="MC/DC")
         Coverages = ttk.Frame(left, style="Panel.TFrame")
         Coverages.pack(fill="x", pady=(0, 4))
@@ -249,7 +247,13 @@ class TestingMateApp(tk.Tk):
 
         ttk.Label(left, text="LLM Refinement", style="Section.TLabel").pack(anchor="w", pady=(14, 8))
         self.use_ollama = tk.BooleanVar(value=False)
-        ttk.Checkbutton(left, text="Use local Ollama", variable=self.use_ollama, command=self._ollama_select).pack(anchor="w")
+        ollama_toggle_row = ttk.Frame(left, style="Panel.TFrame")
+        ollama_toggle_row.pack(fill="x")
+        ttk.Checkbutton(ollama_toggle_row, text="Use local Ollama", variable=self.use_ollama, command=self._ollama_select).pack(side="left")
+        ttk.Label(ollama_toggle_row, text="Timeout", style="Muted.TLabel").pack(side="right", padx=(8, 0))
+        self.ollama_timeout = tk.StringVar(value="45")
+        self.ollama_timeout_entry = ttk.Entry(ollama_toggle_row, textvariable=self.ollama_timeout, width=6)
+        self.ollama_timeout_entry.pack(side="right")
 
         model_row = ttk.Frame(left, style="Panel.TFrame")
         model_row.pack(fill="x", pady=(8, 0))
@@ -280,6 +284,7 @@ class TestingMateApp(tk.Tk):
         self.refine_report_button.pack(fill="x", pady=(8, 0))
         self.ollama_controls = [
             self.ollama_model_entry,
+            self.ollama_timeout_entry,
             self.target_coverage_entry,
             self.max_ai_rounds_entry,
             self.report_file_entry,
@@ -560,8 +565,10 @@ class TestingMateApp(tk.Tk):
             include_main_function=self.include_main_function.get(),
             use_ollama=self.use_ollama.get(),
             ollama_model=self.ollama_model.get(),
+            ollama_timeout_seconds=max(5, int(self._float_setting(self.ollama_timeout.get(), 45.0))),
             target_coverage_percent=self._float_setting(self.target_coverage.get(), 100.0),
             max_ai_rounds=max(1, int(self._float_setting(self.max_ai_rounds.get(), 1.0))),
+            mock_retry_limit=max(0, min(5, int(self._float_setting(self.mock_retry_limit.get(), 5.0)))),
         )
 
     @staticmethod
@@ -679,8 +686,10 @@ class OrchestratorOptions:
     include_main_function: bool = False
     use_ollama: bool = False
     ollama_model: str = "qwen2.5-coder:3b"
+    ollama_timeout_seconds: int = 45
     target_coverage_percent: float = 100.0
     max_ai_rounds: int = 1
+    mock_retry_limit: int = 5
 
 
 @dataclass
@@ -700,23 +709,37 @@ class Orchestrator:
     def _log(self, text: str) -> None:
         self.log_callback(text)
 
-    def _run_backend_with_oracle_fallback(self, backend: str, backend_out_dir: Path, source: Path) -> RunResult:
+    def _run_backend_with_oracle_fallback(self, backend: str, backend_out_dir: Path, source: Path, retry_limit: int = 5) -> RunResult:
         runner = TestBackendRunner()
         run_result = runner.run(backend, backend_out_dir, source)
         self._log(format_run_result(run_result))
         self._log_run_output(run_result)
-        if run_result.returncode not in (0, None):
-            updated, notes = TestOracleFallback.apply(backend, backend_out_dir, source, run_result)
+        retry_limit = max(0, min(5, int(retry_limit)))
+        for attempt in range(1, retry_limit + 1):
+            if run_result.returncode in (0, None):
+                break
+            notes: list[str] = []
+            oracle_updated, oracle_notes = TestOracleFallback.apply(backend, backend_out_dir, source, run_result)
+            notes.extend(oracle_notes)
+            mock_updated, mock_notes = TestMockFallback.apply(backend, backend_out_dir, source, run_result)
+            notes.extend(mock_notes)
             for note in notes:
                 self._log(note)
-            if updated:
-                self._log(f"Oracle fallback patched {updated} expected value(s); rerunning {backend}.")
-                second_result = runner.run(backend, backend_out_dir, source)
-                fallback_log = "\n".join(["", "=== Testing Mate Oracle Fallback ===", *notes, format_run_result(second_result)])
-                second_result.stdout = (second_result.stdout + fallback_log)[-12000:]
-                run_result = second_result
-                self._log(format_run_result(run_result))
-                self._log_run_output(run_result)
+            updated = oracle_updated + mock_updated
+            if not updated:
+                break
+            self._log(f"Fallback retry {attempt}/{retry_limit}: patched {updated} generated test line(s); rerunning {backend}.")
+            next_result = runner.run(backend, backend_out_dir, source)
+            fallback_log = "\n".join([
+                "",
+                f"=== Testing Mate Fallback Retry {attempt}/{retry_limit} ===",
+                *notes,
+                format_run_result(next_result),
+            ])
+            next_result.stdout = (next_result.stdout + fallback_log)[-12000:]
+            run_result = next_result
+            self._log(format_run_result(run_result))
+            self._log_run_output(run_result)
         return run_result
 
     def _log_run_output(self, run_result: RunResult) -> None:
@@ -770,7 +793,7 @@ class Orchestrator:
                     raise FileNotFoundError(f"Runner script was not generated: {runner_path}")
 
                 self._log(f"Rerunning existing {backend} testcase environment: {runner_path}")
-                run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source)
+                run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit)
                 if run_result.returncode not in (0, None):
                     result.exit_code = run_result.returncode
 
@@ -877,6 +900,7 @@ class Orchestrator:
                         options.level,
                         backend,
                         options.ollama_model,
+                        options.ollama_timeout_seconds,
                         options.target_coverage_percent,
                         max(1, options.max_ai_rounds),
                         self._log,
@@ -911,7 +935,7 @@ class Orchestrator:
 
                 should_run = options.run_after_generate or refine_from_report
                 if should_run:
-                    run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source)
+                    run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit)
                     if run_result.returncode not in (0, None):
                         result.exit_code = run_result.returncode
                     active_feedback = collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or active_feedback
