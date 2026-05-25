@@ -866,9 +866,16 @@ class TestBackendGenerator:
                 )
                 lines.append("    /* PRECONDITION */")
                 lines.extend(precondition_lines if precondition_lines else ["    /* No explicit precondition values were generated. */"])
+                manual_precondition = self._manual_code_lines(case, "__manual_precondition_code", "    ")
+                if manual_precondition:
+                    lines.append("    /* MANUAL PRECONDITION CODE */")
+                    lines.extend(manual_precondition)
 
                 lines.append("    /* ACTIONS */")
-                if self._is_void_return_type(fn.return_type):
+                manual_action = self._manual_code_lines(case, "__manual_action_code", "    ")
+                if manual_action:
+                    lines.extend(manual_action)
+                elif self._is_void_return_type(fn.return_type):
                     lines.append(f"    {call};")
                 else:
                     lines.append(f"    {return_fixture_name} = {{}};")
@@ -881,12 +888,32 @@ class TestBackendGenerator:
                 if expected_call_lines:
                     lines.append("    /* EXPECTED CALLS */")
                     lines.extend(expected_call_lines)
+                manual_expected = self._manual_code_lines(case, "__manual_expected_code", "    ")
+                if manual_expected:
+                    lines.append("    /* MANUAL EXPECTED CODE */")
+                    lines.extend(manual_expected)
+                manual_teardown = self._manual_code_lines(case, "__manual_teardown_code", "    ")
+                if manual_teardown:
+                    lines.append("    /* MANUAL TEARDOWN CODE */")
+                    lines.extend(manual_teardown)
                 lines.append(f"    /* {case.rationale} */")
                 lines.append("}")
                 lines.append("")
         if backend == "CppUTest":
             lines.extend(["int main(int argc, char **argv)", "{", "    return CommandLineTestRunner::RunAllTests(argc, argv);", "}", ""])
         return "\n".join(lines)
+
+    @staticmethod
+    def _manual_code_lines(case: TestCase, key: str, indent: str = "") -> list[str]:
+        values = case.values or {}
+        raw = str(values.get(key) or "").rstrip()
+        if not raw:
+            return []
+        lines = [f"{indent}// BEGIN user manual testcase block: {key}"]
+        for line in raw.splitlines():
+            lines.append(f"{indent}{line}" if line.strip() else "")
+        lines.append(f"{indent}// END user manual testcase block")
+        return lines
 
     @staticmethod
     def _state_setup_lines(case: TestCase | dict, indent: str = "") -> list[str]:

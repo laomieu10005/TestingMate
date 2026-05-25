@@ -7,7 +7,7 @@ from testing_mate.boolean_expression import BooleanExpressionEvaluator
 from testing_mate.code_database import CodeDatabase, CodeFunctionRecord
 from testing_mate.constants import C_KEYWORDS
 from testing_mate.generation_workflow import ClassificationResult, Complexity, TestGenerationWorkflow, VerificationObjective, classify
-from testing_mate.models import Condition, FunctionInfo, Parameter, TestCase
+from testing_mate.models import Condition, CoverageGap, FunctionInfo, Parameter, TestCase
 from testing_mate.boolean_expression import ConditionEvaluator
 
 # Maximum vectors to generate per function to prevent explosion
@@ -84,6 +84,150 @@ class TestVectorGenerator:
             if iso_enabled:
                 cases.extend(self._workflow_cases_for(source_name, fn, level, coverage, asil_level, vectors))
         return cases
+
+    def generate_for_coverage_gaps(
+        self,
+        source_name: str,
+        functions: list[FunctionInfo],
+        existing_cases: list[TestCase],
+        gaps: list[CoverageGap],
+        level: str,
+        coverage: str,
+        asil_level: str = "ASIL D",
+        code_database: CodeDatabase | None = None,
+        max_cases_per_gap: int = 3,
+    ) -> list[TestCase]:
+        """Generate focused candidate test cases for executed coverage gaps.
+
+        This is a deterministic, local-engine refinement pass used by the GUI
+        "Add Gap Cases" action. It consumes uncovered C0/C1/MC/DC gaps parsed
+        from clang/llvm-cov or LCOV reports and creates extra vectors that try to
+        drive the matching function line/condition. The cases are still reviewable
+        candidates; MC/DC credit remains proven only by the next llvm-cov run.
+        """
+        self._code_records = {record.name: record for record in code_database.functions} if code_database else {}
+        by_name = {fn.name: fn for fn in functions}
+        result: list[TestCase] = []
+        existing_signatures = {
+            self._vector_signature(case.function, case.values or {})
+            for case in existing_cases
+        }
+        existing_ids = {case.test_id for case in existing_cases}
+        next_index: dict[str, int] = {}
+        for case in existing_cases:
+            next_index[case.function] = next_index.get(case.function, 0) + 1
+
+        for gap in gaps:
+            fn = by_name.get(gap.function) or self._function_for_gap_line(functions, gap.line)
+            if fn is None:
+                continue
+            vectors = self._vectors_for_gap(fn, gap, coverage)[:max(1, max_cases_per_gap)]
+            for vector in vectors:
+                signature = self._vector_signature(fn.name, vector)
+                if signature in existing_signatures:
+                    continue
+                existing_signatures.add(signature)
+                next_index[fn.name] = next_index.get(fn.name, 0) + 1
+                idx = next_index[fn.name]
+                metric = gap.metric or coverage
+                gap_line = gap.line if gap.line is not None else 0
+                annotated = dict(vector)
+                annotated["__gap_metric"] = metric
+                annotated["__gap_line"] = str(gap_line or "")
+                annotated["__gap_text"] = str(gap.text or "")[:220]
+                annotated["__gap_condition"] = str(gap.condition or "")[:220]
+                rationale = (
+                    f"Coverage-gap candidate for {metric} at line {gap_line or 'unknown'}; "
+                    f"source evidence: {str(gap.text or '').strip()[:180]}"
+                )
+                case = self._case(source_name, fn, level, f"Gap {metric}", idx, annotated, rationale, asil_level)
+                safe_metric = re.sub(r"[^A-Za-z0-9]+", "_", metric).strip("_").lower() or "coverage"
+                base_id = f"{fn.name}_gap_{safe_metric}_line_{gap_line or 'unknown'}_{idx:03d}"
+                test_id = re.sub(r"[^A-Za-z0-9_]+", "_", base_id).strip("_")
+                while test_id in existing_ids:
+                    idx += 1
+                    test_id = re.sub(r"[^A-Za-z0-9_]+", "_", f"{base_id}_{idx}").strip("_")
+                existing_ids.add(test_id)
+                case.test_id = test_id
+                case.description = f"Add coverage-gap test candidate for {fn.name} line {gap_line or 'unknown'} ({metric})."
+                case.rationale = rationale
+                case.trace_tags = f"{case.trace_tags};coverage-gap;line-{gap_line or 'unknown'};{metric}"
+                result.append(case)
+        return result
+
+    @staticmethod
+    def _function_for_gap_line(functions: list[FunctionInfo], line: int | None) -> FunctionInfo | None:
+        if line is None:
+            return None
+        for fn in functions:
+            if fn.start_line <= line <= fn.end_line:
+                return fn
+        return None
+
+    @staticmethod
+    def _condition_for_gap_line(fn: FunctionInfo, line: int | None, text: str = "") -> Condition | None:
+        if line is not None:
+            for condition in fn.conditions:
+                if condition.line == line:
+                    return condition
+        lowered = str(text or "").lower()
+        for condition in fn.conditions:
+            if condition.text and condition.text.lower() in lowered:
+                return condition
+            for decision in condition.decisions:
+                if decision and decision.lower() in lowered:
+                    return condition
+        return None
+
+    def _vectors_for_gap(self, fn: FunctionInfo, gap: CoverageGap, coverage: str) -> list[dict[str, str]]:
+        base = self._base_vector_for(fn)
+        metric = (gap.metric or coverage or "").upper()
+        text = str(gap.text or "")
+        condition = self._condition_for_gap_line(fn, gap.line, text or gap.condition)
+        vectors: list[dict[str, str]] = []
+
+        if condition is not None and "MC/DC" in metric:
+            for vec in self._mcdc_pair_vectors(fn.parameters, condition):
+                merged = dict(base)
+                merged.update(vec)
+                self._append_unique(vectors, merged)
+            return vectors
+
+        if condition is not None:
+            desired_values = self._gap_desired_truths(text)
+            for desired in desired_values:
+                vec = dict(base)
+                # Bias earlier conditions toward reachability before toggling the target.
+                if gap.line is not None:
+                    for previous in fn.conditions:
+                        if previous.line < gap.line:
+                            self._drive_condition(vec, previous, True)
+                self._drive_condition(vec, condition, desired)
+                self._append_unique(vectors, vec)
+            return vectors
+
+        vec = dict(base)
+        if gap.line is not None:
+            # For a pure uncovered line, aim to enter the line's containing block by
+            # driving previous conditions true. This is a heuristic, then the backend
+            # coverage run is the actual evidence.
+            for condition in fn.conditions:
+                if condition.line <= gap.line:
+                    self._drive_condition(vec, condition, True)
+        self._append_unique(vectors, vec)
+
+        for path_vec in self._path_optimized_vectors(fn, base)[:4]:
+            self._append_unique(vectors, path_vec)
+        return vectors
+
+    @staticmethod
+    def _gap_desired_truths(text: str) -> list[bool]:
+        lowered = str(text or "").lower()
+        if "false branch" in lowered or "false" in lowered and "true" not in lowered:
+            return [False, True]
+        if "true branch" in lowered or "true" in lowered and "false" not in lowered:
+            return [True, False]
+        return [True, False]
 
     def _integration_cases_for(
         self,

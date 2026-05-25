@@ -42,6 +42,10 @@ class TestingMateApp(tk.Tk):
         self.sources: list[Path] = []
         self.generated_paths: list[Path] = []
         self.report_path: Path | None = None
+        self.last_functions: list[FunctionInfo] = []
+        self.last_cases: list[TestCase] = []
+        self.last_feedback: CoverageFeedback | None = None
+        self._case_by_iid: dict[str, TestCase] = {}
         self._build_style()
         self._build_ui()
 
@@ -147,7 +151,8 @@ class TestingMateApp(tk.Tk):
         left = self._create_scrollable_panel(body)
         right = ttk.Frame(body, style="Panel.TFrame", padding=18)
         right.grid(row=0, column=1, sticky="nsew")
-        right.rowconfigure(2, weight=1)
+        right.rowconfigure(2, weight=2)
+        right.rowconfigure(4, weight=1)
         right.columnconfigure(0, weight=1)
         self.output_dir = tk.StringVar(value=str(Path.cwd() / "TestMate_out"))
         
@@ -167,6 +172,22 @@ class TestingMateApp(tk.Tk):
         ttk.Button(action_row, text="Generate", command=self._run_async, style="Accent.TButton").pack(side="left", fill="x", expand=True)
         ttk.Button(action_row, text="ReTest", command=self._rerun_async, style="Danger.TButton").pack(side="left", fill="x", expand=True, padx=(8, 0))
         ttk.Button(action_row, text="View Report", command=self._open_report_file, style="Secondary.TButton").pack(side="right", padx=(8, 0))
+
+        gap_action_row = ttk.Frame(left, style="Panel.TFrame")
+        gap_action_row.pack(fill="x", pady=(8, 0))
+        self.add_gap_cases_button = ttk.Button(
+            gap_action_row,
+            text="Add Gap Cases",
+            command=self._add_uncovered_cases_async,
+            style="Accent.TButton",
+        )
+        self.add_gap_cases_button.pack(side="left", fill="x", expand=True)
+        ttk.Label(
+            gap_action_row,
+            text="Select an uncovered row to target one line, or no row for all gaps.",
+            style="Muted.TLabel",
+            wraplength=220,
+        ).pack(side="left", padx=(8, 0))
 
         self.source_list = tk.Listbox(
             left,
@@ -325,12 +346,54 @@ class TestingMateApp(tk.Tk):
             self.tree.heading(col, text=title)
             self.tree.column(col, width=width, stretch=True)
         self.tree.grid(row=2, column=0, sticky="nsew")
+        self.tree.tag_configure("covered", background="#ecfdf5", foreground="#065f46")
+        self.tree.tag_configure("uncovered", background="#fff1f2", foreground="#9f1239")
+        self.tree.tag_configure("unknown", background="#f8fafc", foreground="#475569")
+        self.tree.bind("<Double-1>", lambda _event: self._add_uncovered_cases_async())
         tree_scroll = ttk.Scrollbar(right, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=tree_scroll.set)
         tree_scroll.grid(row=2, column=1, sticky="ns")
 
+        case_header = ttk.Frame(right, style="Panel.TFrame")
+        case_header.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 8))
+        case_header.columnconfigure(0, weight=1)
+        ttk.Label(case_header, text="Generated Test Cases", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            case_header,
+            text="Add Manual Testcase",
+            command=lambda: self._open_manual_case_popup(None),
+            style="Accent.TButton",
+        ).grid(row=0, column=1, sticky="e")
+        ttk.Label(
+            case_header,
+            text="Click a testcase row to open a template popup. Use Steps mode for review-only cases or Harness Code mode for direct C++ test-body code.",
+            style="Muted.TLabel",
+            wraplength=760,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        case_columns = ("test_id", "function", "coverage", "mode", "summary")
+        self.case_tree = ttk.Treeview(right, columns=case_columns, show="headings", height=7)
+        for col, title, width in [
+            ("test_id", "Test ID", 190),
+            ("function", "Function", 140),
+            ("coverage", "Coverage", 80),
+            ("mode", "Mode", 110),
+            ("summary", "Summary", 360),
+        ]:
+            self.case_tree.heading(col, text=title)
+            self.case_tree.column(col, width=width, stretch=True)
+        self.case_tree.tag_configure("manual", background="#fefce8", foreground="#713f12")
+        self.case_tree.tag_configure("auto", background="#ffffff", foreground="#172033")
+        self.case_tree.grid(row=4, column=0, sticky="nsew")
+        self.case_tree.bind("<ButtonRelease-1>", self._on_case_tree_click)
+        self.case_tree.bind("<Double-1>", self._on_case_tree_click)
+        self.case_tree.bind("<Return>", lambda _event: self._open_manual_case_popup_from_selection())
+        case_scroll = ttk.Scrollbar(right, orient="vertical", command=self.case_tree.yview)
+        self.case_tree.configure(yscrollcommand=case_scroll.set)
+        case_scroll.grid(row=4, column=1, sticky="ns")
+
         log_frame = ttk.Frame(right, style="Surface.TFrame", padding=12)
-        log_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        log_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(14, 0))
         ttk.Label(log_frame, text="Log", style="MetricLabel.TLabel").pack(anchor="w")
         self.log = tk.Text(
             log_frame,
@@ -509,6 +572,294 @@ class TestingMateApp(tk.Tk):
         thread = threading.Thread(target=self._rerun_existing_testcases, daemon=True)
         thread.start()
 
+    def _add_uncovered_cases_async(self) -> None:
+        if not self.sources and not self.compile_commands.get().strip():
+            messagebox.showwarning(APP_NAME, "Add source files, a source folder, or compile_commands.json first.")
+            return
+        if not self._ensure_msys2_toolchain():
+            return
+        selected_gap = self._selected_gap_request()
+        if selected_gap and "uncovered" not in selected_gap.get("status", "").lower():
+            if not messagebox.askyesno(APP_NAME, "Selected row is not marked uncovered. Add gap cases for all uncovered rows instead?"):
+                return
+            selected_gap = None
+        thread = threading.Thread(target=lambda: self._add_uncovered_cases(selected_gap), daemon=True)
+        thread.start()
+
+    def _selected_gap_request(self) -> dict | None:
+        selection = self.tree.selection()
+        if not selection:
+            return None
+        values = self.tree.item(selection[0], "values")
+        if len(values) < 5:
+            return None
+        line_text = str(values[1])
+        line_match = re.search(r"\d+", line_text)
+        return {
+            "function": str(values[0]),
+            "line": int(line_match.group(0)) if line_match else None,
+            "metric": str(values[2]),
+            "text": str(values[3]),
+            "status": str(values[4]),
+        }
+
+    def _populate_case_tree(self, cases: list[TestCase] | None = None) -> None:
+        def insert() -> None:
+            if not hasattr(self, "case_tree"):
+                return
+            self.case_tree.delete(*self.case_tree.get_children())
+            self._case_by_iid.clear()
+            for case in cases or []:
+                values = case.values or {}
+                mode = "Manual Code" if values.get("__manual_action_code") else "Steps" if values.get("__manual_steps_only") else "Auto"
+                summary = case.description or case.rationale or case.expected or ""
+                if len(summary) > 160:
+                    summary = summary[:157] + "..."
+                tags = ("manual",) if mode != "Auto" or str(case.test_id).startswith("MANUAL_") else ("auto",)
+                iid = self.case_tree.insert(
+                    "",
+                    "end",
+                    values=(case.test_id, case.function, case.coverage, mode, summary),
+                    tags=tags,
+                )
+                self._case_by_iid[iid] = case
+        self.after(0, insert)
+
+    def _on_case_tree_click(self, event: tk.Event) -> None:
+        if not hasattr(self, "case_tree"):
+            return
+        row_id = self.case_tree.identify_row(event.y)
+        if not row_id:
+            return
+        self.case_tree.selection_set(row_id)
+        self._open_manual_case_popup(self._case_by_iid.get(row_id))
+
+    def _open_manual_case_popup_from_selection(self) -> None:
+        if not hasattr(self, "case_tree"):
+            return
+        selection = self.case_tree.selection()
+        selected = self._case_by_iid.get(selection[0]) if selection else None
+        self._open_manual_case_popup(selected)
+
+    def _selected_coverage_function_name(self) -> str:
+        selection = self.tree.selection()
+        if not selection:
+            return ""
+        values = self.tree.item(selection[0], "values")
+        return str(values[0]) if values else ""
+
+    def _manual_case_template(self, fn: FunctionInfo | None, backend: str, mode: str) -> tuple[str, str, str]:
+        fn_name = fn.name if fn else "FunctionUnderTest"
+        if fn:
+            arg_names = []
+            values = {}
+            for param in fn.parameters:
+                safe = re.sub(r"[^A-Za-z0-9_]", "_", param.name)
+                if getattr(param, "kind", "") == "pointer":
+                    arg_names.append(f"tm_arg_{safe}")
+                    values[param.name] = "non_null"
+                else:
+                    arg_names.append(f"tm_{safe}")
+                    values[param.name] = "0"
+        else:
+            arg_names = []
+            values = {}
+        call = f"{fn_name}({', '.join(arg_names)})"
+        values_json = json.dumps(values, indent=2)
+        steps = (
+            "1. Configure the precondition values shown in the Values JSON.\n"
+            f"2. Invoke `{fn_name}` through the generated harness.\n"
+            "3. Observe return value, output parameters, globals, and expected dependency calls.\n"
+            "4. Confirm the selected uncovered line/branch/MC/DC obligation is exercised."
+        )
+        if mode == "Harness Code":
+            if backend == "CppUTest":
+                if fn and fn.return_type.strip() != "void":
+                    code = f"actual_return = {call};\nCHECK_EQUAL(/* expected */ 0, actual_return);"
+                else:
+                    code = f"{call};\n/* Add CHECK/CHECK_EQUAL/MEMCMP_EQUAL assertions here. */"
+            else:
+                if fn and fn.return_type.strip() != "void":
+                    code = f"actual_return = {call};\nEXPECT_EQ(/* expected */ 0, actual_return);"
+                else:
+                    code = f"{call};\n/* Add EXPECT_* assertions here. */"
+            return values_json, steps, code
+        return values_json, steps, ""
+
+    def _open_manual_case_popup(self, selected_case: TestCase | None = None) -> None:
+        if not self.last_functions:
+            messagebox.showwarning(APP_NAME, "Generate or rerun first so functions are available for the testcase template.")
+            return
+
+        popup = tk.Toplevel(self)
+        popup.title("Manual Testcase Template")
+        popup.geometry("980x760")
+        popup.minsize(840, 620)
+        popup.transient(self)
+        popup.grab_set()
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(popup, padding=14)
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(1, weight=1)
+
+        function_names = [fn.name for fn in self.last_functions]
+        selected_function = selected_case.function if selected_case else self._selected_coverage_function_name()
+        if selected_function not in function_names:
+            selected_function = function_names[0]
+
+        test_id_var = tk.StringVar(value=(f"MANUAL_{selected_function}_{len(self.last_cases) + 1:03d}" if selected_case is None else f"MANUAL_{selected_case.test_id}"))
+        function_var = tk.StringVar(value=selected_function)
+        coverage_var = tk.StringVar(value=(selected_case.coverage if selected_case else self.coverage.get()))
+        mode_var = tk.StringVar(value="Harness Code" if selected_case and (selected_case.values or {}).get("__manual_action_code") else "Steps Only")
+        source_var = tk.StringVar(value=self.sources[0].name if self.sources else "")
+
+        ttk.Label(header, text="Test ID", style="Panel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(header, textvariable=test_id_var).grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Label(header, text="Source", style="Panel.TLabel").grid(row=0, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Combobox(header, textvariable=source_var, values=[p.name for p in self.sources], state="readonly", width=24).grid(row=0, column=3, sticky="ew", pady=4)
+
+        ttk.Label(header, text="Function", style="Panel.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        function_box = ttk.Combobox(header, textvariable=function_var, values=function_names, state="readonly")
+        function_box.grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Label(header, text="Coverage", style="Panel.TLabel").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Combobox(header, textvariable=coverage_var, values=("C0", "C0/C1", "C1", "MC/DC", "Manual"), state="readonly", width=24).grid(row=1, column=3, sticky="ew", pady=4)
+
+        ttk.Label(header, text="Mode", style="Panel.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        mode_box = ttk.Combobox(header, textvariable=mode_var, values=("Steps Only", "Harness Code"), state="readonly")
+        mode_box.grid(row=2, column=1, sticky="ew", pady=4)
+
+        body = ttk.Frame(popup, padding=(14, 0, 14, 14))
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(4, weight=1)
+
+        desc_var = tk.StringVar(value=(selected_case.description if selected_case else f"Manual testcase for {selected_function}"))
+        expected_var = tk.StringVar(value=(selected_case.expected if selected_case else "Review expected return/output/global side effects."))
+        precond_var = tk.StringVar(value=(selected_case.preconditions if selected_case else "Unit is initialized; mocks/stubs are reset; required globals/fixtures are configured."))
+
+        ttk.Label(body, text="Description", style="Panel.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Entry(body, textvariable=desc_var).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(body, text="Preconditions", style="Panel.TLabel").grid(row=2, column=0, sticky="w", pady=(0, 4))
+        ttk.Entry(body, textvariable=precond_var).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+
+        ttk.Label(body, text="Values JSON / Harness Inputs", style="Panel.TLabel").grid(row=4, column=0, sticky="nw")
+        ttk.Label(body, text="Steps or Manual C++ Test Body", style="Panel.TLabel").grid(row=4, column=1, sticky="nw")
+        values_text = tk.Text(body, height=11, font=("Cascadia Mono", 9), wrap="none")
+        code_text = tk.Text(body, height=11, font=("Cascadia Mono", 9), wrap="none")
+        values_text.grid(row=5, column=0, sticky="nsew", padx=(0, 8), pady=(4, 8))
+        code_text.grid(row=5, column=1, sticky="nsew", padx=(8, 0), pady=(4, 8))
+
+        ttk.Label(body, text="Expected Result", style="Panel.TLabel").grid(row=6, column=0, sticky="w", pady=(0, 4))
+        ttk.Entry(body, textvariable=expected_var).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+
+        hint = ttk.Label(
+            body,
+            text="Template keys: normal parameter names set harness inputs. Internal keys such as __expected_return, __expected_output.<name>, __expected_global.<name>, and __expected_calls are also supported. In Harness Code mode, the code block is inserted directly into the generated TEST body.",
+            style="Muted.TLabel",
+            wraplength=900,
+        )
+        hint.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+
+        current_template: dict[str, str] = {"function": "", "mode": ""}
+
+        def selected_fn() -> FunctionInfo | None:
+            return next((fn for fn in self.last_functions if fn.name == function_var.get()), None)
+
+        def fill_template(force: bool = False) -> None:
+            fn = selected_fn()
+            mode = "Harness Code" if mode_var.get() == "Harness Code" else "Steps Only"
+            if not force and current_template.get("function") == function_var.get() and current_template.get("mode") == mode:
+                return
+            values_json, steps, code = self._manual_case_template(fn, self.backend.get(), mode)
+            if force or not values_text.get("1.0", "end").strip():
+                values_text.delete("1.0", "end")
+                values_text.insert("1.0", values_json)
+            if force or not code_text.get("1.0", "end").strip():
+                code_text.delete("1.0", "end")
+                code_text.insert("1.0", code if mode == "Harness Code" else steps)
+            current_template["function"] = function_var.get()
+            current_template["mode"] = mode
+
+        if selected_case:
+            values = dict(selected_case.values or {})
+            manual_code = values.pop("__manual_action_code", "")
+            values.pop("__manual_steps_only", None)
+            values.pop("__manual_source", None)
+            values_text.insert("1.0", json.dumps(values, indent=2))
+            code_text.insert("1.0", manual_code or selected_case.test_steps or "")
+        else:
+            fill_template(force=True)
+
+        function_box.bind("<<ComboboxSelected>>", lambda _event: fill_template(force=True))
+        mode_box.bind("<<ComboboxSelected>>", lambda _event: fill_template(force=True))
+
+        actions = ttk.Frame(popup, padding=(14, 0, 14, 14))
+        actions.grid(row=2, column=0, sticky="ew")
+        actions.columnconfigure(0, weight=1)
+
+        def save() -> None:
+            fn = selected_fn()
+            if fn is None:
+                messagebox.showerror(APP_NAME, "Select a valid function.", parent=popup)
+                return
+            try:
+                raw_values = values_text.get("1.0", "end").strip()
+                values = json.loads(raw_values) if raw_values else {}
+                if not isinstance(values, dict):
+                    raise ValueError("Values JSON must be an object.")
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, f"Invalid Values JSON: {exc}", parent=popup)
+                return
+            code_or_steps = code_text.get("1.0", "end").rstrip()
+            payload = {
+                "source_name": source_var.get(),
+                "test_id": test_id_var.get().strip(),
+                "function": fn.name,
+                "coverage": coverage_var.get(),
+                "mode": mode_var.get(),
+                "values": values,
+                "description": desc_var.get().strip(),
+                "preconditions": precond_var.get().strip(),
+                "expected": expected_var.get().strip(),
+                "code_or_steps": code_or_steps,
+            }
+            popup.destroy()
+            self._add_manual_testcase_async(payload)
+
+        ttk.Button(actions, text="Insert Template", command=lambda: fill_template(force=True), style="Secondary.TButton").grid(row=0, column=0, sticky="w")
+        ttk.Button(actions, text="Cancel", command=popup.destroy, style="Secondary.TButton").grid(row=0, column=1, sticky="e", padx=(8, 0))
+        ttk.Button(actions, text="Add Testcase", command=save, style="Accent.TButton").grid(row=0, column=2, sticky="e", padx=(8, 0))
+
+    def _add_manual_testcase_async(self, payload: dict) -> None:
+        if not self.sources and not self.compile_commands.get().strip():
+            messagebox.showwarning(APP_NAME, "Add source files, a source folder, or compile_commands.json first.")
+            return
+        if not self._ensure_msys2_toolchain():
+            return
+        thread = threading.Thread(target=lambda: self._add_manual_testcase(payload), daemon=True)
+        thread.start()
+
+    def _add_manual_testcase(self, payload: dict) -> None:
+        self._set_log("")
+        self._append_log(f"Adding manual testcase for {payload.get('function', 'unknown function')}...")
+        result = Orchestrator(self._append_log).add_manual_test_case(self._orchestrator_options(), payload)
+        self.generated_paths = result.generated_paths
+        self.last_functions = result.functions
+        self.last_cases = result.cases
+        self.last_feedback = result.feedback
+        self._update_metrics(len(result.functions), sum(len(fn.conditions) for fn in result.functions), len(result.cases))
+        self._populate_tree(result.functions, result.feedback)
+        self._populate_case_tree(result.cases)
+        if result.generated_paths:
+            self._append_log("Updated artifacts:")
+            for path in result.generated_paths:
+                self._append_log(f"  {path}")
+        title = "Add manual testcase failed" if result.exit_code else "Add manual testcase complete"
+        self._show_completion_popup(title, result.summary_lines, result.generated_paths, is_error=bool(result.exit_code))
+
     def _ensure_msys2_toolchain(self) -> bool:
         if mingw_toolchain_available():
             return True
@@ -547,8 +898,12 @@ class TestingMateApp(tk.Tk):
         self._clear_tree()
         result = Orchestrator(self._append_log).analyze_and_generate(self._orchestrator_options())
         self.generated_paths = result.generated_paths
+        self.last_functions = result.functions
+        self.last_cases = result.cases
+        self.last_feedback = result.feedback
         self._update_metrics(len(result.functions), sum(len(fn.conditions) for fn in result.functions), len(result.cases))
         self._populate_tree(result.functions, result.feedback)
+        self._populate_case_tree(result.cases)
         if result.generated_paths:
             self._append_log("Generated artifacts:")
             for path in result.generated_paths:
@@ -561,8 +916,12 @@ class TestingMateApp(tk.Tk):
         self._clear_tree()
         result = Orchestrator(self._append_log).refine_from_report(self._orchestrator_options())
         self.generated_paths = result.generated_paths
+        self.last_functions = result.functions
+        self.last_cases = result.cases
+        self.last_feedback = result.feedback
         self._update_metrics(len(result.functions), sum(len(fn.conditions) for fn in result.functions), len(result.cases))
         self._populate_tree(result.functions, result.feedback)
+        self._populate_case_tree(result.cases)
         if result.generated_paths:
             self._append_log("Generated artifacts:")
             for path in result.generated_paths:
@@ -575,13 +934,35 @@ class TestingMateApp(tk.Tk):
         self._clear_tree()
         result = Orchestrator(self._append_log).rerun_existing(self._orchestrator_options())
         self.generated_paths = result.generated_paths
+        self.last_functions = result.functions
+        self.last_cases = result.cases
+        self.last_feedback = result.feedback
         self._update_metrics(len(result.functions), sum(len(fn.conditions) for fn in result.functions), len(result.cases))
         self._populate_tree(result.functions, result.feedback)
+        self._populate_case_tree(result.cases)
         if result.generated_paths:
             self._append_log("Refreshed reports:")
             for path in result.generated_paths:
                 self._append_log(f"  {path}")
         title = "Rerun testcases failed" if result.exit_code else "Rerun testcases complete"
+        self._show_completion_popup(title, result.summary_lines, result.generated_paths, is_error=bool(result.exit_code))
+
+    def _add_uncovered_cases(self, selected_gap: dict | None = None) -> None:
+        self._set_log("")
+        self._append_log("Adding coverage-gap test cases from current uncovered evidence...")
+        result = Orchestrator(self._append_log).add_uncovered_cases(self._orchestrator_options(), selected_gap)
+        self.generated_paths = result.generated_paths
+        self.last_functions = result.functions
+        self.last_cases = result.cases
+        self.last_feedback = result.feedback
+        self._update_metrics(len(result.functions), sum(len(fn.conditions) for fn in result.functions), len(result.cases))
+        self._populate_tree(result.functions, result.feedback)
+        self._populate_case_tree(result.cases)
+        if result.generated_paths:
+            self._append_log("Updated artifacts:")
+            for path in result.generated_paths:
+                self._append_log(f"  {path}")
+        title = "Add gap cases failed" if result.exit_code else "Add gap cases complete"
         self._show_completion_popup(title, result.summary_lines, result.generated_paths, is_error=bool(result.exit_code))
 
     def _orchestrator_options(self) -> OrchestratorOptions:
@@ -651,45 +1032,67 @@ class TestingMateApp(tk.Tk):
         self.after(0, show)
 
     def _clear_tree(self) -> None:
-        self.after(0, lambda: self.tree.delete(*self.tree.get_children()))
+        def clear() -> None:
+            self.tree.delete(*self.tree.get_children())
+            if hasattr(self, "case_tree"):
+                self.case_tree.delete(*self.case_tree.get_children())
+                self._case_by_iid.clear()
+        self.after(0, clear)
 
     def _populate_tree(self, functions: list[FunctionInfo] | None = None, feedback: CoverageFeedback | None = None) -> None:
         def insert() -> None:
             self.tree.delete(*self.tree.get_children())
             if not functions:
                 return
-            
-            uncovered_items = feedback.uncovered_items if feedback else []
-            
-            # Populate coverage obligations from functions
+
+            gaps = CoverageGapPlanner().plan(feedback, functions, max_gaps=120) if feedback else []
+            gap_keys = {(gap.function, gap.line, gap.metric) for gap in gaps}
+
+            # Show concrete backend gaps first. Selecting one of these rows lets the
+            # Add Gap Cases action target a specific uncovered line/branch/MC/DC item.
+            for gap in gaps:
+                self.tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        gap.function,
+                        gap.line if gap.line is not None else "-",
+                        gap.metric,
+                        gap.condition or gap.text,
+                        "Uncovered",
+                    ),
+                    tags=("uncovered",),
+                )
+
+            if gaps:
+                self.tree.insert("", "end", values=("", "", "", "— static obligations below —", ""), tags=("unknown",))
+
+            # Populate static obligations from analyzed functions.
             for fn in functions:
-                # Add C0 obligation (statement coverage for function body)
-                status = "Covered" if not any("C0" in item and fn.name in item for item in uncovered_items) else "Uncovered"
-                self.tree.insert("", "end", values=(fn.name, f"{fn.start_line}-{fn.end_line}", "C0", f"Statement coverage ({fn.start_line}-{fn.end_line})", status))
-                
-                # Add C1 and MC/DC obligations (conditions)
-                for i, condition in enumerate(fn.conditions):
-                    c1_status = "Uncovered"
-                    mcdc_status = "Uncovered"
-                    
-                    for item in uncovered_items:
-                        if "C1" in item and str(condition.line) in item:
-                            c1_status = "Uncovered"
-                            break
-                    else:
-                        c1_status = "Covered"
-                    
-                    for item in uncovered_items:
-                        if "MC/DC" in item and str(condition.line) in item:
-                            mcdc_status = "Uncovered"
-                            break
-                    else:
-                        mcdc_status = "Covered"
-                    
-                    # Show C1 condition
-                    self.tree.insert("", "end", values=(fn.name, condition.line, "C1", condition.text, c1_status))
-                    # Show MC/DC condition  
-                    self.tree.insert("", "end", values=(fn.name, condition.line, "MC/DC", condition.text, mcdc_status))
+                fn_has_c0_gap = any(gap.function == fn.name and gap.metric == "C0" for gap in gaps)
+                status = "Uncovered" if fn_has_c0_gap else "Covered"
+                self.tree.insert(
+                    "",
+                    "end",
+                    values=(fn.name, f"{fn.start_line}-{fn.end_line}", "C0", f"Statement coverage ({fn.start_line}-{fn.end_line})", status),
+                    tags=("uncovered" if status == "Uncovered" else "covered",),
+                )
+
+                for condition in fn.conditions:
+                    c1_status = "Uncovered" if (fn.name, condition.line, "C1") in gap_keys else "Covered"
+                    mcdc_status = "Uncovered" if (fn.name, condition.line, "MC/DC") in gap_keys else "Covered"
+                    self.tree.insert(
+                        "",
+                        "end",
+                        values=(fn.name, condition.line, "C1", condition.text, c1_status),
+                        tags=("uncovered" if c1_status == "Uncovered" else "covered",),
+                    )
+                    self.tree.insert(
+                        "",
+                        "end",
+                        values=(fn.name, condition.line, "MC/DC", condition.text, mcdc_status),
+                        tags=("uncovered" if mcdc_status == "Uncovered" else "covered",),
+                    )
 
         self.after(0, insert)
 
@@ -879,6 +1282,365 @@ class Orchestrator:
             result.summary_lines.append(f"All files: {len(report_items)} source reports collected in {final_report}")
 
         return result
+
+    def add_manual_test_case(self, options: OrchestratorOptions, payload: dict) -> OrchestratorResult:
+        """Append one user-authored testcase, regenerate the backend harness, rerun, and refresh reports."""
+        result = OrchestratorResult()
+        project_sources, include_dirs, defines, compiler = self._resolve_project_inputs(options)
+        out_dir = source_scoped_output_dir(options.output_dir.expanduser(), project_sources)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if out_dir != options.output_dir.expanduser():
+            self._log(f"Output folder: {out_dir}")
+
+        requested_source = str(payload.get("source_name") or "").strip()
+        if requested_source:
+            project_sources = [source for source in project_sources if source.name == requested_source or source.stem == Path(requested_source).stem] or project_sources
+
+        preprocessor = CPreprocessor(compiler, include_dirs, defines)
+        analyzer = ClangEnhancedAnalyzer(include_dirs, defines, compiler, self._log)
+        generator = TestVectorGenerator()
+        report_parser = CoverageReportParser()
+        loaded_feedback = load_coverage_feedback(options.report_file, report_parser, self._log)
+        backend = options.backend
+        unit_sources = self._project_unit_sources(project_sources, include_dirs) if backend in {"CppUTest", "GoogleTest"} else list(project_sources)
+        report_items: list[dict] = []
+
+        for source in project_sources[:1]:
+            try:
+                analysis_source = source
+                if options.preprocess:
+                    analysis_source, note = preprocessor.preprocess_file(source, out_dir / "preprocessed")
+                    self._log(note)
+                functions = analyzer.analyze(
+                    analysis_source,
+                    include_static_functions=options.include_static_functions,
+                    include_main=options.include_main_function,
+                )
+                if analysis_source != source:
+                    analyzer.apply_original_source_context(functions, source)
+                code_database = CodeDatabase.from_functions(source, analysis_source, functions, analyzer=analyzer.last_analyzer)
+                backend_out_dir = out_dir / backend
+                writer = ArtifactWriter(backend_out_dir)
+                try:
+                    _saved_functions, existing_cases = self._load_existing_analysis(backend_out_dir, source)
+                    self._log(f"Loaded {len(existing_cases)} existing cases for {source.name}.")
+                except Exception as exc:
+                    self._log(f"Existing analysis not available for {source.name}; generating initial cases first: {exc}")
+                    existing_cases = generator.generate(
+                        source.name,
+                        functions,
+                        options.level,
+                        options.coverage,
+                        options.iso26262_profile,
+                        options.asil_level,
+                        options.include_static_functions,
+                        code_database,
+                    )
+
+                manual_case = self._manual_case_from_payload(source, functions, existing_cases, options, payload)
+                cases = [*existing_cases, manual_case]
+                feedback = collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or loaded_feedback
+                feedback = merge_generated_coverage_feedback(feedback, functions, cases, options.coverage)
+
+                paths = writer.write(
+                    source,
+                    functions,
+                    cases,
+                    options.level,
+                    backend,
+                    feedback,
+                    None,
+                    include_backend=True,
+                    unit_sources=unit_sources or [source],
+                    include_dirs=include_dirs,
+                    target_coverage_percent=options.target_coverage_percent,
+                    code_database=code_database,
+                )
+                result.generated_paths.extend(paths)
+                self._log(f"Added manual testcase {manual_case.test_id} for {manual_case.function}.")
+
+                run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit)
+                if run_result.returncode not in (0, None):
+                    result.exit_code = run_result.returncode
+                refreshed_feedback = collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or feedback
+                refreshed_feedback = merge_generated_coverage_feedback(refreshed_feedback, functions, cases, options.coverage)
+                refreshed_feedback = self._merge_run_failures(refreshed_feedback, run_result)
+                report_path = writer._write_html_report(source, functions, cases, backend, refreshed_feedback, run_result)
+                summary_path = writer._write_summary(source, functions, cases, refreshed_feedback, run_result)
+                result.generated_paths.extend([report_path, summary_path])
+                result.functions.extend(functions)
+                result.cases.extend(cases)
+                result.feedback = refreshed_feedback
+                result.summary_lines.append(
+                    f"{source.name}: added manual testcase {manual_case.test_id}, total {len(cases)} cases, {format_run_result(run_result)}, {coverage_log_summary(refreshed_feedback)}"
+                )
+                report_items.append({
+                    "source": source,
+                    "functions": functions,
+                    "cases": cases,
+                    "feedback": refreshed_feedback,
+                    "run_result": run_result,
+                    "report_path": report_path,
+                })
+            except Exception as exc:
+                self._log(f"ERROR add manual testcase {source}: {exc}")
+                result.summary_lines.append(f"{source.name}: ERROR {exc}")
+                result.exit_code = 1
+                return result
+
+        if len(report_items) > 1:
+            final_report = ArtifactWriter(out_dir / backend)._write_multi_file_report(backend, report_items)
+            result.generated_paths.append(final_report)
+            self._log(f"All-files report: {final_report}")
+        return result
+
+    @staticmethod
+    def _manual_case_from_payload(
+        source: Path,
+        functions: list[FunctionInfo],
+        existing_cases: list[TestCase],
+        options: OrchestratorOptions,
+        payload: dict,
+    ) -> TestCase:
+        function_name = str(payload.get("function") or "").strip()
+        fn = next((item for item in functions if item.name == function_name), None)
+        if fn is None:
+            raise ValueError(f"Manual testcase function not found: {function_name}")
+
+        raw_id = str(payload.get("test_id") or "").strip()
+        if not raw_id:
+            raw_id = f"MANUAL_{fn.name}_{len(existing_cases) + 1:03d}"
+        safe_id = re.sub(r"[^A-Za-z0-9_]", "_", raw_id).strip("_") or f"MANUAL_{fn.name}_{len(existing_cases) + 1:03d}"
+        existing_ids = {case.test_id for case in existing_cases}
+        base_id = safe_id
+        suffix = 2
+        while safe_id in existing_ids:
+            safe_id = f"{base_id}_{suffix:02d}"
+            suffix += 1
+
+        values = payload.get("values") if isinstance(payload.get("values"), dict) else {}
+        values = {str(key): str(value) for key, value in values.items()}
+        mode = str(payload.get("mode") or "Steps Only")
+        code_or_steps = str(payload.get("code_or_steps") or "").rstrip()
+        if mode == "Harness Code" and code_or_steps:
+            values["__manual_action_code"] = code_or_steps
+        else:
+            values["__manual_steps_only"] = "1"
+        values["__manual_source"] = "gui"
+
+        coverage = str(payload.get("coverage") or options.coverage or "Manual")
+        description = str(payload.get("description") or f"Manual testcase for {fn.name}")
+        preconditions = str(payload.get("preconditions") or "Review manual preconditions before execution.")
+        expected = str(payload.get("expected") or "Review expected return/output/global side effects.")
+        steps = code_or_steps if mode != "Harness Code" else (
+            "1. Execute the user-supplied harness code inserted into the generated TEST body.\n"
+            "2. Review and maintain all assertions in the manual code block."
+        )
+        audit = TestVectorGenerator._audit_fields(
+            fn,
+            coverage,
+            options.level,
+            len(existing_cases) + 1,
+            values,
+            "Manual GUI-authored testcase",
+            options.asil_level,
+            [],
+        )
+        audit.update({
+            "description": description,
+            "preconditions": preconditions,
+            "setup": "Manual GUI testcase. Apply values JSON and any user-authored harness setup code.",
+            "test_steps": steps,
+            "teardown": "Reset mocks/stubs and restore modified globals/fixtures after the manual testcase.",
+            "pass_fail_criteria": "Pass when all user-authored assertions and reviewed expected outcomes are satisfied.",
+            "trace_tags": f"{options.level};{coverage};manual;gui-authored",
+        })
+        return TestCase(
+            test_id=safe_id,
+            unit=source.stem,
+            function=fn.name,
+            coverage=coverage,
+            level=options.level,
+            values=values,
+            expected=expected,
+            rationale="Manual testcase added from GUI popup; reviewer owns oracle/assertion correctness.",
+            asil=options.asil_level,
+            **audit,
+        )
+
+    def add_uncovered_cases(self, options: OrchestratorOptions, selected_gap: dict | None = None) -> OrchestratorResult:
+        """Add deterministic candidate cases for uncovered lines/branches shown by the latest report.
+
+        If `selected_gap` comes from the GUI tree, only that row is targeted.
+        Otherwise all parsed coverage gaps are used. The method rewrites the backend
+        harness with the merged case list, reruns it, and regenerates the HTML report.
+        """
+        result = OrchestratorResult()
+        project_sources, include_dirs, defines, compiler = self._resolve_project_inputs(options)
+        out_dir = source_scoped_output_dir(options.output_dir.expanduser(), project_sources)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if out_dir != options.output_dir.expanduser():
+            self._log(f"Output folder: {out_dir}")
+
+        preprocessor = CPreprocessor(compiler, include_dirs, defines)
+        analyzer = ClangEnhancedAnalyzer(include_dirs, defines, compiler, self._log)
+        generator = TestVectorGenerator()
+        report_parser = CoverageReportParser()
+        loaded_feedback = load_coverage_feedback(options.report_file, report_parser, self._log)
+        backend = options.backend
+        unit_sources = self._project_unit_sources(project_sources, include_dirs) if backend in {"CppUTest", "GoogleTest"} else list(project_sources)
+        report_items: list[dict] = []
+
+        for source in project_sources:
+            try:
+                analysis_source = source
+                if options.preprocess:
+                    analysis_source, note = preprocessor.preprocess_file(source, out_dir / "preprocessed")
+                    self._log(note)
+                functions = analyzer.analyze(
+                    analysis_source,
+                    include_static_functions=options.include_static_functions,
+                    include_main=options.include_main_function,
+                )
+                if analysis_source != source:
+                    analyzer.apply_original_source_context(functions, source)
+                code_database = CodeDatabase.from_functions(source, analysis_source, functions, analyzer=analyzer.last_analyzer)
+                backend_out_dir = out_dir / backend
+                writer = ArtifactWriter(backend_out_dir)
+                try:
+                    _saved_functions, existing_cases = self._load_existing_analysis(backend_out_dir, source)
+                    self._log(f"Loaded {len(existing_cases)} existing cases for {source.name}.")
+                except Exception as exc:
+                    self._log(f"Existing analysis not available for {source.name}; generating initial cases first: {exc}")
+                    existing_cases = generator.generate(
+                        source.name,
+                        functions,
+                        options.level,
+                        options.coverage,
+                        options.iso26262_profile,
+                        options.asil_level,
+                        options.include_static_functions,
+                        code_database,
+                    )
+
+                feedback = collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or loaded_feedback
+                feedback = merge_generated_coverage_feedback(feedback, functions, existing_cases, options.coverage)
+
+                gaps = CoverageGapPlanner().plan(feedback, functions, max_gaps=48)
+                if selected_gap:
+                    gaps = self._filter_selected_gaps(gaps, selected_gap, functions)
+                if not gaps:
+                    result.summary_lines.append(f"{source.name}: no uncovered gap was found in the current coverage feedback.")
+                    result.functions.extend(functions)
+                    result.cases.extend(existing_cases)
+                    result.feedback = feedback
+                    continue
+
+                new_cases = generator.generate_for_coverage_gaps(
+                    source.name,
+                    functions,
+                    existing_cases,
+                    gaps,
+                    options.level,
+                    options.coverage,
+                    options.asil_level,
+                    code_database,
+                )
+                if not new_cases:
+                    result.summary_lines.append(f"{source.name}: gaps found, but all generated candidate vectors duplicated existing cases.")
+                    result.functions.extend(functions)
+                    result.cases.extend(existing_cases)
+                    result.feedback = feedback
+                    continue
+
+                cases = [*existing_cases, *new_cases]
+                paths = writer.write(
+                    source,
+                    functions,
+                    cases,
+                    options.level,
+                    backend,
+                    feedback,
+                    None,
+                    include_backend=True,
+                    unit_sources=unit_sources or [source],
+                    include_dirs=include_dirs,
+                    target_coverage_percent=options.target_coverage_percent,
+                    code_database=code_database,
+                )
+                result.generated_paths.extend(paths)
+                self._log(f"Added {len(new_cases)} coverage-gap candidate cases for {source.name}.")
+
+                run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit)
+                if run_result.returncode not in (0, None):
+                    result.exit_code = run_result.returncode
+                refreshed_feedback = collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or feedback
+                refreshed_feedback = merge_generated_coverage_feedback(refreshed_feedback, functions, cases, options.coverage)
+                refreshed_feedback = self._merge_run_failures(refreshed_feedback, run_result)
+                report_path = writer._write_html_report(source, functions, cases, backend, refreshed_feedback, run_result)
+                summary_path = writer._write_summary(source, functions, cases, refreshed_feedback, run_result)
+                result.generated_paths.extend([report_path, summary_path])
+                result.functions.extend(functions)
+                result.cases.extend(cases)
+                result.feedback = refreshed_feedback
+                result.summary_lines.append(
+                    f"{source.name}: added {len(new_cases)} gap cases, total {len(cases)} cases, {format_run_result(run_result)}, {coverage_log_summary(refreshed_feedback)}"
+                )
+                report_items.append({
+                    "source": source,
+                    "functions": functions,
+                    "cases": cases,
+                    "feedback": refreshed_feedback,
+                    "run_result": run_result,
+                    "report_path": report_path,
+                })
+            except Exception as exc:
+                self._log(f"ERROR add uncovered cases {source}: {exc}")
+                result.summary_lines.append(f"{source.name}: ERROR {exc}")
+                result.exit_code = 1
+                return result
+
+        if len(report_items) > 1:
+            final_report = ArtifactWriter(out_dir / backend)._write_multi_file_report(backend, report_items)
+            result.generated_paths.append(final_report)
+            self._log(f"All-files report: {final_report}")
+        return result
+
+    @staticmethod
+    def _filter_selected_gaps(gaps: list[CoverageGap], selected_gap: dict, functions: list[FunctionInfo]) -> list[CoverageGap]:
+        selected_function = str(selected_gap.get("function") or "")
+        selected_metric = str(selected_gap.get("metric") or "")
+        selected_line = selected_gap.get("line")
+        selected_text = str(selected_gap.get("text") or "")
+        matched: list[CoverageGap] = []
+        for gap in gaps:
+            if selected_function and gap.function != selected_function:
+                continue
+            if selected_metric and selected_metric != gap.metric:
+                continue
+            if selected_line is not None and gap.line != selected_line:
+                continue
+            matched.append(gap)
+        if matched:
+            return matched
+        fn = next((item for item in functions if item.name == selected_function), None)
+        if fn is None and selected_line is not None:
+            fn = next((item for item in functions if item.start_line <= int(selected_line) <= item.end_line), None)
+        if fn is None:
+            return []
+        condition = ""
+        if selected_line is not None:
+            for item in fn.conditions:
+                if item.line == int(selected_line):
+                    condition = item.text
+                    break
+        return [CoverageGap(
+            function=fn.name,
+            line=int(selected_line) if selected_line is not None else None,
+            metric=selected_metric or "C0",
+            text=selected_text or f"Selected uncovered row for {fn.name}",
+            condition=condition,
+        )]
 
     def _run(self, options: OrchestratorOptions, refine_from_report: bool) -> OrchestratorResult:
         result = OrchestratorResult()

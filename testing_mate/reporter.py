@@ -6,50 +6,83 @@ from pathlib import Path
 import html
 import json
 import re
+from typing import Any
 
 
 class MCDCDetailedParser:
     """Parse detailed MC/DC metrics from llvm-cov outputs."""
     
     @staticmethod
-    def parse_mcdc_summary_detailed(text: str) -> dict[str, any]:
-        """Extract detailed MC/DC information from llvm-cov report summary.
-        
-        Returns dict with:
-        - overall_percent: float
-        - per_decision: list of {line, conditions, covered, percent}
-        - uncovered_decisions: list of {line, reason}
+    @staticmethod
+    def parse_mcdc_summary_detailed(text: str) -> dict[str, Any]:
+        """Extract useful MC/DC detail from llvm-cov text output.
+
+        `llvm-cov report` usually exposes only the TOTAL table. `llvm-cov show`
+        may expose decision/vector detail depending on the LLVM version and flags.
+        This parser intentionally accepts both formats and never invents MC/DC:
+        if the LLVM output does not contain MC/DC data, `overall_percent` stays None.
         """
-        result = {
+        result: dict[str, Any] = {
             "overall_percent": None,
             "per_decision": [],
             "uncovered_decisions": [],
+            "raw_mcdc_lines": [],
         }
-        
-        # Extract overall percentage
-        for line in text.splitlines():
-            if "TOTAL" in line.upper() and "MC/DC" in line.upper():
-                match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
-                if match:
-                    result["overall_percent"] = float(match.group(1))
-        
-        # Extract per-decision details if available
-        for line in text.splitlines():
-            # Look for decision-level reports
-            if any(x in line for x in ["Decision", "decision", "DECISION"]):
-                # Parse decision line data
-                if "covered" in line.lower() or "condition" in line.lower():
-                    # Extract condition counts
-                    conditions = re.findall(r"(\d+)\s+condition", line, re.IGNORECASE)
-                    if conditions:
-                        covered = re.findall(r"(\d+)\s+covered", line, re.IGNORECASE)
-                        if covered:
-                            result["per_decision"].append({
-                                "text": line.strip(),
-                                "total_conditions": int(conditions[0]),
-                                "covered_conditions": int(covered[0]),
-                            })
-        
+
+        normalized_lines = [" ".join(line.strip().split()) for line in text.splitlines()]
+        normalized_lines = [line for line in normalized_lines if line]
+
+        # llvm-cov report table: the TOTAL row normally ends with MC/DC percentage
+        # when -show-mcdc-summary is enabled.
+        for line in normalized_lines:
+            if not line.startswith("TOTAL"):
+                continue
+            percentages = [float(item) for item in re.findall(r"(\d+(?:\.\d+)?)\s*%", line)]
+            if percentages:
+                result["overall_percent"] = percentages[-1]
+
+        # Keep source/show lines that mention MC/DC, decision, condition, or vector so
+        # the HTML report can display raw evidence without guessing unavailable fields.
+        for line in normalized_lines:
+            lowered = line.lower()
+            if any(token in lowered for token in ("mcdc", "mc/dc", "decision", "condition", "vector")):
+                result["raw_mcdc_lines"].append(line[:500])
+
+                line_no = None
+                line_match = re.search(r"\bline\s+(\d+)\b", line, re.IGNORECASE)
+                if line_match:
+                    line_no = int(line_match.group(1))
+
+                # Common detail style: N/M conditions or covered/total wording.
+                fraction_match = re.search(r"\b(\d+)\s*/\s*(\d+)\b", line)
+                if fraction_match and int(fraction_match.group(2)) > 0:
+                    covered = int(fraction_match.group(1))
+                    total = int(fraction_match.group(2))
+                    entry = {
+                        "line": line_no,
+                        "text": line,
+                        "covered_conditions": covered,
+                        "total_conditions": total,
+                        "percent": (covered / total) * 100.0,
+                    }
+                    result["per_decision"].append(entry)
+                    if covered < total:
+                        result["uncovered_decisions"].append({
+                            "line": line_no,
+                            "reason": line,
+                        })
+                    continue
+
+                if any(token in lowered for token in ("not covered", "uncovered", "false", "missing")):
+                    result["uncovered_decisions"].append({
+                        "line": line_no,
+                        "reason": line,
+                    })
+
+        # Avoid returning thousands of lines from a large source report.
+        result["raw_mcdc_lines"] = result["raw_mcdc_lines"][:200]
+        result["per_decision"] = result["per_decision"][:200]
+        result["uncovered_decisions"] = result["uncovered_decisions"][:200]
         return result
 
 
@@ -286,16 +319,123 @@ class CoverageReportParser:
                 notes[key] = f"From llvm-cov JSON{target_note}: {int(total.get('covered', 0))}/{int(total.get('count', 0))} {label} covered."
         if metrics.get("MC/DC") is None:
             notes["MC/DC"] = "LLVM coverage exists, but no MC/DC records were found. Rebuild target sources with -fcoverage-mcdc and rerun tests."
+
+        uncovered = self._extract_llvm_json_uncovered_items(payload, targets)
+
         return CoverageFeedback(
             source=source,
             raw_text=text[:12000],
             coverage_percent=self._best_percent(text, metrics),
             metrics=metrics,
             metric_notes=notes,
-            uncovered_items=[],
+            uncovered_items=uncovered[:120],
             failures=[],
         )
 
+    def _extract_llvm_json_uncovered_items(self, payload: object, targets: list[str]) -> list[str]:
+        """Best-effort gap list from llvm-cov export JSON.
+
+        This is intentionally conservative. It reports line/branch/MC/DC evidence that
+        llvm-cov explicitly marks as not executed or not fully covered; it does not
+        derive MC/DC from LCOV-style branch counters.
+        """
+        items: list[str] = []
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not (isinstance(data, list) and data and isinstance(data[0], dict)):
+            return items
+
+        files = data[0].get("files")
+        if not isinstance(files, list):
+            return items
+
+        for file_item in files:
+            if not isinstance(file_item, dict):
+                continue
+            filename = str(file_item.get("filename") or file_item.get("name") or "")
+            if filename and not self._path_matches_targets(filename, targets):
+                continue
+
+            # Segments are commonly [line, col, count, has_count, is_region_entry, ...].
+            zero_lines: set[int] = set()
+            segments = file_item.get("segments")
+            if isinstance(segments, list):
+                for segment in segments:
+                    if isinstance(segment, list) and len(segment) >= 4:
+                        try:
+                            line_no = int(segment[0])
+                            count = int(float(segment[2]))
+                            has_count = bool(segment[3])
+                        except (TypeError, ValueError):
+                            continue
+                        if has_count and count <= 0:
+                            zero_lines.add(line_no)
+                    elif isinstance(segment, dict):
+                        line_no = self._first_number(segment, ("line", "line_no", "line_number"))
+                        count = self._first_number(segment, ("count", "execution_count", "covered"))
+                        if line_no is not None and count is not None and count <= 0:
+                            zero_lines.add(int(line_no))
+            for line_no in sorted(zero_lines)[:80]:
+                items.append(f"Uncovered C0 line {line_no} in {filename}")
+
+            branches = file_item.get("branches")
+            if isinstance(branches, list):
+                for branch in branches[:160]:
+                    if isinstance(branch, list) and len(branch) >= 4:
+                        try:
+                            line_no = int(branch[0])
+                            true_count = int(float(branch[2]))
+                            false_count = int(float(branch[3]))
+                        except (TypeError, ValueError):
+                            continue
+                        if true_count <= 0:
+                            items.append(f"Uncovered C1 true branch line {line_no} in {filename}")
+                        if false_count <= 0:
+                            items.append(f"Uncovered C1 false branch line {line_no} in {filename}")
+                    elif isinstance(branch, dict):
+                        line_no = self._first_number(branch, ("line", "line_no", "line_number"))
+                        count = self._first_number(branch, ("count", "covered", "executed"))
+                        false_count = self._first_number(branch, ("false_count", "false", "not_taken"))
+                        true_count = self._first_number(branch, ("true_count", "true", "taken"))
+                        if line_no is None:
+                            continue
+                        if count is not None and count <= 0:
+                            items.append(f"Uncovered C1 branch line {int(line_no)} in {filename}")
+                        if true_count is not None and true_count <= 0:
+                            items.append(f"Uncovered C1 true branch line {int(line_no)} in {filename}")
+                        if false_count is not None and false_count <= 0:
+                            items.append(f"Uncovered C1 false branch line {int(line_no)} in {filename}")
+
+            mcdc_records = file_item.get("mcdc_records")
+            if isinstance(mcdc_records, list):
+                for record in mcdc_records[:160]:
+                    if isinstance(record, dict):
+                        line_no = self._first_number(record, ("line", "line_no", "line_number"))
+                        percent = self._first_number(record, ("percent", "coverage", "ratio"))
+                        covered = self._first_number(record, ("covered", "hit", "executed"))
+                        count = self._first_number(record, ("count", "total", "num"))
+                        if percent is not None and percent < 100.0:
+                            line_text = f" line {int(line_no)}" if line_no is not None else ""
+                            items.append(f"Uncovered MC/DC obligation{line_text} in {filename}: {percent:.2f}%")
+                        elif count is not None and covered is not None and covered < count:
+                            line_text = f" line {int(line_no)}" if line_no is not None else ""
+                            items.append(f"Uncovered MC/DC obligation{line_text} in {filename}: {int(covered)}/{int(count)} covered")
+                    elif isinstance(record, list) and len(record) >= 3:
+                        try:
+                            line_no = int(record[0])
+                        except (TypeError, ValueError):
+                            line_no = None
+                        text = ",".join(str(part) for part in record)
+                        if any(token in text.lower() for token in ("false", "uncovered", "not covered")):
+                            line_text = f" line {line_no}" if line_no is not None else ""
+                            items.append(f"Uncovered MC/DC obligation{line_text} in {filename}")
+        # Stable de-duplication.
+        unique: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            if item not in seen:
+                unique.append(item)
+                seen.add(item)
+        return unique
     def _extract_llvm_json_totals(self, payload: object, targets: list[str]) -> dict[str, dict[str, float]]:
         totals = {"lines": {"count": 0.0, "covered": 0.0}, "branches": {"count": 0.0, "covered": 0.0}, "mcdc": {"count": 0.0, "covered": 0.0}}
 
