@@ -476,11 +476,19 @@ class TestBackendGenerator:
         unit_sources: list[Path] | None = None,
         code_database: CodeDatabase | None = None,
     ) -> list[Path]:
+        # Keep native LLVM MC/DC instrumentation strictly tied to the selected
+        # coverage objective. C0/C1 generation must not compile or report with
+        # -fcoverage-mcdc, even when the clang/llvm-cov backend is used.
+        enable_mcdc = self._cases_request_mcdc(cases)
         if backend == "CppUTest":
-            return self._write_cpputest(source, functions, cases, unit_sources or [source], code_database)
+            return self._write_cpputest(source, functions, cases, unit_sources or [source], code_database, enable_mcdc)
         if backend == "GoogleTest":
-            return self._write_gtest(source, functions, cases, unit_sources or [source], code_database)
+            return self._write_gtest(source, functions, cases, unit_sources or [source], code_database, enable_mcdc)
         return []
+
+    @staticmethod
+    def _cases_request_mcdc(cases: list[TestCase]) -> bool:
+        return any(str(case.coverage).strip().upper() in {"MC/DC", "MCDC"} for case in cases)
 
     def _write_cpputest(
         self,
@@ -489,6 +497,7 @@ class TestBackendGenerator:
         cases: list[TestCase],
         unit_sources: list[Path],
         code_database: CodeDatabase | None = None,
+        enable_mcdc: bool = False,
     ) -> list[Path]:
         test_dir = self.out_dir / f"{source.stem}_cpputest"
         test_dir.mkdir(parents=True, exist_ok=True)
@@ -514,7 +523,7 @@ class TestBackendGenerator:
                     "set(CMAKE_CXX_STANDARD 11)",
                     "enable_testing()",
                     "option(TESTING_MATE_LLVM_COVERAGE \"Enable Clang/LLVM source-based coverage\" ON)",
-                    "option(TESTING_MATE_LLVM_MCDC \"Enable Clang/LLVM MC/DC coverage\" ON)",
+                    f"option(TESTING_MATE_LLVM_MCDC \"Enable Clang/LLVM MC/DC coverage\" {'ON' if enable_mcdc else 'OFF'})",
                     "option(TESTING_MATE_LEGACY_LCOV \"Enable legacy gcov/lcov C0/C1 coverage\" OFF)",
                     "if(TESTING_MATE_LLVM_COVERAGE)",
                     "  if(NOT CMAKE_C_COMPILER_ID MATCHES \"Clang\")",
@@ -558,7 +567,7 @@ class TestBackendGenerator:
             ),
             encoding="utf-8",
         )
-        runner.write_text(self._cmake_runner(source.stem + "_cpputest", f"src/{source.name}"), encoding="utf-8")
+        runner.write_text(self._cmake_runner(source.stem + "_cpputest", f"src/{source.name}", enable_mcdc), encoding="utf-8")
         return [*copied, *stub_result.generated_paths, test_file, cmake_file, runner]
 
     def _write_gtest(
@@ -568,6 +577,7 @@ class TestBackendGenerator:
         cases: list[TestCase],
         unit_sources: list[Path],
         code_database: CodeDatabase | None = None,
+        enable_mcdc: bool = False,
     ) -> list[Path]:
         test_dir = self.out_dir / f"{source.stem}_gtest"
         test_dir.mkdir(parents=True, exist_ok=True)
@@ -593,7 +603,7 @@ class TestBackendGenerator:
                     "set(CMAKE_CXX_STANDARD 14)",
                     "enable_testing()",
                     "option(TESTING_MATE_LLVM_COVERAGE \"Enable Clang/LLVM source-based coverage\" ON)",
-                    "option(TESTING_MATE_LLVM_MCDC \"Enable Clang/LLVM MC/DC coverage\" ON)",
+                    f"option(TESTING_MATE_LLVM_MCDC \"Enable Clang/LLVM MC/DC coverage\" {'ON' if enable_mcdc else 'OFF'})",
                     "option(TESTING_MATE_LEGACY_LCOV \"Enable legacy gcov/lcov C0/C1 coverage\" OFF)",
                     "if(TESTING_MATE_LLVM_COVERAGE)",
                     "  if(NOT CMAKE_C_COMPILER_ID MATCHES \"Clang\")",
@@ -637,7 +647,7 @@ class TestBackendGenerator:
             ),
             encoding="utf-8",
         )
-        runner.write_text(self._cmake_runner(source.stem + "_gtest", f"src/{source.name}"), encoding="utf-8")
+        runner.write_text(self._cmake_runner(source.stem + "_gtest", f"src/{source.name}", enable_mcdc), encoding="utf-8")
         return [*copied, *stub_result.generated_paths, test_file, cmake_file, runner]
 
     def _copy_target_source(self, source: Path, test_dir: Path) -> list[Path]:
@@ -2926,7 +2936,7 @@ class TestBackendGenerator:
         return source.name
 
     @staticmethod
-    def _cmake_runner(target: str, target_source: str | None = None) -> str:
+    def _cmake_runner(target: str, target_source: str | None = None, enable_mcdc: bool = False) -> str:
         import textwrap
 
         def bash_dq(value: str) -> str:
@@ -2953,6 +2963,7 @@ cd "$SCRIPT_DIR"
 
 target="@@TARGET@@"
 target_source="@@TARGET_SOURCE@@"
+native_mcdc="@@NATIVE_MCDC@@"
 
 report_base="${target}"
 report_base="${report_base%_cpputest}"
@@ -3088,6 +3099,7 @@ fi
 echo "shell: ${MSYSTEM:-unknown}"
 echo "tool prefix: ${tool_prefix}"
 echo "coverage backend: ${coverage_backend}"
+echo "native MC/DC: ${native_mcdc}"
 echo "target: ${target}"
 echo "coverage target source: ${target_source}"
 echo "CC: ${CC}"
@@ -3175,7 +3187,7 @@ cmake_extra_args=()
 if [ "$coverage_backend" = "clang_llvmcov" ]; then
   cmake_extra_args+=(
     "-DTESTING_MATE_LLVM_COVERAGE=ON"
-    "-DTESTING_MATE_LLVM_MCDC=ON"
+    "-DTESTING_MATE_LLVM_MCDC=${native_mcdc}"
     "-DTESTING_MATE_LEGACY_LCOV=OFF"
   )
 else
@@ -3244,10 +3256,12 @@ if [ "$coverage_backend" = "clang_llvmcov" ]; then
 
   report_opts=("-show-branch-summary")
 
-  if llvm-cov report --help 2>&1 | grep -q -- "show-mcdc-summary"; then
-    report_opts+=("-show-mcdc-summary")
-  else
-    echo "Warning: this llvm-cov does not support -show-mcdc-summary."
+  if [ "$native_mcdc" = "ON" ]; then
+    if llvm-cov report --help 2>&1 | grep -q -- "show-mcdc-summary"; then
+      report_opts+=("-show-mcdc-summary")
+    else
+      echo "Warning: this llvm-cov does not support -show-mcdc-summary."
+    fi
   fi
 
   llvm-cov report "$exe_path" \
@@ -3266,14 +3280,16 @@ if [ "$coverage_backend" = "clang_llvmcov" ]; then
     "-show-branches=count"
   )
 
-  if llvm-cov show --help 2>&1 | grep -q -- "show-mcdc"; then
-    show_opts+=("-show-mcdc")
-  fi
+  if [ "$native_mcdc" = "ON" ]; then
+    if llvm-cov show --help 2>&1 | grep -q -- "show-mcdc"; then
+      show_opts+=("-show-mcdc")
+    fi
 
-  if llvm-cov show --help 2>&1 | grep -q -- "show-mcdc-non-executed-vectors"; then
-    show_opts+=("-show-mcdc-non-executed-vectors")
-  else
-    echo "Info: this llvm-cov does not support -show-mcdc-non-executed-vectors."
+    if llvm-cov show --help 2>&1 | grep -q -- "show-mcdc-non-executed-vectors"; then
+      show_opts+=("-show-mcdc-non-executed-vectors")
+    else
+      echo "Info: this llvm-cov does not support -show-mcdc-non-executed-vectors."
+    fi
   fi
 
   llvm-cov show "$exe_path" \
@@ -3366,6 +3382,7 @@ exit "$test_status"
             .lstrip()
             .replace("@@TARGET@@", bash_dq(target))
             .replace("@@TARGET_SOURCE@@", bash_dq(target_source_msys))
+            .replace("@@NATIVE_MCDC@@", "ON" if enable_mcdc else "OFF")
         )
 
 class TestBackendRunner:

@@ -216,7 +216,7 @@ class TestingMateApp(tk.Tk):
         Coverages = ttk.Frame(left, style="Panel.TFrame")
         Coverages.pack(fill="x", pady=(0, 4))
         for text, value in (("C0/C1", "C0/C1"), ("MCDC", "MC/DC")):
-            ttk.Radiobutton(Coverages, text=text, variable=self.coverage, value=value).pack(side="left", padx=(0, 20))
+            ttk.Radiobutton(Coverages, text=text, variable=self.coverage, value=value, command=self._on_coverage_changed).pack(side="left", padx=(0, 20))
 
         self.level = tk.StringVar(value="UT")
         levels = ttk.Frame(left, style="Panel.TFrame")
@@ -586,6 +586,15 @@ class TestingMateApp(tk.Tk):
         thread = threading.Thread(target=lambda: self._add_uncovered_cases(selected_gap), daemon=True)
         thread.start()
 
+    def _coverage_mcdc_enabled(self) -> bool:
+        return str(self.coverage.get()).strip().upper() in {"MC/DC", "MCDC"}
+
+    def _on_coverage_changed(self) -> None:
+        if self.last_functions:
+            self._populate_tree(self.last_functions, self.last_feedback)
+        if not self._coverage_mcdc_enabled():
+            self._append_log("MC/DC instrumentation and MC/DC obligations are disabled for C0/C1 mode.")
+
     def _selected_gap_request(self) -> dict | None:
         selection = self.tree.selection()
         if not selection:
@@ -595,10 +604,14 @@ class TestingMateApp(tk.Tk):
             return None
         line_text = str(values[1])
         line_match = re.search(r"\d+", line_text)
+        metric = str(values[2])
+        if metric == "MC/DC" and not self._coverage_mcdc_enabled():
+            messagebox.showwarning(APP_NAME, "MC/DC gap selection is disabled while coverage mode is C0/C1.")
+            return None
         return {
             "function": str(values[0]),
             "line": int(line_match.group(0)) if line_match else None,
-            "metric": str(values[2]),
+            "metric": metric,
             "text": str(values[3]),
             "status": str(values[4]),
         }
@@ -711,7 +724,12 @@ class TestingMateApp(tk.Tk):
 
         test_id_var = tk.StringVar(value=(f"MANUAL_{selected_function}_{len(self.last_cases) + 1:03d}" if selected_case is None else f"MANUAL_{selected_case.test_id}"))
         function_var = tk.StringVar(value=selected_function)
+        coverage_values = ["C0", "C0/C1", "C1", "Manual"]
+        if self._coverage_mcdc_enabled() or (selected_case and str(selected_case.coverage).strip().upper() in {"MC/DC", "MCDC"}):
+            coverage_values.insert(3, "MC/DC")
         coverage_var = tk.StringVar(value=(selected_case.coverage if selected_case else self.coverage.get()))
+        if coverage_var.get() == "MC/DC" and "MC/DC" not in coverage_values:
+            coverage_var.set("C0/C1")
         mode_var = tk.StringVar(value="Harness Code" if selected_case and (selected_case.values or {}).get("__manual_action_code") else "Steps Only")
         source_var = tk.StringVar(value=self.sources[0].name if self.sources else "")
 
@@ -724,7 +742,7 @@ class TestingMateApp(tk.Tk):
         function_box = ttk.Combobox(header, textvariable=function_var, values=function_names, state="readonly")
         function_box.grid(row=1, column=1, sticky="ew", pady=4)
         ttk.Label(header, text="Coverage", style="Panel.TLabel").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=4)
-        ttk.Combobox(header, textvariable=coverage_var, values=("C0", "C0/C1", "C1", "MC/DC", "Manual"), state="readonly", width=24).grid(row=1, column=3, sticky="ew", pady=4)
+        ttk.Combobox(header, textvariable=coverage_var, values=coverage_values, state="readonly", width=24).grid(row=1, column=3, sticky="ew", pady=4)
 
         ttk.Label(header, text="Mode", style="Panel.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
         mode_box = ttk.Combobox(header, textvariable=mode_var, values=("Steps Only", "Harness Code"), state="readonly")
@@ -1046,6 +1064,9 @@ class TestingMateApp(tk.Tk):
                 return
 
             gaps = CoverageGapPlanner().plan(feedback, functions, max_gaps=120) if feedback else []
+            mcdc_enabled = self._coverage_mcdc_enabled()
+            if not mcdc_enabled:
+                gaps = [gap for gap in gaps if gap.metric != "MC/DC"]
             gap_keys = {(gap.function, gap.line, gap.metric) for gap in gaps}
 
             # Show concrete backend gaps first. Selecting one of these rows lets the
@@ -1080,19 +1101,20 @@ class TestingMateApp(tk.Tk):
 
                 for condition in fn.conditions:
                     c1_status = "Uncovered" if (fn.name, condition.line, "C1") in gap_keys else "Covered"
-                    mcdc_status = "Uncovered" if (fn.name, condition.line, "MC/DC") in gap_keys else "Covered"
                     self.tree.insert(
                         "",
                         "end",
                         values=(fn.name, condition.line, "C1", condition.text, c1_status),
                         tags=("uncovered" if c1_status == "Uncovered" else "covered",),
                     )
-                    self.tree.insert(
-                        "",
-                        "end",
-                        values=(fn.name, condition.line, "MC/DC", condition.text, mcdc_status),
-                        tags=("uncovered" if mcdc_status == "Uncovered" else "covered",),
-                    )
+                    if mcdc_enabled:
+                        mcdc_status = "Uncovered" if (fn.name, condition.line, "MC/DC") in gap_keys else "Covered"
+                        self.tree.insert(
+                            "",
+                            "end",
+                            values=(fn.name, condition.line, "MC/DC", condition.text, mcdc_status),
+                            tags=("uncovered" if mcdc_status == "Uncovered" else "covered",),
+                        )
 
         self.after(0, insert)
 
@@ -1527,6 +1549,8 @@ class Orchestrator:
                 feedback = merge_generated_coverage_feedback(feedback, functions, existing_cases, options.coverage)
 
                 gaps = CoverageGapPlanner().plan(feedback, functions, max_gaps=48)
+                if str(options.coverage).strip().upper() not in {"MC/DC", "MCDC"}:
+                    gaps = [gap for gap in gaps if gap.metric != "MC/DC"]
                 if selected_gap:
                     gaps = self._filter_selected_gaps(gaps, selected_gap, functions)
                 if not gaps:

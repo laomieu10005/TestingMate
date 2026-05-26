@@ -21,6 +21,10 @@ class ArtifactWriter:
         self.out_dir = out_dir
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _cases_request_mcdc(cases: list[TestCase]) -> bool:
+        return any(str(case.coverage).strip().upper() in {"MC/DC", "MCDC"} for case in cases)
+
     def write(
         self,
         source: Path,
@@ -541,7 +545,9 @@ class ArtifactWriter:
         condition_count = sum(len(fn.conditions) for fn in functions)
         decision_count = sum(max(1, len(condition.decisions) or 1) for fn in functions for condition in fn.conditions)
         metrics, metric_notes = self._effective_coverage_metrics(source, backend, feedback)
-        min_executed_metric = min([value for value in metrics.values() if value is not None], default=None)
+        include_mcdc = self._cases_request_mcdc(cases)
+        active_metric_keys = ("C0", "C1", "MC/DC") if include_mcdc else ("C0", "C1")
+        min_executed_metric = min([metrics.get(key) for key in active_metric_keys if metrics.get(key) is not None], default=None)
         coverage = f"{min_executed_metric:.2f}%" if min_executed_metric is not None else "N/A"
 
         run_status = "Not run"
@@ -597,8 +603,14 @@ class ArtifactWriter:
                 "</details>"
             )
 
-        coverage_metric_html = self._coverage_metric_cards(feedback, functions, source, backend)
-        coverage_obligation_rows = self._coverage_obligation_rows(functions)
+        coverage_metric_html = self._coverage_metric_cards(feedback, functions, source, backend, include_mcdc)
+        coverage_obligation_rows = self._coverage_obligation_rows(functions, include_mcdc)
+        coverage_notice = (
+            '<div class="notice"><strong>MC/DC rule:</strong> MC/DC is only claimed from LLVM native <code>-fcoverage-mcdc</code> evidence. LCOV/gcov branch counters are not treated as MC/DC.</div>'
+            if include_mcdc
+            else '<div class="notice"><strong>C0/C1 mode:</strong> MC/DC instrumentation, MC/DC report options, and MC/DC obligations are disabled for this run.</div>'
+        )
+        worst_metric_note = "Minimum available C0/C1/MC/DC value" if include_mcdc else "Minimum available C0/C1 value"
         uncovered = "".join(f"<li>{html.escape(item)}</li>" for item in (feedback.uncovered_items if feedback else []))
         failures = "".join(f"<li>{html.escape(item)}</li>" for item in (feedback.failures if feedback else []))
         if not uncovered:
@@ -990,7 +1002,7 @@ class ArtifactWriter:
         <div class="card"><div class="label">Functions</div><div class="metric">@@FUNCTION_COUNT@@</div><div class="note">Analyzed units</div></div>
         <div class="card"><div class="label">Conditions</div><div class="metric">@@CONDITION_COUNT@@</div><div class="note">Extracted Boolean decisions</div></div>
         <div class="card"><div class="label">@@CASE_LABEL@@</div><div class="metric">@@CASE_COUNT@@</div><div class="note">Backend execution evidence</div></div>
-        <div class="card"><div class="label">Worst Metric</div><div class="metric">@@DASHBOARD_METRIC@@</div><div class="note">Minimum available C0/C1/MC/DC value</div></div>
+        <div class="card"><div class="label">Worst Metric</div><div class="metric">@@DASHBOARD_METRIC@@</div><div class="note">@@WORST_METRIC_NOTE@@</div></div>
       </div>
     </div>
   </header>
@@ -998,7 +1010,7 @@ class ArtifactWriter:
     <section>
       <h2>Coverage Metrics</h2>
       <div class="metric-grid">@@COVERAGE_METRIC_HTML@@</div>
-      <div class="notice"><strong>MC/DC rule:</strong> MC/DC is only claimed from LLVM native <code>-fcoverage-mcdc</code> evidence. LCOV/gcov branch counters are not treated as MC/DC.</div>
+      @@COVERAGE_NOTICE@@
     </section>
 
     <section>
@@ -1085,7 +1097,9 @@ class ArtifactWriter:
             .replace("@@CASE_LABEL@@", html.escape(report_case_label))
             .replace("@@CASE_COUNT@@", str(report_case_count))
             .replace("@@DASHBOARD_METRIC@@", dashboard_metric)
+            .replace("@@WORST_METRIC_NOTE@@", worst_metric_note)
             .replace("@@COVERAGE_METRIC_HTML@@", coverage_metric_html)
+            .replace("@@COVERAGE_NOTICE@@", coverage_notice)
             .replace("@@FUNCTION_ROWS@@", function_rows_html)
             .replace("@@BACKEND_OUTPUT_HTML@@", backend_output_html)
             .replace("@@LCOV_TRACE_HTML@@", lcov_trace_html)
@@ -1123,6 +1137,7 @@ class ArtifactWriter:
         functions: list[FunctionInfo],
         source: Path | None = None,
         backend: str = "",
+        include_mcdc: bool = True,
     ) -> str:
         if source is not None and backend:
             metrics, notes = self._effective_coverage_metrics(source, backend, feedback)
@@ -1140,8 +1155,9 @@ class ArtifactWriter:
             "C1": "Branch coverage",
             "MC/DC": "Native LLVM MC/DC",
         }
+        metric_keys = ("C0", "C1", "MC/DC") if include_mcdc else ("C0", "C1")
         cards: list[str] = []
-        for metric in ("C0", "C1", "MC/DC"):
+        for metric in metric_keys:
             value = metrics.get(metric)
             level = self._metric_level(value)
             display = f"{value:.2f}%" if value is not None else "N/A"
@@ -1316,7 +1332,7 @@ class ArtifactWriter:
         return f'<a href="{html.escape(source_href)}#{line}">line {line}</a>'
 
     @staticmethod
-    def _coverage_obligation_rows(functions: list[FunctionInfo]) -> str:
+    def _coverage_obligation_rows(functions: list[FunctionInfo], include_mcdc: bool = True) -> str:
         rows: list[str] = []
         for fn in functions:
             rows.append(
@@ -1339,16 +1355,17 @@ class ArtifactWriter:
                     "<td>LLVM source-based branch coverage from llvm-cov export/report</td>"
                     "</tr>"
                 )
-                for decision in decisions:
-                    rows.append(
-                        "<tr>"
-                        "<td><span class=\"pill na\">MC/DC</span></td>"
-                        f"<td>{html.escape(fn.name)}</td>"
-                        f"<td>{condition.line}</td>"
-                        f"<td>Independent effect pair for <code>{html.escape(decision)}</code></td>"
-                        "<td>LLVM native MC/DC from -fcoverage-mcdc; N/A when LLVM MC/DC records are absent</td>"
-                        "</tr>"
-                    )
+                if include_mcdc:
+                    for decision in decisions:
+                        rows.append(
+                            "<tr>"
+                            "<td><span class=\"pill na\">MC/DC</span></td>"
+                            f"<td>{html.escape(fn.name)}</td>"
+                            f"<td>{condition.line}</td>"
+                            f"<td>Independent effect pair for <code>{html.escape(decision)}</code></td>"
+                            "<td>LLVM native MC/DC from -fcoverage-mcdc; N/A when LLVM MC/DC records are absent</td>"
+                            "</tr>"
+                        )
         if not rows:
             return "<tr><td colspan=\"5\" class=\"subtle\">No coverage obligations were extracted.</td></tr>"
         return "".join(rows)
