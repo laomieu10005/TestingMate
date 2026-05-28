@@ -49,10 +49,11 @@ def validate_toolchain(compiler: str = DEFAULT_COMPILER, log_fn=None) -> tuple[b
 
 
 
-def _unique_paths(paths: list[Path]) -> list[Path]:
+def _unique_paths(paths: list[Path | str]) -> list[Path]:
     result: list[Path] = []
     seen: set[Path] = set()
     for path in paths:
+        path = path if isinstance(path, Path) else Path(str(path))
         try:
             resolved = path.expanduser().resolve()
         except OSError:
@@ -67,7 +68,7 @@ def _unique_paths(paths: list[Path]) -> list[Path]:
 INCLUDE_FOLDER_NAMES = {"include", "includes", "inc", "header", "headers"}
 
 
-def discover_include_dirs_for_source(source: Path) -> list[str]:
+def discover_include_dirs_for_source(source: Path | str) -> list[str]:
     """Return source-local include roots for GUI/orchestrator build context.
 
     Discovery is deliberately small and deterministic:
@@ -117,7 +118,7 @@ def _unique_strings_for_cbackend(values: list[str]) -> list[str]:
     return result
 
 
-def discover_include_dirs_for_sources(sources: list[Path]) -> list[str]:
+def discover_include_dirs_for_sources(sources: list[Path | str]) -> list[str]:
     discovered: list[Path] = []
     for source in sources:
         for item in discover_include_dirs_for_source(source):
@@ -231,6 +232,8 @@ def _tm_split_toplevel_statements(text: str) -> list[str]:
                 result.append(statement)
     return result
 def _tm_parse_global_declaration(statement: str) -> tuple[str, str] | None:
+    if re.search(r"\bstatic\b", statement or ""):
+        return None
     statement = re.sub(r"\b(?:extern|static|volatile)\b", " ", statement or "").strip()
     if "(" in statement or not statement.endswith(";"):
         return None
@@ -249,7 +252,13 @@ def _tm_parse_global_declaration(statement: str) -> tuple[str, str] | None:
     return name, " ".join(ctype.split())
 def _tm_global_variable_type_map(text: str) -> dict[str, str]:
     result: dict[str, str] = {}
-    for statement in _tm_split_toplevel_statements(text):
+    clean = _tm_strip_comments_and_strings(text or "")
+    # Do not treat compound typedef aliases as file-scope variables. The
+    # top-level statement splitter intentionally discards brace contents, which
+    # would otherwise leave fragments such as `OutType;` and parse them as bogus
+    # globals.
+    clean = re.sub(r"\btypedef\s+(?:struct|union|enum)\b.*?\}\s*[A-Za-z_]\w*\s*;", "", clean, flags=re.S)
+    for statement in _tm_split_toplevel_statements(clean):
         parsed = _tm_parse_global_declaration(statement)
         if parsed:
             name, ctype = parsed
@@ -285,6 +294,69 @@ def _tm_local_assignments(body: str) -> dict[str, str]:
     return result
 
 
+def _tm_braced_or_statement_span(text: str, index: int) -> tuple[str, int]:
+    """Return the next braced block or single statement plus the following index."""
+    index = CAnalyzer._next_nonspace_index(text, index) or index
+    if index >= len(text):
+        return "", index
+    if text[index] == "{":
+        end = CAnalyzer._matching_brace(text, index)
+        if end >= 0:
+            return text[index + 1 : end], end + 1
+        return "", index
+    semi = text.find(";", index)
+    if semi < 0:
+        return "", len(text)
+    return text[index : semi + 1], semi + 1
+
+
+def _tm_if_else_blocks(clean: str) -> list[tuple[str, str, str, str]]:
+    """Extract simple if/else blocks used to attach path conditions to FixIt hints.
+
+    The fourth tuple member is the straight-line prefix before the if statement.
+    It lets the oracle builder infer else-path return values from initial local
+    assignments such as `ret = 0; if (...) { ret = 1; } return ret;`.
+    """
+    result: list[tuple[str, str, str, str]] = []
+    for match in re.finditer(r"\bif\s*\((?P<cond>[^{};]+)\)", clean):
+        cond = " ".join(match.group("cond").split())
+        then_block, cursor = _tm_braced_or_statement_span(clean, match.end())
+        cursor = CAnalyzer._next_nonspace_index(clean, cursor) or cursor
+        else_block = ""
+        if clean.startswith("else", cursor):
+            else_block, cursor = _tm_braced_or_statement_span(clean, cursor + 4)
+        if then_block.strip() or else_block.strip():
+            result.append((cond, then_block, else_block, clean[:match.start()]))
+    return result
+
+
+def _tm_targeted_assignments(block: str, pointer_params: set[str], globals_: set[str], locals_: set[str]) -> list[tuple[str, str, str]]:
+    """Return (kind,target,value) for observable assignments in a block."""
+    result: list[tuple[str, str, str]] = []
+    returned_locals = set(re.findall(r"\breturn\s+([A-Za-z_]\w*)\s*;", block))
+    for param in pointer_params:
+        escaped = re.escape(param)
+        for match in re.finditer(rf"\*\s*{escaped}\s*=\s*([^;]+);", block):
+            result.append(("expected_output", param, match.group(1)))
+        for match in re.finditer(rf"\b{escaped}\s*->\s*([A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*)\s*=\s*([^;]+);", block):
+            field = re.sub(r"\s+", "", match.group(1))
+            result.append(("expected_output", f"{param}.{field}", match.group(2)))
+        for match in re.finditer(rf"\b{escaped}\s*\[\s*0\s*\]\s*=\s*([^;]+);", block):
+            result.append(("expected_output", param, match.group(1)))
+    for match in re.finditer(r"(?<![!<>=.>])\b([A-Za-z_]\w*)\b\s*=\s*([^;]+);", block):
+        name = match.group(1)
+        expr = match.group(2)
+        if name in returned_locals or (name in locals_ and name.lower() in {"ret", "retval", "returnvalue", "result", "status"}):
+            result.append(("expected_return", "return", expr))
+        elif name in globals_ or _tm_probably_global_name(name):
+            result.append(("expected_global", name, expr))
+    for match in re.finditer(r"\breturn\s+([^;]+);", block):
+        expr = match.group(1).strip()
+        if not (re.fullmatch(r"[A-Za-z_]\w*", expr) and expr in locals_):
+            result.append(("expected_return", "return", expr))
+    return result
+
+
 def build_fixit_hints_for_function(fn, source: str = "analysis") -> list[dict[str, str]]:
     """Create FixItHint-style deterministic test-oracle hints from analyzed C body.
 
@@ -297,6 +369,7 @@ def build_fixit_hints_for_function(fn, source: str = "analysis") -> list[dict[st
     params = {getattr(param, "name", "") for param in getattr(fn, "parameters", [])}
     pointer_params = {getattr(param, "name", "") for param in getattr(fn, "parameters", []) if getattr(param, "kind", "") == "pointer"}
     locals_ = _tm_function_internal_local_names(fn)
+    _, _, globals_ = _tm_function_scope_sets(fn)
     local_assignments = _tm_local_assignments(body)
     hints: list[dict[str, str]] = []
     seen: set[tuple[str, str, str, str]] = set()
@@ -313,6 +386,44 @@ def build_fixit_hints_for_function(fn, source: str = "analysis") -> list[dict[st
         if condition:
             item["condition"] = condition.strip()
         hints.append(item)
+
+    # Path-aware hints for simple if/else blocks. This prevents unsafe oracles
+    # such as applying the THEN branch output to an ELSE-branch vector.
+    returned_locals = set(re.findall(r"\breturn\s+([A-Za-z_]\w*)\s*;", clean))
+    for cond, then_block, else_block, prefix_block in _tm_if_else_blocks(clean):
+        then_assignments = _tm_targeted_assignments(then_block, pointer_params, globals_, locals_)
+        else_assignments = _tm_targeted_assignments(else_block, pointer_params, globals_, locals_)
+        prefix_assignments = _tm_local_assignments(prefix_block)
+        prefix_observable_assignments = _tm_targeted_assignments(prefix_block, pointer_params, globals_, locals_)
+        prefix_by_target = {(kind, target): value for kind, target, value in prefix_observable_assignments}
+
+        # If a THEN block changes an observable and there is no explicit ELSE,
+        # use the straight-line prefix value as the false-path oracle. This is
+        # common C style: ret/out/global defaults are initialized before if().
+        then_targets = {(kind, target) for kind, target, _ in then_assignments}
+        else_targets = {(kind, target) for kind, target, _ in else_assignments}
+        for key in sorted(then_targets - else_targets):
+            if key in prefix_by_target:
+                else_assignments.append((key[0], key[1], prefix_by_target[key]))
+        for key in sorted(else_targets - then_targets):
+            if key in prefix_by_target:
+                then_assignments.append((key[0], key[1], prefix_by_target[key]))
+
+        if any(kind == "expected_return" for kind, _, _ in then_assignments) and not any(kind == "expected_return" for kind, _, _ in else_assignments):
+            for returned in returned_locals:
+                if returned in prefix_assignments:
+                    else_assignments.append(("expected_return", "return", prefix_assignments[returned]))
+                    break
+        if any(kind == "expected_return" for kind, _, _ in else_assignments) and not any(kind == "expected_return" for kind, _, _ in then_assignments):
+            for returned in returned_locals:
+                if returned in prefix_assignments:
+                    then_assignments.append(("expected_return", "return", prefix_assignments[returned]))
+                    break
+        for kind, target, value in then_assignments:
+            add(kind, target, local_assignments.get(value.strip(), value), cond)
+        if else_assignments:
+            for kind, target, value in else_assignments:
+                add(kind, target, local_assignments.get(value.strip(), value), f"!({cond})")
 
     # if (cond) return A; else return B;
     for match in re.finditer(r"\bif\s*\((?P<cond>[^{};]+)\)\s*return\s+(?P<yes>[^;]+);\s*else\s*return\s+(?P<no>[^;]+);", clean):
@@ -351,6 +462,17 @@ def build_fixit_hints_for_function(fn, source: str = "analysis") -> list[dict[st
         name = match.group(1)
         if name not in ignored and name not in C_KEYWORDS and _tm_is_real_global_symbol(fn, name):
             add("expected_global", name, "1")
+
+    conditional_targets = {
+        (item.get("kind", ""), item.get("target", ""))
+        for item in hints
+        if item.get("condition")
+    }
+    if conditional_targets:
+        hints = [
+            item for item in hints
+            if item.get("condition") or (item.get("kind", ""), item.get("target", "")) not in conditional_targets
+        ]
     return hints
 
 
@@ -539,8 +661,10 @@ class CPreprocessor:
         target = out_dir / f"{source.stem}.preprocessed.c"
         env = toolchain_env()
         
-        # Build include directories, prioritizing stub_dir if available
-        include_dirs = _unique_strings_for_cbackend([*self.include_dirs, *discover_include_dirs_for_source(source)])
+        # Keep compiler include paths explicit. Generated/staged headers are
+        # searched through stub_dir when available; original source/include
+        # roots are not auto-added here.
+        include_dirs = _unique_strings_for_cbackend([*self.include_dirs])
         if self.stub_dir and self.stub_dir.exists():
             stub_include = self.stub_dir / "stub" / "include"
             if stub_include.exists():
@@ -729,13 +853,15 @@ class CAnalyzer:
         re.M,
     )
 
-    def analyze(self, source: Path, include_static_functions: bool = False, include_main: bool = False) -> list[FunctionInfo]:
+    def analyze(self, source: Path | str, include_static_functions: bool = False, include_main: bool = False) -> list[FunctionInfo]:
+        source = source if isinstance(source, Path) else Path(str(source))
         text = source.read_text(encoding="utf-8", errors="replace")
         file_global_types = _tm_global_variable_type_map(text)
+        file_global_symbols = set(file_global_types)
         enum_types = self._enum_types(text)
         line_starts = self._line_offsets(text)
         functions: list[FunctionInfo] = []
-        seen: set[tuple[str, int]] = set()
+        seen_bodies: set[tuple[str, int, str]] = set()
         for match in self.function_header.finditer(text):
             name = match.group("name")
             return_type = " ".join(match.group("rtype").split())
@@ -756,8 +882,11 @@ class CAnalyzer:
             if body_end == -1:
                 continue
             body = text[body_start + 1 : body_end]
-            start_line = self._line_for_offset(line_starts, match.start())
+            start_line = self._line_for_offset(line_starts, match.start("name"))
             end_line = self._line_for_offset(line_starts, body_end)
+            body_key = (name, end_line, body.strip())
+            if body_key in seen_bodies:
+                continue
             fn = FunctionInfo(
                 name=name,
                 return_type=return_type,
@@ -768,18 +897,18 @@ class CAnalyzer:
             )
             fn.conditions = self._conditions(body, start_line)
             fn.global_variable_types = dict(file_global_types)
-            fn.global_symbols = set(file_global_types)
+            fn.global_symbols = set(file_global_symbols)
             attach_fixit_hints(fn, source="c_backend")
             functions.append(fn)
-            seen.add((name, start_line))
+            seen_bodies.add(body_key)
         for item in self._scan_brace_function_definitions(text, line_starts):
             name, return_type, params, body, start_line, end_line = item
             if name == "main" and not include_main:
                 continue
             if return_type.strip().startswith("static") and not include_static_functions:
                 continue
-            key = (name, start_line)
-            if key in seen or name in C_KEYWORDS or name in {"FUNC", "P2VAR", "P2CONST", "CONSTP2VAR", "P2FUNC"} or name.startswith("__") or name.startswith("_"):
+            body_key = (name, end_line, body.strip())
+            if body_key in seen_bodies or name in C_KEYWORDS or name in {"FUNC", "P2VAR", "P2CONST", "CONSTP2VAR", "P2FUNC"} or name.startswith("__") or name.startswith("_"):
                 continue
             fn = FunctionInfo(
                 name=name,
@@ -791,10 +920,10 @@ class CAnalyzer:
             )
             fn.conditions = self._conditions(body, start_line)
             fn.global_variable_types = dict(file_global_types)
-            fn.global_symbols = set(file_global_types)
+            fn.global_symbols = set(file_global_symbols)
             attach_fixit_hints(fn, source="c_backend")
             functions.append(fn)
-            seen.add(key)
+            seen_bodies.add(body_key)
         functions.sort(key=lambda fn: (fn.start_line, fn.name))
         return functions
 

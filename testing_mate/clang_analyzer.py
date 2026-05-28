@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from testing_mate.analysis import AstCache
-from testing_mate.c_backend import CAnalyzer, attach_fixit_hints, discover_include_dirs_for_source
+from testing_mate.c_backend import CAnalyzer, attach_fixit_hints
 from testing_mate.constants import C_KEYWORDS
 from testing_mate.mcdc_engine import MCDCAnalyzer
 from testing_mate.models import Condition, FunctionInfo, Parameter
@@ -102,6 +102,18 @@ class ClangEnhancedAnalyzer:
             fn.end_line = source_fn.end_line
             fn.body = source_fn.body
             if source_fn.conditions:
+                analysis_conditions = list(fn.conditions)
+                for index, source_condition in enumerate(source_fn.conditions):
+                    if index >= len(analysis_conditions):
+                        continue
+                    analysis_condition = analysis_conditions[index]
+                    if analysis_condition.text != source_condition.text:
+                        source_condition.analysis_text = analysis_condition.text
+                    source_condition.analysis_decisions = [
+                        item for item in analysis_condition.decisions
+                        if item and item not in source_condition.decisions
+                    ]
+                    source_condition.analysis_line = analysis_condition.line
                 fn.conditions = source_fn.conditions
 
     def _source_function_index(self, source_text: str) -> dict[str, FunctionInfo]:
@@ -182,7 +194,7 @@ class ClangEnhancedAnalyzer:
             result.append(clean)
         return result
     def _effective_include_dirs(self, source: Path) -> list[str]:
-        return self._unique_strings([*self.include_dirs, *discover_include_dirs_for_source(source)])
+        return self._unique_strings([*self.include_dirs])
     def _attach_function_metadata(self, fn: FunctionInfo, node: dict, body_node: dict, text: str) -> None:
         """Preserve AST context and FixItHint-style analysis hints for vector generation."""
         try:
@@ -464,6 +476,6 @@ class ClangEnhancedAnalyzer:
     @staticmethod
     def _path_key(path: Path) -> str:
         try:
-            return str(path.resolve()).replace("\\", "/").lower()
+            return str(Path(path).resolve()).replace("\\", "/").lower()
         except OSError:
             return str(path).replace("\\", "/").lower()

@@ -82,3 +82,5 @@ SCALAR_TOKENS = {
 "int8_t", "int16_t", "int32_t", "int64_t",
 "size_t", "ssize_t", "Std_ReturnType", "boolean",
 }
+
+RERUN_CMD = 0

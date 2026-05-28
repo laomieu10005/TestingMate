@@ -7,7 +7,7 @@ import json
 import re
 import shutil
 
-from testing_mate.constants import C_KEYWORDS, C_SOURCE_EXTENSIONS, HEADER_SOURCE_EXTENSIONS
+from testing_mate.constants import C_KEYWORDS, C_SOURCE_EXTENSIONS, HEADER_SOURCE_EXTENSIONS, EXCLUDED_SOURCE_DIRS
 from testing_mate.code_database import CodeDatabase
 from testing_mate.models import FunctionInfo, TestCase
 
@@ -112,6 +112,19 @@ class StubHarnessEngine:
         "fabsf",
         "min",
         "max",
+        # Log/parser placeholders must never become generated mock symbols.
+        "Unexpected",
+        "Uninteresting",
+        "Function",
+        "FunctionCall",
+        "Mock",
+        "GMOCK",
+        "WARNING",
+        "NOTE",
+        "Expected",
+        "Actual",
+        "returning",
+        "directly",
     }
 
     def discover(
@@ -123,40 +136,62 @@ class StubHarnessEngine:
         include_dirs: list[Path | str] | None = None,
         code_database: CodeDatabase | None = None,
     ) -> list[StubSymbol]:
-        unit_sources = unit_sources or [source]
+        source = source if isinstance(source, Path) else Path(str(source))
+        unit_sources = [item if isinstance(item, Path) else Path(str(item)) for item in (unit_sources or [source]) if item]
         include_dirs = [Path(item).expanduser() for item in (include_dirs or []) if item]
 
-        defined = self._defined_function_names(
-            [*unit_sources, *self._analysis_sources_from_database(code_database)]
-        ) | {fn.name for fn in functions}
-        if code_database is not None:
-            defined.update(record.name for record in code_database.functions)
+        # Workspace mode compiles only the selected UUT source copied under src/.
+        # Other project C/C++ files are intentionally not linked; calls into them
+        # must therefore be represented by generated mocks/stubs.  The old logic
+        # treated every function seen in unit_sources/code_database as "defined"
+        # and skipped mock generation, which caused undefined references after the
+        # workspace-model change.  Only functions physically defined in the target
+        # source are link-defined for this backend.
+        target_defined = self._defined_function_names([source])
+        defined = set(target_defined)
+        if not defined:
+            defined.update(fn.name for fn in functions)
 
         analysis_sources = self._analysis_sources_from_database(code_database)
         primary_source_include = self._primary_source_include(source, unit_sources, include_dirs)
 
         prototypes = self._prototype_map(source, unit_sources, include_dirs, analysis_sources)
         dependency_prototypes = self._dependency_prototype_map(source, unit_sources, include_dirs)
+        definition_prototypes = self._definition_prototype_map(source, unit_sources, include_dirs, analysis_sources)
+        call_arg_counts = self._call_arg_count_map(functions, [source, *unit_sources, *analysis_sources])
+        output_arg_indexes = {
+            name: indexes
+            for name, indexes in self._case_stub_output_indexes(cases).items()
+            if not self._should_ignore_call(name)
+        }
         global_declarations = self._global_declaration_map(source, unit_sources, include_dirs, analysis_sources)
         dependency_globals = self._dependency_global_declaration_map(source, unit_sources, include_dirs)
-        defined_globals = self._defined_global_names(unit_sources)
+        defined_globals = self._defined_global_names([source])
         calls = self._referenced_calls(functions)
+        calls.update(self._referenced_calls_from_sources([source]))
+        calls.update(self._code_database_calls_for_target(code_database, target_defined or {fn.name for fn in functions}))
         calls.update(self._case_harness_calls(cases))
         controlled_returns = self._case_stub_return_calls(cases) | self._function_fixit_stub_return_calls(functions)
+        controlled_returns.difference_update(defined)
         calls.update(controlled_returns)
 
         symbols: list[StubSymbol] = []
         for name in sorted(calls):
-            if (name in defined and name not in controlled_returns) or self._should_ignore_call(name):
+            if name in defined or self._should_ignore_call(name):
                 continue
 
-            proto = prototypes.get(name) or dependency_prototypes.get(name)
+            proto = prototypes.get(name) or dependency_prototypes.get(name) or definition_prototypes.get(name)
             if proto is not None:
                 rtype = proto.return_type
                 params = proto.params
                 from_prototype = True
-                declaration_source = "header" if self._is_header_path(proto.header_path) else "preprocessed source"
-                reason = f"external call declared in {declaration_source} {Path(proto.header_path).name}"
+                if self._is_header_path(proto.header_path):
+                    declaration_source = "header"
+                elif proto.header_path:
+                    declaration_source = "definition source"
+                else:
+                    declaration_source = "preprocessed source"
+                reason = f"external call declared in {declaration_source} {Path(proto.header_path).name if proto.header_path else source.name}"
                 prototype_text = proto.declaration
                 header_path = proto.header_path
                 header_include = proto.header_include or primary_source_include
@@ -164,10 +199,15 @@ class StubHarnessEngine:
                 emit_declaration = not self._is_header_path(proto.header_path)
             else:
                 rtype = "uint8"
-                params = "..."
+                arg_count = call_arg_counts.get(name, 0)
+                output_indexes = output_arg_indexes.get(name, set())
+                params = self._generic_fallback_params(arg_count, output_indexes)
                 from_prototype = False
-                reason = "external call without visible header declaration; uint8 fallback stub generated"
-                prototype_text = f"uint8 {name}(...);"
+                reason = (
+                    "external call without visible declaration or definition; "
+                    f"generated uint8 fallback stub with {arg_count} generic parameter(s)"
+                )
+                prototype_text = f"uint8 {name}({params});"
                 header_path = ""
                 header_include = ""
                 symbol_source = str(source)
@@ -220,17 +260,19 @@ class StubHarnessEngine:
     def write_for_backend(
         self,
         backend: str,
-        out_dir: Path,
-        source: Path,
+        out_dir: Path | str,
+        source: Path | str,
         functions: list[FunctionInfo],
         cases: list[TestCase],
-        unit_sources: list[Path] | None = None,
+        unit_sources: list[Path | str] | None = None,
         include_dirs: list[Path | str] | None = None,
         code_database: CodeDatabase | None = None,
     ) -> StubHarnessResult:
+        out_dir = out_dir if isinstance(out_dir, Path) else Path(str(out_dir))
+        source = source if isinstance(source, Path) else Path(str(source))
         out_dir.mkdir(parents=True, exist_ok=True)
-        include_dirs_expanded = [Path(item).expanduser() for item in (include_dirs or []) if item]
-        unit_sources_expanded = unit_sources or [source]
+        include_dirs_expanded = [Path(str(item)).expanduser() for item in (include_dirs or []) if item]
+        unit_sources_expanded = [Path(str(item)).expanduser() for item in (unit_sources or [source]) if item]
         symbols = self.discover(
             source,
             functions,
@@ -299,6 +341,55 @@ class StubHarnessEngine:
                 calls.add(match.group(1))
         return calls
 
+    def _referenced_calls_from_sources(self, sources: list[Path]) -> set[str]:
+        """Scan the actual compiled UUT source for dependency calls.
+
+        FunctionInfo can be scoped to only public functions or can be stale after
+        GUI filtering.  Scanning the target source guarantees that calls made by
+        static helpers in the same file still drive mock generation for external
+        dependencies.
+        """
+        calls: set[str] = set()
+        for source in sources:
+            if source.suffix.lower() not in C_SOURCE_EXTENSIONS and source.suffix.lower() not in HEADER_SOURCE_EXTENSIONS:
+                continue
+            try:
+                text = source.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            text = re.sub(r"^\s*#.*$", "", self._strip_comments_and_strings(text), flags=re.MULTILINE)
+            for match in self.call_pattern.finditer(text):
+                calls.add(match.group(1))
+        return calls
+
+    @staticmethod
+    def _code_database_calls_for_target(
+        code_database: CodeDatabase | None,
+        target_function_names: set[str],
+    ) -> set[str]:
+        """Return calls recorded for functions belonging to the compiled UUT.
+
+        Do not use CodeDatabase.function names as linked definitions in the
+        workspace model.  The database is useful as a call-index only; dependency
+        functions listed there still need mocks because their .c files are not
+        linked into the generated backend executable.
+        """
+        if code_database is None:
+            return set()
+        calls: set[str] = set()
+        for record in code_database.functions:
+            if target_function_names and record.name not in target_function_names:
+                continue
+            for name in [*(record.calls or []), *(record.external_calls or [])]:
+                if name:
+                    calls.add(name)
+            for requirement in record.mock_requirements or []:
+                if isinstance(requirement, dict):
+                    name = str(requirement.get("name") or requirement.get("symbol") or "").strip()
+                    if name and not self._should_ignore_call(name):
+                        calls.add(name)
+        return calls
+
     @staticmethod
     def _referenced_globals(functions: list[FunctionInfo], code_database: CodeDatabase | None) -> set[str]:
         globals_: set[str] = set()
@@ -326,11 +417,22 @@ class StubHarnessEngine:
     def _case_harness_calls(self, cases: list[TestCase]) -> set[str]:
         calls: set[str] = set()
         for case in cases:
+            values = case.values or {}
             calls.update(self._case_stub_return_calls([case]))
+            for key, value in values.items():
+                if key in {"__expected_calls", "__expect_calls", "expected_calls", "expect_calls"}:
+                    for item in re.split(r"[,;\s]+", str(value or "")):
+                        clean = item.strip()
+                        if clean and not self._should_ignore_call(clean):
+                            calls.add(clean)
+                elif key.startswith("__expected_call_arg.") or key.startswith("__expected_call_output."):
+                    tail = key.split(".", 1)[1]
+                    name = tail.split(".", 1)[0].strip()
+                    if name and not self._should_ignore_call(name):
+                        calls.add(name)
         return calls
 
-    @staticmethod
-    def _function_fixit_stub_return_calls(functions: list[FunctionInfo]) -> set[str]:
+    def _function_fixit_stub_return_calls(self, functions: list[FunctionInfo]) -> set[str]:
         calls: set[str] = set()
         for fn in functions:
             for hint in getattr(fn, "fixit_hints", []) or []:
@@ -340,11 +442,11 @@ class StubHarnessEngine:
                 if kind not in {"stub", "stub_return", "mock_return"}:
                     continue
                 name = str(hint.get("target") or hint.get("name") or hint.get("symbol") or "").strip()
-                if name:
+                if name and not self._should_ignore_call(name):
                     calls.add(name)
         return calls
-    @staticmethod
-    def _case_stub_return_calls(cases: list[TestCase]) -> set[str]:
+
+    def _case_stub_return_calls(self, cases: list[TestCase]) -> set[str]:
         calls: set[str] = set()
         for case in cases:
             for key in case.values:
@@ -353,6 +455,29 @@ class StubHarnessEngine:
                     if name:
                         calls.add(name)
         return calls
+
+    @staticmethod
+    def _case_stub_output_indexes(cases: list[TestCase]) -> dict[str, set[int]]:
+        result: dict[str, set[int]] = {}
+        prefixes = (
+            "__stub_output.",
+            "__mock_output.",
+            "__expected_call_output.",
+            "__output_param.",
+        )
+        for case in cases:
+            for key in case.values:
+                for prefix in prefixes:
+                    if not key.startswith(prefix):
+                        continue
+                    tail = key[len(prefix):]
+                    if "." not in tail:
+                        continue
+                    name, raw_index = tail.rsplit(".", 1)
+                    if name and raw_index.isdigit():
+                        result.setdefault(name, set()).add(int(raw_index))
+                    break
+        return result
 
     def _defined_function_names(self, unit_sources: list[Path]) -> set[str]:
         result: set[str] = set()
@@ -365,6 +490,13 @@ class StubHarnessEngine:
                 continue
             text = self._strip_comments_and_strings(text)
             result.update(match.group(1) for match in self.function_definition_pattern.finditer(text))
+            result.update(
+                match.group(1)
+                for match in re.finditer(
+                    r"(?m)^\s*(?:static\s+)?(?:FUNC|P2FUNC)\s*\([^)]*\)\s+([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{",
+                    text,
+                )
+            )
         return result
 
     def _dependency_prototype_map(
@@ -426,6 +558,224 @@ class StubHarnessEngine:
             seen.add(resolved)
             deduped.append(path)
         return deduped
+
+    def _definition_prototype_map(
+        self,
+        source: Path,
+        unit_sources: list[Path],
+        include_dirs: list[Path],
+        declaration_sources: list[Path] | None = None,
+    ) -> dict[str, HeaderPrototype]:
+        """Recover prototypes from C/C++ function definitions.
+
+        This is the declaration fallback used when a dependency is called by the
+        target source but no header prototype is visible in the isolated backend
+        workspace.  It searches the supplied unit/dependency sources and nearby
+        project source roots, extracts the exact function-definition signature,
+        and emits that signature into ``stub/include/stubs.h``.  The generic
+        ``uint8 name(...)`` fallback is used only when this recovery also fails.
+        """
+        result: dict[str, HeaderPrototype] = {}
+        for path in self._definition_candidate_files(source, unit_sources, include_dirs, declaration_sources or []):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for proto in self._parse_definition_prototypes(text, path, include_dirs, source.parent):
+                if proto.name not in result and not self._should_ignore_call(proto.name):
+                    result[proto.name] = proto
+        return result
+
+    def _definition_candidate_files(
+        self,
+        source: Path,
+        unit_sources: list[Path],
+        include_dirs: list[Path],
+        declaration_sources: list[Path],
+        max_files: int = 1000,
+    ) -> list[Path]:
+        candidates: list[Path] = []
+        candidates.extend([source, *unit_sources, *declaration_sources])
+
+        # Search source roots discovered by the GUI/workspace code.  This covers
+        # the common AUTOSAR layout where BSW/SWC functions are defined in .c
+        # files but not declared in any copied header.
+        for root in include_dirs:
+            if not root.exists() or not root.is_dir():
+                continue
+            for path in self._iter_project_sources(root):
+                candidates.append(path)
+                if len(candidates) >= max_files:
+                    break
+            if len(candidates) >= max_files:
+                break
+
+        deduped: list[Path] = []
+        seen: set[Path] = set()
+        for path in candidates:
+            if len(deduped) >= max_files:
+                break
+            if path.suffix.lower() not in C_SOURCE_EXTENSIONS and path.suffix.lower() not in HEADER_SOURCE_EXTENSIONS:
+                continue
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved in seen or not path.exists() or not path.is_file():
+                continue
+            seen.add(resolved)
+            deduped.append(path)
+        return deduped
+
+    def _iter_project_sources(self, root: Path):
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if any(part.lower() in EXCLUDED_SOURCE_DIRS for part in path.parts):
+                continue
+            if path.suffix.lower() in C_SOURCE_EXTENSIONS:
+                yield path
+
+    def _parse_definition_prototypes(
+        self,
+        text: str,
+        path: Path,
+        include_dirs: list[Path],
+        source_parent: Path,
+    ) -> list[HeaderPrototype]:
+        sanitized = self._strip_comments_and_strings(text)
+        sanitized = re.sub(r"^\s*#.*$", "", sanitized, flags=re.MULTILINE)
+
+        prototypes: list[HeaderPrototype] = []
+        for signature in self._iter_top_level_definition_signatures(sanitized):
+            proto = self._parse_definition_signature(signature)
+            if proto is None:
+                continue
+            proto.header_path = str(path)
+            if self._is_header_path(path):
+                proto.header_include = self._header_include_name(path, include_dirs, source_parent)
+            else:
+                proto.header_include = self._definition_source_include_name(path, include_dirs, source_parent)
+            prototypes.append(proto)
+        return prototypes
+
+    @staticmethod
+    def _iter_top_level_definition_signatures(text: str) -> list[str]:
+        signatures: list[str] = []
+        last_boundary = 0
+        index = 0
+        paren = 0
+        bracket = 0
+        brace = 0
+        while index < len(text):
+            ch = text[index]
+            if ch == "(" and brace == 0:
+                paren += 1
+            elif ch == ")" and brace == 0:
+                paren = max(0, paren - 1)
+            elif ch == "[" and brace == 0:
+                bracket += 1
+            elif ch == "]" and brace == 0:
+                bracket = max(0, bracket - 1)
+            elif ch == ";" and brace == 0 and paren == 0 and bracket == 0:
+                last_boundary = index + 1
+            elif ch == "{" and brace == 0 and paren == 0 and bracket == 0:
+                candidate = text[last_boundary:index].strip()
+                if candidate and "(" in candidate:
+                    signatures.append(candidate)
+                close_index = StubHarnessEngine._matching_brace(text, index)
+                if close_index is None:
+                    break
+                last_boundary = close_index + 1
+                index = close_index
+            index += 1
+        return signatures
+
+    def _parse_definition_signature(self, signature: str) -> HeaderPrototype | None:
+        stmt = " ".join((signature or "").split()).strip()
+        if not stmt or "(" not in stmt:
+            return None
+        if re.search(r"\b(?:if|for|while|switch|return|typedef)\b", stmt):
+            return None
+        if "=" in stmt:
+            return None
+        stmt = re.sub(r"\b__attribute__\s*\(\(.*?\)\)", "", stmt).strip()
+        proto = self._parse_prototype_statement(stmt + ";")
+        if proto is None:
+            return None
+        proto.declaration = " ".join((proto.declaration or "").split())
+        return proto
+
+    @staticmethod
+    def _matching_brace(text: str, open_index: int) -> int | None:
+        depth = 0
+        for index in range(open_index, len(text)):
+            ch = text[index]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return index
+        return None
+
+    def _definition_source_include_name(self, path: Path, include_dirs: list[Path], source_parent: Path) -> str:
+        # Prefer the dependency's own public header so typedefs/macros used by
+        # the recovered signature are visible when stubs.h emits the prototype.
+        for include_name in self._extract_includes(path):
+            resolved = self._resolve_include(include_name, path, include_dirs, [path.parent, source_parent])
+            if resolved is not None and self._is_header_path(resolved):
+                return include_name.replace("\\", "/")
+        sibling = path.with_suffix(".h")
+        if sibling.exists() and sibling.is_file():
+            return self._header_include_name(sibling, include_dirs, source_parent)
+        return ""
+
+    def _call_arg_count_map(self, functions: list[FunctionInfo], sources: list[Path]) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for fn in functions:
+            self._merge_call_arg_counts(result, self._strip_comments_and_strings(fn.body or ""))
+        for source in sources:
+            if source.suffix.lower() not in C_SOURCE_EXTENSIONS and source.suffix.lower() not in HEADER_SOURCE_EXTENSIONS:
+                continue
+            try:
+                text = source.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            text = re.sub(r"^\s*#.*$", "", self._strip_comments_and_strings(text), flags=re.MULTILINE)
+            self._merge_call_arg_counts(result, text)
+        return result
+
+    def _merge_call_arg_counts(self, result: dict[str, int], text: str) -> None:
+        for match in self.call_pattern.finditer(text):
+            name = match.group(1)
+            if self._should_ignore_call(name):
+                continue
+            open_index = text.find("(", match.start())
+            if open_index < 0:
+                continue
+            close_index = self._matching_paren(text, open_index)
+            if close_index is None:
+                continue
+            args_text = text[open_index + 1:close_index].strip()
+            arg_count = 0 if not args_text or args_text == "void" else len(self._split_params(args_text))
+            if arg_count > result.get(name, 0):
+                result[name] = arg_count
+
+    @staticmethod
+    def _generic_fallback_params(arg_count: int, output_indexes: set[int] | None = None) -> str:
+        if arg_count <= 0:
+            return "void"
+        output_indexes = output_indexes or set()
+        params: list[str] = []
+        for index in range(arg_count):
+            ctype = "void *" if index in output_indexes else "uintptr_t"
+            params.append(f"{ctype} p{index}")
+        return ", ".join(params)
+
+    @staticmethod
+    def _generic_fallback_prototype(name: str, arg_count: int = 0) -> str:
+        return f"uint8 {name}({StubHarnessEngine._generic_fallback_params(arg_count)});"
 
     def _defined_global_names(self, unit_sources: list[Path]) -> set[str]:
         result: set[str] = set()
@@ -1066,14 +1416,11 @@ class StubHarnessEngine:
             lines.append(f"unsigned {symbol.call_count_name}(void);")
             if backend not in {"CppUTest", "GoogleTest"} and symbol.return_control_name:
                 lines.append(f"void {symbol.return_control_name}(long long value);")
-            if symbol.emit_declaration and symbol.from_prototype and symbol.prototype:
+            if symbol.emit_declaration and symbol.prototype:
                 lines.append(symbol.prototype)
             elif symbol.emit_declaration:
-                lines.append("#ifdef __cplusplus")
-                lines.append(f"uint8 {symbol.name}(...);")
-                lines.append("#else")
-                lines.append(f"uint8 {symbol.name}();")
-                lines.append("#endif")
+                arg_count = 0
+                lines.append(self._generic_fallback_prototype(symbol.name, arg_count))
         lines.extend(
             [
                 "",
@@ -1115,11 +1462,34 @@ class StubHarnessEngine:
         payload = {
             "version": "1.1",
             "backend": backend,
-            "source": str(source),
+            "source": self._local_manifest_path(source, source),
             "stub_count": len(symbols),
-            "symbols": [asdict(symbol) for symbol in symbols],
+            "symbols": [self._manifest_symbol(symbol, source) for symbol in symbols],
         }
         return json.dumps(payload, indent=2)
+
+    @classmethod
+    def _manifest_symbol(cls, symbol: StubSymbol, source: Path) -> dict:
+        item = asdict(symbol)
+        item["source"] = cls._local_manifest_path(item.get("source", ""), source, symbol.header_include)
+        item["header_path"] = cls._local_manifest_path(item.get("header_path", ""), source, symbol.header_include)
+        return item
+
+    @staticmethod
+    def _local_manifest_path(path: str | Path, source: Path, header_include: str = "") -> str:
+        raw = str(path or "").strip()
+        if not raw:
+            return ""
+        candidate = Path(raw)
+        suffix = candidate.suffix.lower()
+        if suffix in C_SOURCE_EXTENSIONS:
+            return f"src/{candidate.name}".replace("\\", "/")
+        if suffix in HEADER_SOURCE_EXTENSIONS:
+            include_name = header_include or candidate.name
+            return f"stub/include/{include_name}".replace("\\", "/")
+        if candidate.name == source.name:
+            return f"src/{source.name}".replace("\\", "/")
+        return raw.replace("\\", "/")
 
     def _stub_readme(self, backend: str, source: Path, symbols: list[StubSymbol]) -> str:
         lines = [
@@ -1132,7 +1502,7 @@ class StubHarnessEngine:
             "The generated stubs are weak build-unblockers. Replace them with reviewed mocks/fakes before claiming test evidence.",
             "When a header declaration is available, the stub implementation uses that exact signature shape instead of guessing.",
             "When a preprocessed analysis source is available, Testing Mate also mines it for external function and variable declarations.",
-            "When no declaration is found, Testing Mate emits a generated `uint8 name(...)` fallback declaration and a buildable C stub.",
+            "When no header declaration is found, Testing Mate searches dependency source files for the real function definition and emits that recovered prototype. Only if no declaration or definition is available does it emit a generic `uint8 name(uintptr_t p0, ...)` build-unblocker.",
             "The main coverage report remains target-only; these stub files are not intended to contribute to unit coverage.",
             "",
             "## Symbols",
@@ -1401,7 +1771,7 @@ class StubHarnessEngine:
             return f"{call_name}.returnPointerValueOrDefault(nullptr)"
         if lowered in {"float", "double"}:
             return f"{call_name}.returnDoubleValueOrDefault(0.0)"
-        if "unsigned" in lowered or re.fullmatch(r"u(?:int)?(?:8|16|32|64)(?:_t)?", lowered):
+        if "uintptr_t" in lowered or "unsigned" in lowered or re.fullmatch(r"u(?:int)?(?:8|16|32|64)(?:_t)?", lowered):
             return f"{call_name}.returnUnsignedIntValueOrDefault(0U)"
         if "long" in lowered or re.fullmatch(r"int(?:32|64)(?:_t)?", lowered):
             return f"{call_name}.returnLongIntValueOrDefault(0L)"
@@ -1446,7 +1816,7 @@ class StubHarnessEngine:
             return f'.withPointerParameter("{name}", (void *){name})'
         if lowered in {"float", "double"}:
             return f'.withDoubleParameter("{name}", (double){name})'
-        if "unsigned" in lowered or re.fullmatch(r"u(?:int)?(?:8|16|32|64)(?:_t)?", lowered):
+        if "uintptr_t" in lowered or "unsigned" in lowered or re.fullmatch(r"u(?:int)?(?:8|16|32|64)(?:_t)?", lowered):
             return f'.withUnsignedIntParameter("{name}", (unsigned int){name})'
         if "long" in lowered or re.fullmatch(r"int(?:32|64)(?:_t)?", lowered):
             return f'.withLongIntParameter("{name}", (long int){name})'

@@ -7,8 +7,9 @@ from datetime import datetime
 from testing_mate.models import CoverageFeedback, CoverageGap, Condition, FunctionInfo, Parameter, RunResult, TestCase
 from testing_mate.code_database import CodeDatabase
 from testing_mate.c1_engine import C1CoverageEngine
-from testing_mate.constants import DEFAULT_ENHANCEMENT_STAGES
+from testing_mate.constants import DEFAULT_ENHANCEMENT_STAGES, RERUN_CMD
 from testing_mate.generator import TestVectorGenerator, TestBackendGenerator
+from testing_mate.vector_generator import TestCaseRegistry
 from testing_mate.coverage_gap import CoverageGapPlanner
 from dataclasses import asdict
 from testing_mate.llm import OllamaTestRefiner
@@ -41,6 +42,9 @@ class ArtifactWriter:
         enhancement_stages: list[str] | None = None,
         code_database: CodeDatabase | None = None,
     ) -> list[Path]:
+        source = source if isinstance(source, Path) else Path(str(source))
+        unit_sources = [item if isinstance(item, Path) else Path(str(item)) for item in (unit_sources or []) if item]
+        TestCaseRegistry.ensure_unique_test_ids(cases)
         active_feedback = feedback or CoverageFeedback(source="none", raw_text="")
         if any(case.coverage in {"C0/C1", "C1", "MC/DC"} for case in cases) and active_feedback.metrics.get("C1") is None:
             active_feedback = C1CoverageEngine.merge(active_feedback, C1CoverageEngine().analyze(functions, cases))
@@ -58,7 +62,7 @@ class ArtifactWriter:
             )
         paths = [
             self._write_code_database(source, code_database),
-            self._write_json(source, functions, cases, code_database),
+            self._write_json(source, functions, cases, code_database, active_feedback),
             self._write_enhancement_request(
                 source,
                 functions,
@@ -155,7 +159,14 @@ class ArtifactWriter:
                     writer.writerow({**common, "parameter": "", "value": ""})
         return path
 
-    def _write_json(self, source: Path, functions: list[FunctionInfo], cases: list[TestCase], code_database: CodeDatabase | None = None) -> Path:
+    def _write_json(
+        self,
+        source: Path,
+        functions: list[FunctionInfo],
+        cases: list[TestCase],
+        code_database: CodeDatabase | None = None,
+        feedback: CoverageFeedback | None = None,
+    ) -> Path:
         path = self.out_dir / f"{source.stem}_analysis.json"
         records = {record.name: asdict(record) for record in code_database.functions} if code_database else {}
         payload = {
@@ -173,6 +184,7 @@ class ArtifactWriter:
                 for fn in functions
             ],
             "test_cases": [asdict(case) for case in cases],
+            "execution_layers": list(getattr(feedback, "execution_layers", []) or []),
         }
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return path
@@ -631,6 +643,7 @@ class ArtifactWriter:
         status_class = html.escape(run_status_class)
         function_rows_html = "".join(function_rows) or "<tr><td colspan=\"5\" class=\"subtle\">No functions were analyzed.</td></tr>"
         function_sections_html = "".join(function_sections) or "<p class=\"subtle\">No function detail available.</p>"
+        layer_rows_html = self._execution_layer_rows(feedback)
 
         content = """<!doctype html>
 <html lang="en">
@@ -1046,6 +1059,16 @@ class ArtifactWriter:
     </section>
 
     <section>
+      <h2>Escalation Layer Evidence</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Layer</th><th>Function</th><th>Candidates</th><th>Backend</th><th>Status</th><th>Reconciled</th><th>Coverage After</th><th>Artifact</th></tr></thead>
+          <tbody>@@LAYER_ROWS@@</tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
       <h2>Coverage Feedback</h2>
       <h3>Uncovered / Gaps</h3>
       <ul>@@UNCOVERED@@</ul>
@@ -1105,6 +1128,7 @@ class ArtifactWriter:
             .replace("@@LCOV_TRACE_HTML@@", lcov_trace_html)
             .replace("@@OBLIGATION_ROWS@@", coverage_obligation_rows)
             .replace("@@FUNCTION_SECTIONS@@", function_sections_html)
+            .replace("@@LAYER_ROWS@@", layer_rows_html)
             .replace("@@UNCOVERED@@", uncovered)
             .replace("@@FAILURES@@", failures)
             .replace("@@STDOUT@@", stdout)
@@ -1112,6 +1136,44 @@ class ArtifactWriter:
         )
         path.write_text(content, encoding="utf-8")
         return path
+
+    def _execution_layer_rows(self, feedback: CoverageFeedback | None) -> str:
+        records = list(getattr(feedback, "execution_layers", []) or []) if feedback else []
+        if not records:
+            return '<tr><td colspan="8" class="subtle">No escalation backend layer run was recorded.</td></tr>'
+        rows: list[str] = []
+        for record in records:
+            after = record.get("coverage_after", {}) or {}
+            metrics = ", ".join(
+                f"{html.escape(str(key))}={float(value):.2f}%"
+                for key, value in after.items()
+                if value is not None
+            ) or html.escape(str(record.get("coverage_summary") or "n/a"))
+            artifact = html.escape(str(record.get("out_dir") or ""))
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(record.get('layer', '')))}</td>"
+                f"<td>{html.escape(str(record.get('function', '')))}</td>"
+                f"<td>{html.escape(str(record.get('candidate_count', 0)))}</td>"
+                f"<td>{html.escape(str(record.get('backend', '')))}</td>"
+                f'<td><span class="pill {self._status_class(str(record.get("run_status", "")))}">{html.escape(str(record.get("run_status", "")))}</span></td>'
+                f"<td>{html.escape(str(record.get('reconcile_updates', 0)))}</td>"
+                f"<td>{metrics}</td>"
+                f"<td><code>{artifact}</code></td>"
+                "</tr>"
+            )
+        return "".join(rows)
+
+    @staticmethod
+    def _status_class(status: str) -> str:
+        status = status.strip().upper()
+        if status == "PASS":
+            return "good"
+        if status in {"FAIL", "ERROR"}:
+            return "bad"
+        if status in {"SKIPPED", "NOT_RUN", "NO_CANDIDATES"}:
+            return "warn"
+        return "na"
 
     @staticmethod
     def _executed_test_count(run_result: RunResult | None) -> int | None:
@@ -1539,7 +1601,7 @@ class ArtifactWriter:
         if backend == "CppUTest":
             return [
                 f"{source.stem}_cpputest_cases.csv",
-                f"{source.stem}_cpputest/src/ (copied source/header environment)",
+                f"{source.stem}_cpputest/src/ + stub/include/ (local workspace)",
                 f"{source.stem}_cpputest/{source.stem}_cpputest_test.cpp",
                 f"{source.stem}_cpputest/run_cpputest.sh",
                 f"{source.stem}_cpputest/coverage.json (after clang/llvm-cov run)",
@@ -1549,7 +1611,7 @@ class ArtifactWriter:
         if backend == "GoogleTest":
             return [
                 f"{source.stem}_googletest_cases.csv",
-                f"{source.stem}_gtest/src/ (copied source/header environment)",
+                f"{source.stem}_gtest/src/ + stub/include/ (local workspace)",
                 f"{source.stem}_gtest/{source.stem}_gtest_test.cpp",
                 f"{source.stem}_gtest/run_gtest.sh",
                 f"{source.stem}_gtest/coverage.json (after clang/llvm-cov run)",

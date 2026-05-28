@@ -53,15 +53,37 @@ class CoverageGapPlanner:
         return None
 
     @staticmethod
+    def _condition_texts(condition: Condition) -> list[str]:
+        values = [
+            condition.text,
+            getattr(condition, "analysis_text", "") or "",
+            *(getattr(condition, "decisions", []) or []),
+            *(getattr(condition, "analysis_decisions", []) or []),
+        ]
+        result: list[str] = []
+        for value in values:
+            clean = str(value or "").strip()
+            if clean and clean not in result:
+                result.append(clean)
+        return result
+
+    @staticmethod
     def _condition_for_gap(fn: FunctionInfo, text: str, line: int | None) -> str:
         if line is not None:
             same_line = [condition for condition in fn.conditions if condition.line == line]
             if same_line:
                 return same_line[0].text
+            same_analysis_line = [
+                condition for condition in fn.conditions
+                if getattr(condition, "analysis_line", None) == line
+            ]
+            if same_analysis_line:
+                return same_analysis_line[0].text
+            previous = [condition for condition in fn.conditions if condition.line < line]
+            if previous:
+                return max(previous, key=lambda condition: condition.line).text
         for condition in fn.conditions:
-            if condition.text and condition.text in text:
-                return condition.text
-            for decision in condition.decisions:
+            for decision in CoverageGapPlanner._condition_texts(condition):
                 if decision and decision in text:
                     return condition.text
         return ""

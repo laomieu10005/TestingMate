@@ -248,6 +248,116 @@ Primary analysis uses Clang. If Clang is unavailable or parsing fails, Testing M
 
 Generated testcases are useful engineering evidence, but executed backend coverage is stronger evidence. Review expected values and safety-critical oracles before using generated cases for sign-off.
 
+
+
+## The 4-Layer Fallback Architecture
+
+  +------------------------------------------------------------+
+  |  [Layer 1]  Clang Static Analyzer            Cost: ZERO    |
+  |     Path-sensitive analysis on AST (built into LLVM 21)    |
+  |     Prune infeasible paths, detect dead branches           |
+  +---------------------------+--------------------------------+
+                              | coverage < target?
+                              v YES
+  +------------------------------------------------------------+
+  |  [Layer 2]  Z3 SMT Solver                    Cost: LOW     |
+  |     Solve condition constraints from CFG edges             |
+  |     Generate MC/DC independence pairs                      |
+  +---------------------------+--------------------------------+
+                              | coverage < target?
+                              v YES
+  +------------------------------------------------------------+
+  |  [Layer 3]  angr Basic Symbolic Execution     Cost: MEDIUM |
+  |     Full symbolic execution on compiled binary             |
+  |     Automatic CFG recovery + SimulationManager             |
+  +---------------------------+--------------------------------+
+                              | coverage < target?
+                              v YES
+  +------------------------------------------------------------+
+  |  [Layer 4]  angr Deep Concolic                Cost: HIGH   |
+  |     Veritesting + DFS + LoopSeer + full symbolic memory    |
+  |     Instruction-level concolic, bounded loop unrolling     |
+  +---------------------------+--------------------------------+
+                              | coverage < target?
+                              v YES
+  +------------------------------------------------------------+
+  |  [OUTPUT]  Coverage gap report + manual review needed      |
+  +------------------------------------------------------------+
+
+### Layer Comparison
+
+| Layer | Tool | Install | Analysis Level | Speed | Test Gen | Py 3.12 Win |
+|:-----:|------|---------|----------------|:-----:|:--------:|:-----------:|
+| 1 | Clang Analyzer | Built-in LLVM 21 | Source AST | ++++  | Indirect | YES |
+| 2 | Z3 | `pacman` + `pip` | Constraints | +++   | Direct | YES |
+| 3 | angr Basic | `pip install angr` | Binary (BFS) | ++    | Direct | YES |
+| 4 | angr Deep | same as Layer 3 | Binary (DFS+Veritesting) | +     | Direct | YES |
+
+### State Machine Diagram
+
+                         +-------------------+
+                         |    ENTRY           |
+                         | classify_function()|
+                         +--------+----------+
+                                  |
+                                  v
+                     +-----------+-----------+
+                     |   LAYER_1_RUNNING     |
+                     | Clang Static Analyzer |
+                     +-----------+-----------+
+                                 |
+                                 v
+                     +-----------+-----------+
+                     |   GATE_1_CHECK        |
+                     | C0 >= 90%?            |
+                     | C1 >= 85%?            |
+                     | MCDC >= 80%?          |
+                     +-+-------+---------+---+
+                       |YES    |NO       |NO (max_layer reached)
+                       v       v         v
+                    DONE   LAYER_2    REPORT_GAP
+                           RUNNING
+                     +-----------+-----------+
+                     | Z3 SMT Solver         |
+                     +-----------+-----------+
+                                 |
+                                 v
+                     +-----------+-----------+
+                     |   GATE_2_CHECK        |
+                     | same metrics          |
+                     | + stale_gain < 1%?    |
+                     +-+-------+---------+---+
+                       |YES    |NO       |STALE
+                       v       v         v
+                    DONE   LAYER_3    REPORT_GAP
+                           RUNNING
+                     +-----------+-----------+
+                     | angr Basic SymEx      |
+                     +-----------+-----------+
+                                 |
+                                 v
+                     +-----------+-----------+
+                     |   GATE_3_CHECK        |
+                     | same metrics          |
+                     | + stale_gain < 1%?    |
+                     +-+-------+---------+---+
+                       |YES    |NO       |STALE
+                       v       v         v
+                    DONE   LAYER_4    REPORT_GAP
+                           RUNNING
+                     +-----------+-----------+
+                     | angr Deep Concolic    |
+                     | Veritesting+DFS+Loop  |
+                     +-----------+-----------+
+                                 |
+                                 v
+                     +-----------+-----------+
+                     |   GATE_4_CHECK        |
+                     +-+-------------------+-+
+                       |YES                |NO
+                       v                   v
+                    DONE              REPORT_GAP
+
 ## Test Levels
 
 ### UT

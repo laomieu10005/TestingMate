@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 from pathlib import Path
@@ -7,7 +7,7 @@ from testing_mate.boolean_expression import BooleanExpressionEvaluator
 from testing_mate.code_database import CodeDatabase, CodeFunctionRecord
 from testing_mate.constants import C_KEYWORDS
 from testing_mate.generation_workflow import ClassificationResult, Complexity, TestGenerationWorkflow, VerificationObjective, classify
-from testing_mate.models import Condition, CoverageGap, FunctionInfo, Parameter, TestCase
+from testing_mate.models import Condition, CoverageFeedback, CoverageGap, ExecutionContext, FunctionInfo, Parameter, TestCase
 from testing_mate.boolean_expression import ConditionEvaluator
 
 # Maximum vectors to generate per function to prevent explosion
@@ -17,22 +17,177 @@ SIMPLE_PARAMETER_LIMIT = 3
 MODERATE_CONDITION_LIMIT = 10
 
 
+class TestCaseRegistry:
+    """Tracks emitted testcase identities and input vectors across generation layers."""
+
+    def __init__(self, cases: list[TestCase] | None = None):
+        self.test_ids: set[str] = set()
+        self.test_names: set[str] = set()
+        self.signatures: set[str] = set()
+        for case in cases or []:
+            self.remember(case)
+
+    @staticmethod
+    def safe_test_name(test_id: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_]+", "_", str(test_id or "")).strip("_")
+        if not safe:
+            safe = "TC"
+        if safe[0].isdigit():
+            safe = f"TC_{safe}"
+        return safe
+
+    @staticmethod
+    def case_signature(case: TestCase) -> str:
+        return TestVectorGenerator._vector_signature(case.function, case.values or {})
+
+    def signature_for(self, function: str, values: dict[str, object]) -> str:
+        return TestVectorGenerator._vector_signature(function, values or {})
+
+    def has_signature(self, function: str, values: dict[str, object]) -> bool:
+        return self.signature_for(function, values or {}) in self.signatures
+
+    def remember(self, case: TestCase) -> None:
+        test_id = str(getattr(case, "test_id", "") or "")
+        if test_id:
+            self.test_ids.add(test_id)
+            self.test_names.add(self.safe_test_name(test_id))
+        self.signatures.add(self.case_signature(case))
+
+    def unique_test_id(self, preferred: str) -> str:
+        base = self.safe_test_name(preferred)
+        candidate = base
+        suffix = 2
+        while candidate in self.test_ids or candidate in self.test_names:
+            candidate = f"{base}_{suffix:03d}"
+            suffix += 1
+        return candidate
+
+    def add_case(self, case: TestCase, preferred_id: str | None = None) -> bool:
+        signature = self.case_signature(case)
+        if signature in self.signatures:
+            return False
+        case.test_id = self.unique_test_id(preferred_id or case.test_id)
+        self.remember(case)
+        return True
+
+    @classmethod
+    def ensure_unique_test_ids(cls, cases: list[TestCase]) -> None:
+        test_ids: set[str] = set()
+        test_names: set[str] = set()
+        for case in cases:
+            raw_id = str(getattr(case, "test_id", "") or "")
+            safe_name = cls.safe_test_name(raw_id)
+            if raw_id and raw_id not in test_ids and safe_name not in test_names:
+                test_ids.add(raw_id)
+                test_names.add(safe_name)
+                continue
+
+            base = safe_name
+            candidate = base
+            suffix = 2
+            while candidate in test_ids or candidate in test_names:
+                candidate = f"{base}_{suffix:03d}"
+                suffix += 1
+            case.test_id = candidate
+            test_ids.add(candidate)
+            test_names.add(candidate)
+
+    @classmethod
+    def inventory(cls, cases: list[TestCase]) -> list[dict[str, object]]:
+        return [
+            {
+                "test_id": case.test_id,
+                "test_name": cls.safe_test_name(case.test_id),
+                "function": case.function,
+                "coverage": case.coverage,
+                "level": case.level,
+                "values": dict(case.values or {}),
+                "signature": TestVectorGenerator._vector_signature(case.function, case.values or {}),
+            }
+            for case in cases
+        ]
+
+
 class TestVectorGenerator:
     def __init__(self):
         """Initialize generator with deduplication tracking."""
         self._vector_signatures: set[str] = set()
         self._code_records: dict[str, CodeFunctionRecord] = {}
         self.workflow = TestGenerationWorkflow()
-    
+
     @staticmethod
-    def _vector_signature(fn_name: str, values: dict[str, str]) -> str:
+    def _strip_outer_parens(value: str) -> str:
+        text = value.strip()
+        if not (text.startswith("(") and text.endswith(")")):
+            return text
+        depth = 0
+        for index, char in enumerate(text):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0 and index != len(text) - 1:
+                    return text
+        return text[1:-1].strip()
+
+    @staticmethod
+    def _canonical_vector_value(value: object) -> str:
+        """Normalize equivalent C/C++ literal spellings for vector dedupe."""
+        text = str(value if value is not None else "").strip()
+        text = re.sub(r"/\*.*?\*/", "", text).strip()
+        cast_pattern = re.compile(
+            r"^\(\s*(?:(?:const|volatile)\s+)*(?:unsigned\s+|signed\s+)?[A-Za-z_]\w*(?:\s*\*)?\s*\)\s*(.+)$"
+        )
+        changed = True
+        while changed and text:
+            changed = False
+            match = cast_pattern.match(text)
+            if match:
+                text = match.group(1).strip()
+                changed = True
+            stripped = TestVectorGenerator._strip_outer_parens(text)
+            if stripped != text:
+                text = stripped
+                changed = True
+
+        upper = text.upper()
+        if upper in {"TRUE", "STD_ON"}:
+            return "1"
+        if upper in {"FALSE", "STD_OFF", "NULL", "NULLPTR"}:
+            return "0"
+
+        numeric = re.fullmatch(r"([+-]?(?:0[xX][0-9A-Fa-f]+|\d+))(?:[uUlL]+)?", text)
+        if numeric:
+            try:
+                return str(int(numeric.group(1), 0))
+            except ValueError:
+                return numeric.group(1)
+
+        floating = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)(?:[fFlL])?", text)
+        if floating:
+            try:
+                number = float(floating.group(1))
+                if number.is_integer():
+                    return str(int(number))
+            except ValueError:
+                pass
+        return text
+
+    @staticmethod
+    def _vector_signature(fn_name: str, values: dict[str, object]) -> str:
         """Generate a signature for a test vector for deduplication.
         
         Signature is based on function name and sorted values, enabling
         identification of truly duplicate test cases.
         """
-        # Only include non-internal values in signature
-        visible_values = {k: v for k, v in sorted(values.items()) if not k.startswith("__")}
+        # Only include non-internal input values in the signature. Internal
+        # expectation/audit metadata must not keep an otherwise identical vector
+        # alive, and C literal spelling differences should collapse together.
+        visible_values = {
+            k: TestVectorGenerator._canonical_vector_value(v)
+            for k, v in sorted((values or {}).items())
+            if not str(k).startswith("__")
+        }
         sig_parts = [fn_name] + [f"{k}={v}" for k, v in visible_values.items()]
         return "|".join(sig_parts)
     
@@ -108,11 +263,7 @@ class TestVectorGenerator:
         self._code_records = {record.name: record for record in code_database.functions} if code_database else {}
         by_name = {fn.name: fn for fn in functions}
         result: list[TestCase] = []
-        existing_signatures = {
-            self._vector_signature(case.function, case.values or {})
-            for case in existing_cases
-        }
-        existing_ids = {case.test_id for case in existing_cases}
+        registry = TestCaseRegistry(existing_cases)
         next_index: dict[str, int] = {}
         for case in existing_cases:
             next_index[case.function] = next_index.get(case.function, 0) + 1
@@ -123,10 +274,8 @@ class TestVectorGenerator:
                 continue
             vectors = self._vectors_for_gap(fn, gap, coverage)[:max(1, max_cases_per_gap)]
             for vector in vectors:
-                signature = self._vector_signature(fn.name, vector)
-                if signature in existing_signatures:
+                if registry.has_signature(fn.name, vector):
                     continue
-                existing_signatures.add(signature)
                 next_index[fn.name] = next_index.get(fn.name, 0) + 1
                 idx = next_index[fn.name]
                 metric = gap.metric or coverage
@@ -143,17 +292,114 @@ class TestVectorGenerator:
                 case = self._case(source_name, fn, level, f"Gap {metric}", idx, annotated, rationale, asil_level)
                 safe_metric = re.sub(r"[^A-Za-z0-9]+", "_", metric).strip("_").lower() or "coverage"
                 base_id = f"{fn.name}_gap_{safe_metric}_line_{gap_line or 'unknown'}_{idx:03d}"
-                test_id = re.sub(r"[^A-Za-z0-9_]+", "_", base_id).strip("_")
-                while test_id in existing_ids:
-                    idx += 1
-                    test_id = re.sub(r"[^A-Za-z0-9_]+", "_", f"{base_id}_{idx}").strip("_")
-                existing_ids.add(test_id)
-                case.test_id = test_id
+                if not registry.add_case(case, base_id):
+                    continue
                 case.description = f"Add coverage-gap test candidate for {fn.name} line {gap_line or 'unknown'} ({metric})."
                 case.rationale = rationale
                 case.trace_tags = f"{case.trace_tags};coverage-gap;line-{gap_line or 'unknown'};{metric}"
                 result.append(case)
         return result
+
+    def run_escalation(
+        self,
+        source_name: str,
+        functions: list[FunctionInfo],
+        cases: list[TestCase],
+        feedback: CoverageFeedback,
+        level: str,
+        coverage: str,
+        asil_level: str = "ASIL D",
+        code_database: CodeDatabase | None = None,
+        cfg_json: dict | None = None,
+        target_percent: float = 100.0,
+        stale_gain_threshold: float = 1.0,
+        density: int = 3,
+        execution_context: ExecutionContext | None = None,
+    ) -> tuple[list[TestCase], CoverageFeedback, dict[str, str]]:
+        """Route generated cases through the layered coverage fallback gate."""
+        from testing_mate.escalation_engine import run_escalation
+        from testing_mate.utilities import merge_generated_coverage_feedback
+
+        active_cases = list(cases)
+        gate_feedback = feedback
+        statuses: dict[str, str] = {}
+        registry = TestCaseRegistry(active_cases)
+        for fn in functions:
+            fn_cases = [case for case in active_cases if case.function == fn.name]
+            layer_cfg = {
+                "source_name": source_name,
+                "level": level,
+                "coverage": coverage,
+                "asil_level": asil_level,
+                "target_percent": target_percent,
+                "stale_gain_threshold": max(0.0, stale_gain_threshold) / 100.0,
+                "density": max(1, density),
+            }
+            if execution_context is not None:
+                layer_cfg["execution_context"] = execution_context
+            if cfg_json:
+                layer_cfg.update(cfg_json)
+            layer_cfg["existing_testcases"] = TestCaseRegistry.inventory(active_cases)
+            layer_cfg["existing_test_ids"] = [item["test_id"] for item in layer_cfg["existing_testcases"]]
+            layer_cfg["existing_test_names"] = [item["test_name"] for item in layer_cfg["existing_testcases"]]
+            layer_cfg["dedupe_against"] = [item["signature"] for item in layer_cfg["existing_testcases"]]
+            layer_cases, gate_feedback, status = run_escalation(
+                fn,
+                code_database,
+                gate_feedback,
+                layer_cfg,
+                existing_cases=fn_cases,
+                source_name=source_name,
+                level=level,
+                coverage=coverage,
+                asil_level=asil_level,
+                target_percent=target_percent,
+                stale_gain_threshold=max(0.0, stale_gain_threshold) / 100.0,
+                density=max(1, density),
+            )
+            statuses[fn.name] = status
+            for case in layer_cases:
+                if registry.add_case(case):
+                    active_cases.append(case)
+        active_feedback = merge_generated_coverage_feedback(
+            gate_feedback,
+            functions,
+            active_cases,
+            coverage,
+        )
+        return active_cases, active_feedback, statuses
+
+    @staticmethod
+    def _condition_texts(condition: Condition) -> list[str]:
+        values = [
+            condition.text,
+            getattr(condition, "analysis_text", "") or "",
+            *(condition.decisions or []),
+            *(getattr(condition, "analysis_decisions", []) or []),
+        ]
+        result: list[str] = []
+        for value in values:
+            clean = str(value or "").strip()
+            if clean and clean not in result:
+                result.append(clean)
+        return result
+
+    @staticmethod
+    def _condition_decisions(condition: Condition) -> list[str]:
+        values = [
+            *(condition.decisions or []),
+            *(getattr(condition, "analysis_decisions", []) or []),
+        ]
+        if not values:
+            values.extend(ConditionEvaluator.atoms(condition.text) or [])
+            analysis_text = getattr(condition, "analysis_text", "") or ""
+            values.extend(ConditionEvaluator.atoms(analysis_text) or [])
+        result: list[str] = []
+        for value in values:
+            clean = str(value or "").strip()
+            if clean and clean not in result:
+                result.append(clean)
+        return result or [condition.text]
 
     @staticmethod
     def _function_for_gap_line(functions: list[FunctionInfo], line: int | None) -> FunctionInfo | None:
@@ -170,12 +416,15 @@ class TestVectorGenerator:
             for condition in fn.conditions:
                 if condition.line == line:
                     return condition
+                if getattr(condition, "analysis_line", None) == line:
+                    return condition
+            previous = [condition for condition in fn.conditions if condition.line < line]
+            if previous:
+                return max(previous, key=lambda condition: condition.line)
         lowered = str(text or "").lower()
         for condition in fn.conditions:
-            if condition.text and condition.text.lower() in lowered:
-                return condition
-            for decision in condition.decisions:
-                if decision and decision.lower() in lowered:
+            for candidate in self._condition_texts(condition):
+                if candidate.lower() in lowered:
                     return condition
         return None
 
@@ -201,8 +450,11 @@ class TestVectorGenerator:
                 if gap.line is not None:
                     for previous in fn.conditions:
                         if previous.line < gap.line:
-                            self._drive_condition(vec, previous, True)
+                            self._drive_condition(vec, previous, previous.depth < condition.depth)
                 self._drive_condition(vec, condition, desired)
+                target_decision = self._gap_decision_text(text)
+                if target_decision:
+                    self._drive_decision(vec, target_decision, desired)
                 self._append_unique(vectors, vec)
             return vectors
 
@@ -213,12 +465,17 @@ class TestVectorGenerator:
             # coverage run is the actual evidence.
             for condition in fn.conditions:
                 if condition.line <= gap.line:
-                    self._drive_condition(vec, condition, True)
+                    self._drive_condition(vec, condition, condition.line == gap.line)
         self._append_unique(vectors, vec)
 
         for path_vec in self._path_optimized_vectors(fn, base)[:4]:
             self._append_unique(vectors, path_vec)
         return vectors
+
+    @staticmethod
+    def _gap_decision_text(text: str) -> str:
+        match = re.search(r"`([^`]+)`", str(text or ""))
+        return match.group(1).strip() if match else ""
 
     @staticmethod
     def _gap_desired_truths(text: str) -> list[bool]:
@@ -1106,15 +1363,16 @@ class TestVectorGenerator:
         return vectors
 
     def _drive_condition(self, vector: dict[str, str], condition: Condition, target_true: bool) -> None:
-        decisions = condition.decisions or [condition.text]
-        if "&&" in condition.text:
+        decisions = self._condition_decisions(condition)
+        combined_text = f"{condition.text} {getattr(condition, 'analysis_text', '') or ''}"
+        if "&&" in combined_text:
             if target_true:
                 for decision in decisions:
                     self._drive_decision(vector, decision, True)
             elif decisions:
                 self._drive_decision(vector, decisions[0], False)
             return
-        if "||" in condition.text:
+        if "||" in combined_text:
             if target_true and decisions:
                 self._drive_decision(vector, decisions[0], True)
             else:
@@ -1263,7 +1521,7 @@ class TestVectorGenerator:
             return ["-1.0", "0.0", "1.0", "2.0"]
         if "char" in ctype and "signed" not in ctype and "unsigned" not in ctype:
             return ["'\\0'", "'A'", "'Z'"]
-        if "unsigned" in ctype:
+        if "unsigned" in ctype or re.search(r"\buint(?:8|16|32|64)?(?:_t)?\b", ctype):
             return ["0", "1", "2", "3", "15", "16", "255"]
         return ["-2", "-1", "0", "1", "2", "3", "15", "16"]
 
@@ -1292,12 +1550,12 @@ class TestVectorGenerator:
         enum_match = re.search(r"\b([A-Za-z_]\w*)\b\s*(==|!=)\s*\b([A-Z][A-Za-z0-9_]+)\b", decision)
         if enum_match and enum_match.group(1) in vector:
             name, op, constant = enum_match.group(1), enum_match.group(2), enum_match.group(3)
-            vector[name] = constant if (op == "==") == target_true else "0"
+            vector[name] = self._literal_for_equality_target(constant, (op == "==") == target_true)
             return
         enum_match = re.search(r"\b([A-Z][A-Za-z0-9_]+)\b\s*(==|!=)\s*\b([A-Za-z_]\w*)\b", decision)
         if enum_match and enum_match.group(3) in vector:
             constant, op, name = enum_match.group(1), enum_match.group(2), enum_match.group(3)
-            vector[name] = constant if (op == "==") == target_true else "0"
+            vector[name] = self._literal_for_equality_target(constant, (op == "==") == target_true)
             return
         negated_field = re.fullmatch(r"!\s*([A-Za-z_]\w*)\s*->\s*([A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*)", decision)
         if negated_field:
@@ -1323,6 +1581,16 @@ class TestVectorGenerator:
             number = float(raw) if "." in raw else int(raw)
             vector[name] = self._value_for_compare(number, op, target_true)
             return
+        match = re.search(r"\b([A-Za-z_]\w*)\b\s*(>=|<=|>|<)\s*\b([A-Z][A-Za-z0-9_]+)\b", decision)
+        if match and match.group(1) in vector:
+            name, op, symbol = match.group(1), match.group(2), match.group(3)
+            vector[name] = self._value_for_compare(self._symbolic_compare_anchor(symbol), op, target_true)
+            return
+        match = re.search(r"\b([A-Z][A-Za-z0-9_]+)\b\s*(>=|<=|>|<)\s*\b([A-Za-z_]\w*)\b", decision)
+        if match and match.group(3) in vector:
+            symbol, op, name = match.group(1), match.group(2), match.group(3)
+            vector[name] = self._value_for_compare(self._symbolic_compare_anchor(symbol), self._flip_operator(op), target_true)
+            return
         match = re.search(r"\b([A-Za-z_]\w*)\b\s*(==|!=|>=|<=|>|<)\s*([A-Za-z_]\w*(?:\s*(?:->|\.)\s*[A-Za-z_]\w*)*)", decision)
         if match and match.group(1) in vector:
             key = self._resolve_vector_key(re.sub(r"\s*(?:->|\.)\s*", ".", match.group(3)), vector)
@@ -1341,6 +1609,34 @@ class TestVectorGenerator:
         match = re.search(r"\b([A-Za-z_]\w*)\b", decision)
         if match and match.group(1) in vector:
             vector[match.group(1)] = "1" if target_true else "0"
+
+    @staticmethod
+    def _literal_for_equality_target(constant: str, should_equal: bool) -> str:
+        upper = str(constant or "").upper()
+        if should_equal:
+            return constant
+        if upper == "FALSE":
+            return "TRUE"
+        if upper == "TRUE":
+            return "FALSE"
+        return "0"
+
+    @staticmethod
+    def _symbolic_compare_anchor(symbol: str) -> int:
+        name = str(symbol or "").upper()
+        standard = {"STD_LOW": 0, "STD_HIGH": 1, "STD_OFF": 0, "STD_ON": 1}
+        if name in standard:
+            return standard[name]
+        number = re.search(r"(\d+)", name)
+        if number:
+            return int(number.group(1))
+        if "SPEED" in name and any(token in name for token in ("LIMIT", "MAX")):
+            return 120
+        if any(token in name for token in ("LIMIT", "THRESHOLD", "MAX", "HIGH")):
+            return 50
+        if any(token in name for token in ("MIN", "LOW")):
+            return 1
+        return 1
 
     @staticmethod
     def _field_key(param_name: str, field_path: str) -> str:

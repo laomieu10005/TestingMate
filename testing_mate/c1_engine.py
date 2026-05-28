@@ -74,4 +74,5 @@ class C1CoverageEngine:
             metric_notes=metric_notes,
             uncovered_items=(feedback.uncovered_items + (c1.uncovered_items if use_generated_items else []))[:80],
             failures=feedback.failures,
+            execution_layers=getattr(feedback, "execution_layers", []),
         )

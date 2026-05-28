@@ -84,6 +84,7 @@ def complete_no_obligation_metrics(feedback: CoverageFeedback, functions: list[F
         metric_notes=notes,
         uncovered_items=feedback.uncovered_items,
         failures=feedback.failures,
+        execution_layers=getattr(feedback, "execution_layers", []),
     )
 
 def has_executed_coverage_evidence(feedback: CoverageFeedback) -> bool:
@@ -92,13 +93,13 @@ def has_executed_coverage_evidence(feedback: CoverageFeedback) -> bool:
     return bool(feedback.raw_text.strip() or any(value is not None for value in feedback.metrics.values()))
 
 def merge_cases(existing: list[TestCase], candidates: list[TestCase]) -> int:
-    signatures = {(case.function, tuple(sorted(case.values.items()))) for case in existing}
+    from testing_mate.vector_generator import TestCaseRegistry
+
+    registry = TestCaseRegistry(existing)
     added = 0
     for candidate in candidates:
-        signature = (candidate.function, tuple(sorted(candidate.values.items())))
-        if signature in signatures:
+        if not registry.add_case(candidate):
             continue
-        signatures.add(signature)
         existing.append(candidate)
         added += 1
     return added
@@ -128,6 +129,7 @@ def merge_generated_coverage_feedback(
             metric_notes=notes,
             uncovered_items=feedback.uncovered_items,
             failures=feedback.failures,
+            execution_layers=getattr(feedback, "execution_layers", []),
         )
     return complete_no_obligation_metrics(feedback, functions)
 
@@ -148,10 +150,8 @@ def collect_backend_feedback(parser: CoverageReportParser, out_dir: Path, source
     target_files: list[Path] = [source]
     if backend == "CppUTest":
         base_dir = out_dir / f"{source.stem}_cpputest"
-        target_files.append(base_dir / "src" / source.name)
     elif backend == "GoogleTest":
         base_dir = out_dir / f"{source.stem}_gtest"
-        target_files.append(base_dir / "src" / source.name)
     else:
         base_dir = out_dir
     candidates.extend(
@@ -185,6 +185,7 @@ def collect_backend_feedback(parser: CoverageReportParser, out_dir: Path, source
                     metric_notes=notes,
                     uncovered_items=(feedback.uncovered_items + lcov_feedback.uncovered_items)[:80],
                     failures=feedback.failures + [item for item in lcov_feedback.failures if item not in feedback.failures],
+                    execution_layers=getattr(feedback, "execution_layers", []),
                 )
             return feedback
     if log:

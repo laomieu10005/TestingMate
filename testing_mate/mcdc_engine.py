@@ -389,6 +389,7 @@ class MCDCCoverageEngine:
             metric_notes=metric_notes,
             uncovered_items=(feedback.uncovered_items + (mcdc.uncovered_items if use_generated_items else []))[:80],
             failures=feedback.failures,
+            execution_layers=getattr(feedback, "execution_layers", []),
         )
 
     def evaluations(self, condition: Condition, decisions: list[str], cases: list[TestCase]) -> list[tuple[TestCase, list[bool] | None, bool | None]]:

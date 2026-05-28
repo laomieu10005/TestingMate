@@ -1,14 +1,16 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import html
 import json
 import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from testing_mate.code_database import CodeDatabase
-from testing_mate.constants import C_SOURCE_EXTENSIONS, SCALAR_TOKENS
+from testing_mate.constants import C_SOURCE_EXTENSIONS, HEADER_SOURCE_EXTENSIONS, SCALAR_TOKENS
 from testing_mate.mcdc_engine import MCDCCoverageCollector
 from testing_mate.models import FunctionInfo, Parameter, RunResult, TestCase, Condition
 from testing_mate.boolean_expression import ConditionEvaluator
@@ -17,7 +19,9 @@ from testing_mate.toolchain import local_mingw_bin, msys_bash_path, toolchain_en
 from testing_mate.vector_generator import TestVectorGenerator
 
 
-def backend_harness_path(out_dir: Path, source: Path, backend: str) -> Path:
+def backend_harness_path(out_dir: Path | str, source: Path | str, backend: str) -> Path:
+    out_dir = out_dir if isinstance(out_dir, Path) else Path(str(out_dir))
+    source = source if isinstance(source, Path) else Path(str(source))
     if backend == "CppUTest":
         return out_dir / f"{source.stem}_cpputest" / "run_cpputest.sh"
     if backend == "GoogleTest":
@@ -36,8 +40,10 @@ class TestOracleFallback:
     """Patch generated expected fixtures from first-run assertion evidence."""
 
     @classmethod
-    def apply(cls, backend: str, out_dir: Path, source: Path, run_result: RunResult) -> tuple[int, list[str]]:
-        if run_result.returncode in (0, None):
+    def apply(cls, backend: str, out_dir: Path | str, source: Path | str, run_result: RunResult) -> tuple[int, list[str]]:
+        out_dir = out_dir if isinstance(out_dir, Path) else Path(str(out_dir))
+        source = source if isinstance(source, Path) else Path(str(source))
+        if run_result.returncode is None:
             return 0, []
         test_source = cls._test_source_path(backend, out_dir, source)
         if not test_source.exists():
@@ -47,7 +53,7 @@ class TestOracleFallback:
         except OSError as exc:
             return 0, [f"Oracle fallback skipped: cannot read {test_source}: {exc}"]
 
-        mismatches = cls.expected_actual_mismatches(run_result)
+        mismatches = cls.expected_actual_mismatches(run_result, test_source)
         if not mismatches:
             return 0, ["Oracle fallback found no parseable expected/actual equality failures."]
 
@@ -77,11 +83,94 @@ class TestOracleFallback:
         return updated, notes
 
     @classmethod
-    def expected_actual_mismatches(cls, run_result: RunResult) -> list[dict[str, str]]:
-        text = "\n".join(part for part in (run_result.stdout, run_result.stderr) if part)
+    def expected_actual_mismatches(cls, run_result: RunResult, test_source: Path | str | None = None) -> list[dict[str, str]]:
+        text = cls.backend_execution_text(run_result)
         if not text.strip():
             return []
-        return cls._gtest_mismatches(text) + cls._cpputest_mismatches(text)
+        source_text = ""
+        if test_source is not None:
+            try:
+                source_text = Path(str(test_source)).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                source_text = ""
+        test_source_name = Path(str(test_source)).name if test_source is not None else ""
+        failures = cls.failed_test_names_from_text(text)
+        items = cls._gtest_mismatches(text, source_text, test_source_name) + cls._cpputest_mismatches(text, source_text, test_source_name)
+        if failures:
+            items = [item for item in items if cls._test_matches_failure_set(item.get("test", ""), failures)]
+        return items
+
+    @staticmethod
+    def backend_execution_text(run_result: RunResult) -> str:
+        """Return current backend stdout/stderr without Testing Mate retry notes.
+
+        Retry notes are appended into stdout for report visibility.  In long or
+        nested runs those notes may appear before another real CTest/GTest block,
+        so do not simply truncate at the first retry marker.  Remove only the
+        note block, then select the latest real execution block.
+        """
+        text = "\n".join(part for part in (run_result.stdout, run_result.stderr) if part)
+        if not text:
+            return ""
+        text = html.unescape(text)
+        text = TestOracleFallback._strip_testing_mate_retry_notes(text)
+        starts = [m.start() for m in re.finditer(r"(?m)^(?:Start testing:|Running main\(\) from|\[=+\] Running )", text)]
+        if len(starts) > 1:
+            # Prefer the latest backend execution, but avoid selecting a short
+            # inner banner when a later CTest LastTest.log block is appended.
+            ctest_starts = [m.start() for m in re.finditer(r"(?m)^Start testing:", text)]
+            text = text[(ctest_starts[-1] if ctest_starts else starts[-1]):]
+        return text
+
+    @staticmethod
+    def _strip_testing_mate_retry_notes(text: str) -> str:
+        note_start = re.compile(r"^===\s+Testing Mate Fallback Retry\s+\d+/\d+\s+===\s*$")
+        execution_start = re.compile(r"^(?:Start testing:|Running main\(\) from|\[=+\] Running )")
+        kept: list[str] = []
+        skipping = False
+        for line in str(text or "").splitlines():
+            if note_start.match(line.strip()):
+                skipping = True
+                continue
+            if skipping and execution_start.search(line):
+                skipping = False
+            if skipping:
+                continue
+            kept.append(line)
+        return "\n".join(kept)
+
+    @staticmethod
+    def _next_failed_test_name(lines: list[str], start_index: int, window: int = 40) -> str:
+        tail = "\n".join(lines[start_index:min(len(lines), start_index + window)])
+        failed_match = re.search(r"(?m)^\[\s*FAILED\s*\]\s+([^\s(]+)", tail)
+        return failed_match.group(1).strip().rsplit(".", 1)[-1] if failed_match else ""
+
+    @staticmethod
+    def failed_test_names_from_text(text: str) -> set[str]:
+        failed: set[str] = set()
+        text = str(text or "")
+        for match in re.finditer(r"(?m)^\[\s*FAILED\s*\]\s+([^\s(]+)", text):
+            name = match.group(1).strip()
+            if not name or name.isdigit():
+                continue
+            failed.add(name)
+            failed.add(name.rsplit(".", 1)[-1])
+        for match in re.finditer(r"Failure\s+in\s+TEST\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)", text, re.I):
+            group = match.group(1).strip()
+            name = match.group(2).strip()
+            if not name or name.isdigit():
+                continue
+            failed.add(name)
+            if group:
+                failed.add(f"{group}.{name}")
+        return failed
+
+    @staticmethod
+    def _test_matches_failure_set(test_name: str, failures: set[str]) -> bool:
+        if not failures:
+            return True
+        clean = str(test_name or "").strip()
+        return bool(clean and (clean in failures or clean.rsplit(".", 1)[-1] in failures))
 
     @staticmethod
     def failure_summaries(run_result: RunResult, limit: int = 20) -> list[str]:
@@ -95,7 +184,7 @@ class TestOracleFallback:
             )
         if summaries:
             return summaries
-        text = "\n".join(part for part in (run_result.stdout, run_result.stderr) if part)
+        text = TestOracleFallback.backend_execution_text(run_result)
         for line in text.splitlines():
             clean = " ".join(line.strip().split())
             if clean and any(token in clean.lower() for token in ("failed", "failure", "error", "expected", "actual")):
@@ -105,26 +194,65 @@ class TestOracleFallback:
         return summaries
 
     @staticmethod
-    def _test_source_path(backend: str, out_dir: Path, source: Path) -> Path:
+    def _test_source_path(backend: str, out_dir: Path | str, source: Path | str) -> Path:
+        out_dir = out_dir if isinstance(out_dir, Path) else Path(str(out_dir))
+        source = source if isinstance(source, Path) else Path(str(source))
         if backend == "CppUTest":
             return out_dir / f"{source.stem}_cpputest" / f"{source.stem}_cpputest_test.cpp"
         return out_dir / f"{source.stem}_gtest" / f"{source.stem}_gtest_test.cpp"
 
     @staticmethod
-    def _gtest_mismatches(text: str) -> list[dict[str, str]]:
+    def _gtest_mismatches(text: str, source_text: str = "", test_source_name: str = "") -> list[dict[str, str]]:
         result: list[dict[str, str]] = []
         current_test = ""
+        pending_failure_line: int | None = None
         lines = text.splitlines()
         index = 0
         while index < len(lines):
-            run_match = re.search(r"^\[\s*RUN\s*\]\s+(.+)$", lines[index])
+            line = lines[index]
+            run_match = re.search(r"^\[\s*RUN\s*\]\s+(.+)$", line)
             if run_match:
                 current_test = run_match.group(1).strip().rsplit(".", 1)[-1]
-            if "Expected equality of these values:" in lines[index]:
-                parsed = TestOracleFallback._parse_gtest_equality_block(lines[index + 1 : index + 8])
+                pending_failure_line = None
+            failure_match = TestOracleFallback._output_cpp_line_match(line)
+            if failure_match and re.search(r"(?i):\s+Failure", line):
+                failure_file, failure_line = failure_match
+                pending_failure_line = failure_line if TestOracleFallback._is_same_output_source(failure_file, test_source_name) else None
+            if "Expected equality of these values:" in line:
+                parsed = TestOracleFallback._parse_gtest_equality_block(lines[index + 1 : index + 10])
                 if parsed:
-                    parsed["test"] = current_test
+                    mapped_test = (
+                        current_test
+                        or TestOracleFallback._test_name_at_line(source_text, pending_failure_line)
+                        or TestOracleFallback._next_failed_test_name(lines, index + 1)
+                    )
+                    parsed["test"] = mapped_test
+                    if pending_failure_line is not None:
+                        parsed["line"] = str(pending_failure_line)
                     result.append(parsed)
+            else:
+                # Tail-truncated output can start inside a GTest equality block,
+                # e.g. `tual_return` followed by `Which is: '\x1' (1)`.  When
+                # that happens, infer expected_return/actual_return and map to
+                # the following [ FAILED ] line so the case can still be put back.
+                clean = line.strip()
+                if (clean.endswith("actual_return") or clean.endswith("tual_return")) and "Expected equality of these values:" not in "\n".join(lines[max(0, index - 4):index]):
+                    if index + 1 < len(lines):
+                        value_match = re.search(r"Which is:\s*(.+)$", lines[index + 1].strip())
+                        mapped_test = (
+                            current_test
+                            or TestOracleFallback._test_name_at_line(source_text, pending_failure_line)
+                            or TestOracleFallback._next_failed_test_name(lines, index + 2)
+                        )
+                        if value_match and mapped_test:
+                            result.append({
+                                "test": mapped_test,
+                                "expected": "expected_return",
+                                "expected_value": "",
+                                "actual": "actual_return",
+                                "actual_value": value_match.group(1).strip(),
+                                "line": str(pending_failure_line or ""),
+                            })
             index += 1
         return result
 
@@ -153,23 +281,72 @@ class TestOracleFallback:
         return {"expected": expected, "expected_value": expected_value, "actual": actual, "actual_value": actual_value}
 
     @staticmethod
-    def _cpputest_mismatches(text: str) -> list[dict[str, str]]:
+    def _cpputest_mismatches(text: str, source_text: str = "", test_source_name: str = "") -> list[dict[str, str]]:
         result: list[dict[str, str]] = []
         current_test = ""
-        for line in text.splitlines():
+        pending_failure_line: int | None = None
+        pending_expected = ""
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
             test_match = re.search(r"TEST\(([^,]+),\s*([^)]+)\)", line)
             if test_match:
                 current_test = test_match.group(2).strip()
-            match = re.search(r"expected\s*<([^>]+)>.*(?:but was|actual)\s*<([^>]+)>", line, re.I)
-            if match:
+            failure_test_match = re.search(r"Failure\s+in\s+TEST\(([^,]+),\s*([^)]+)\)", line, re.I)
+            if failure_test_match:
+                current_test = failure_test_match.group(2).strip()
+            line_match = TestOracleFallback._output_cpp_line_match(line)
+            if line_match:
+                failure_file, failure_line = line_match
+                if TestOracleFallback._is_same_output_source(failure_file, test_source_name):
+                    pending_failure_line = failure_line
+                    mapped = TestOracleFallback._test_name_at_line(source_text, pending_failure_line)
+                    if mapped:
+                        current_test = mapped
+                else:
+                    # Failures from generated stubs/TearDown helpers still belong to the active test.
+                    pending_failure_line = None
+            one_line = re.search(r"expected\s*<([^>]+)>.*(?:but was|actual)\s*<([^>]+)>", line, re.I)
+            if one_line:
                 result.append({
-                    "test": current_test,
+                    "test": current_test or TestOracleFallback._test_name_at_line(source_text, pending_failure_line),
                     "expected": "expected_return",
-                    "expected_value": match.group(1).strip(),
+                    "expected_value": one_line.group(1).strip(),
                     "actual": "actual_return",
-                    "actual_value": match.group(2).strip(),
+                    "actual_value": one_line.group(2).strip(),
+                    "line": str(pending_failure_line or ""),
                 })
+                pending_expected = ""
+                continue
+            expected_match = re.search(r"expected\s*<([^>]+)>", line, re.I)
+            if expected_match:
+                pending_expected = expected_match.group(1).strip()
+                continue
+            actual_match = re.search(r"(?:but was|actual)\s*<([^>]+)>", line, re.I)
+            if pending_expected and actual_match:
+                result.append({
+                    "test": current_test or TestOracleFallback._test_name_at_line(source_text, pending_failure_line),
+                    "expected": "expected_return",
+                    "expected_value": pending_expected,
+                    "actual": "actual_return",
+                    "actual_value": actual_match.group(1).strip(),
+                    "line": str(pending_failure_line or ""),
+                })
+                pending_expected = ""
         return result
+
+    @staticmethod
+    def _output_cpp_line_match(line: str) -> tuple[str, int] | None:
+        match = re.search(r"(?i)(?P<file>(?:[A-Za-z]:)?[^:\n]*?\.cpp):(?P<line>\d+):", line)
+        if not match:
+            return None
+        return match.group("file"), int(match.group("line"))
+
+    @staticmethod
+    def _is_same_output_source(output_file: str, test_source_name: str) -> bool:
+        if not test_source_name:
+            return True
+        normalized = str(output_file or "").replace("\\", "/").rsplit("/", 1)[-1]
+        return normalized == test_source_name
 
     @staticmethod
     def _fixture_type_map(text: str) -> dict[str, str]:
@@ -194,7 +371,15 @@ class TestOracleFallback:
         expected_root = expected.split(".", 1)[0]
         ctype = type_map.get(expected_root, "")
         typed = TestBackendGenerator._typed_value(ctype, literal) if ctype else literal
-        pattern = re.compile(rf"(?m)^(\s*{re.escape(expected)}\s*=\s*)([^;]+)(;)")
+        if re.fullmatch(r"[A-Za-z_]\w*", expected):
+            # Generated suites usually assign fixture members as
+            # `expected_return = ...;`, but focused/synthetic layer suites can
+            # also declare a local such as `uint8 expected_return = ...;`.
+            # Patch both forms so immediate retry uses the observed oracle.
+            assign_pattern = rf"(?m)^(\s*(?:(?:[A-Za-z_]\w*(?:::[A-Za-z_]\w*)?|[A-Za-z_]\w*<[^;=]*>|[*&])\s+)*{re.escape(expected)}\s*=\s*)([^;]+)(;)"
+        else:
+            assign_pattern = rf"(?m)^(\s*{re.escape(expected)}\s*=\s*)([^;]+)(;)"
+        pattern = re.compile(assign_pattern)
         if pattern.search(block):
             block = pattern.sub(rf"\g<1>{typed}\3", block, count=1)
             return text[:start] + block + text[end:], True
@@ -227,8 +412,37 @@ class TestOracleFallback:
         return None
 
     @staticmethod
+    def _test_name_at_line(text: str, line_no: int | None) -> str:
+        if not text or line_no is None or line_no <= 0:
+            return ""
+        candidates: list[tuple[int, int, str]] = []
+        pattern = re.compile(r"\bTEST(?:_F)?\s*\(\s*[A-Za-z_]\w*\s*,\s*([A-Za-z_]\w*)\s*\)\s*\{")
+        for match in pattern.finditer(text):
+            open_brace = text.find("{", match.start())
+            if open_brace < 0:
+                continue
+            depth = 0
+            end_index = len(text)
+            for index in range(open_brace, len(text)):
+                ch = text[index]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end_index = index + 1
+                        break
+            start_line = text[: match.start()].count("\n") + 1
+            end_line = text[:end_index].count("\n") + 1
+            candidates.append((start_line, end_line, match.group(1)))
+        for start_line, end_line, name in candidates:
+            if start_line <= line_no <= end_line:
+                return name
+        return ""
+
+    @staticmethod
     def _literal_from_observed_value(value: str) -> str:
-        clean = value.strip()
+        clean = html.unescape(value.strip())
         paren_number = re.search(r"\((-?\d+(?:\.\d+)?)\)", clean)
         if paren_number:
             return paren_number.group(1)
@@ -249,12 +463,275 @@ class TestOracleFallback:
         return ""
 
 
+class TestCaseRunReconciler:
+    """Persist backend-discovered oracles and mock-call expectations into TestCase values.
+
+    The generated C/C++ file can be patched for the immediate retry, but later
+    coverage layers call ArtifactWriter.write(...) again.  Without updating the
+    TestCase objects, those regenerated files lose the observed expected_return
+    and mock expectation fixes.  This reconciler stores the same evidence in the
+    testcase model so every next layer keeps it.
+    """
+
+    EXPECTED_CALL_KEYS = {"__expected_calls", "__expect_calls", "expected_calls", "expect_calls"}
+    NON_MOCK_CALL_NAMES = {
+        "Unexpected",
+        "Uninteresting",
+        "Function",
+        "FunctionCall",
+        "Mock",
+        "GMOCK",
+        "WARNING",
+        "NOTE",
+        "Expected",
+        "Actual",
+        "returning",
+        "directly",
+    }
+
+    @classmethod
+    def _is_valid_mock_call_name(cls, name: object, stubbed_calls: set[str] | None = None) -> bool:
+        clean = str(name or "").strip()
+        if not re.fullmatch(r"[A-Za-z_]\w*", clean):
+            return False
+        if clean in cls.NON_MOCK_CALL_NAMES:
+            return False
+        if stubbed_calls is not None and clean not in stubbed_calls:
+            return False
+        return True
+
+
+    @classmethod
+    def apply(
+        cls,
+        backend: str,
+        out_dir: Path | str,
+        source: Path | str,
+        run_result: RunResult,
+        cases: list[TestCase] | None,
+    ) -> tuple[int, list[str]]:
+        if not cases or run_result.returncode is None:
+            return 0, []
+        test_source = TestOracleFallback._test_source_path(backend, out_dir, source)
+        source_text = ""
+        if test_source.exists():
+            try:
+                source_text = test_source.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                source_text = ""
+
+        by_name = cls._case_map(cases)
+        changed = 0
+        notes: list[str] = []
+
+        for mismatch in TestOracleFallback.expected_actual_mismatches(run_result, test_source):
+            test_name = str(mismatch.get("test") or "").strip()
+            case = by_name.get(test_name)
+            if case is None:
+                continue
+            expected = str(mismatch.get("expected") or "").strip()
+            value_key = cls._expected_value_key(expected)
+            if not value_key:
+                continue
+            literal = TestOracleFallback._literal_from_observed_value(str(mismatch.get("actual_value") or ""))
+            if not literal:
+                continue
+            values = dict(case.values or {})
+            if str(values.get(value_key, "")).strip() == literal:
+                continue
+            values[value_key] = literal
+            case.values = values
+            case.expected = cls._merge_expected_note(case.expected, f"{value_key}={literal}")
+            case.oracle_status = "auto_observed"
+            case.execution_status = "reconciled"
+            case.trace_tags = cls._merge_trace_tag(case.trace_tags, "oracle-reconciled")
+            changed += 1
+            notes.append(f"Run reconciliation stored {case.test_id}: {value_key} = {literal}.")
+
+        for failure in TestMockFallback.mock_failures(run_result, test_source):
+            test_name = str(failure.get("test") or "").strip()
+            function = str(failure.get("function") or "").strip()
+            action = str(failure.get("action") or "").strip()
+            if not test_name or not function or action not in {"add", "remove"}:
+                continue
+            if not cls._is_valid_mock_call_name(function):
+                continue
+            case = by_name.get(test_name)
+            if case is None:
+                continue
+            values = dict(case.values or {})
+            calls = cls._expected_calls_for_case(values, source_text, test_name)
+            before = list(calls)
+            if action == "add":
+                if function not in calls:
+                    calls.append(function)
+            else:
+                calls = [item for item in calls if item != function]
+            if calls == before and "__expected_calls" in values:
+                continue
+            # Even an empty explicit list is meaningful: it disables automatic
+            # call inference for a path where the backend proved the call is not reached.
+            values["__expected_calls"] = ",".join(calls)
+            case.values = values
+            case.oracle_status = "auto_observed"
+            case.execution_status = "reconciled"
+            case.trace_tags = cls._merge_trace_tag(case.trace_tags, "mock-reconciled")
+            changed += 1
+            verb = "added" if action == "add" else "removed"
+            notes.append(f"Run reconciliation {verb} mock expectation in {case.test_id}: {function}.")
+
+        for observed in TestMockFallback.observed_mock_calls(run_result, test_source):
+            test_name = str(observed.get("test") or "").strip()
+            function = str(observed.get("function") or "").strip()
+            args = observed.get("args") or []
+            if not test_name or not function:
+                continue
+            if not cls._is_valid_mock_call_name(function):
+                continue
+            case = by_name.get(test_name)
+            if case is None:
+                continue
+            values = dict(case.values or {})
+            calls = cls._expected_calls_for_case(values, source_text, test_name)
+            modified = False
+            if function not in calls:
+                calls.append(function)
+                values["__expected_calls"] = ",".join(calls)
+                modified = True
+            for arg_index, raw_arg in enumerate(args):
+                literal = TestMockFallback._literal_from_mock_arg(str(raw_arg))
+                if not literal:
+                    continue
+                key = f"__expected_call_arg.{function}.{arg_index}"
+                if str(values.get(key, "")).strip() != literal:
+                    values[key] = literal
+                    modified = True
+            if not modified:
+                continue
+            case.values = values
+            case.oracle_status = "auto_observed"
+            case.execution_status = "reconciled"
+            case.trace_tags = cls._merge_trace_tag(case.trace_tags, "mock-param-reconciled")
+            changed += 1
+            arg_note = ", ".join(
+                f"arg{idx}={TestMockFallback._literal_from_mock_arg(str(raw)) or str(raw).strip()}"
+                for idx, raw in enumerate(args)
+            )
+            notes.append(f"Run reconciliation stored mock parameters in {case.test_id}: {function}({arg_note}).")
+
+        return changed, notes
+
+    @staticmethod
+    def _case_map(cases: list[TestCase]) -> dict[str, TestCase]:
+        result: dict[str, TestCase] = {}
+        for case in cases:
+            safe = re.sub(r"[^A-Za-z0-9_]", "_", str(case.test_id or ""))
+            if safe:
+                result[safe] = case
+            if case.test_id:
+                result[str(case.test_id)] = case
+        return result
+
+    @staticmethod
+    def _expected_value_key(expected: str) -> str:
+        root = expected.split(".", 1)[0].strip()
+        if root == "expected_return":
+            return "__expected_return"
+        # Whole-struct or field output/global names are intentionally left for
+        # direct source patching because fixture names may not round-trip back to
+        # the original parameter/global name safely.
+        return ""
+
+    @classmethod
+    def _expected_calls_for_case(cls, values: dict[str, str], source_text: str, test_name: str) -> list[str]:
+        explicit = cls._parse_call_list(values.get("__expected_calls", ""))
+        if "__expected_calls" in values:
+            return explicit
+        for key in cls.EXPECTED_CALL_KEYS:
+            if key in values:
+                return cls._parse_call_list(values.get(key, ""))
+        for key in sorted(values):
+            if key.startswith("__expected_call."):
+                call = key.split(".", 1)[1].strip()
+                if call and call not in explicit:
+                    explicit.append(call)
+            elif key.startswith("__stub_return."):
+                call = key.split(".", 1)[1].strip()
+                if call and call not in explicit:
+                    explicit.append(call)
+        if explicit:
+            return explicit
+        return cls._expected_calls_from_generated_block(source_text, test_name)
+
+    @staticmethod
+    def _parse_call_list(raw: object) -> list[str]:
+        result: list[str] = []
+        for item in re.split(r"[,;\s]+", str(raw or "")):
+            clean = item.strip()
+            if TestCaseRunReconciler._is_valid_mock_call_name(clean) and clean not in result:
+                result.append(clean)
+        return result
+
+    @staticmethod
+    def _expected_calls_from_generated_block(source_text: str, test_name: str) -> list[str]:
+        span = TestOracleFallback._test_block_span(source_text, test_name)
+        if span is None:
+            return []
+        block = source_text[span[0]:span[1]]
+        result: list[str] = []
+        for match in re.finditer(r'mock\(\)\.expectOneCall\(\s*"([A-Za-z_]\w*)"', block):
+            name = match.group(1)
+            if TestCaseRunReconciler._is_valid_mock_call_name(name) and name not in result:
+                result.append(name)
+        for match in re.finditer(r"EXPECT_CALL\(\s*TestingMate_Mock\(\)\s*,\s*([A-Za-z_]\w*)\s*\(", block):
+            name = match.group(1)
+            if TestCaseRunReconciler._is_valid_mock_call_name(name) and name not in result:
+                result.append(name)
+        return result
+
+    @staticmethod
+    def _merge_expected_note(current: str, note: str) -> str:
+        clean = str(current or "").strip()
+        if note in clean:
+            return clean
+        return f"{clean}; observed {note}".strip("; ") if clean else f"observed {note}"
+
+    @staticmethod
+    def _merge_trace_tag(current: str, tag: str) -> str:
+        tags = [item.strip() for item in re.split(r"[,;\s]+", str(current or "")) if item.strip()]
+        if tag not in tags:
+            tags.append(tag)
+        return ",".join(tags)
+
+
 class TestMockFallback:
     """Patch generated mock expectations from backend mock-failure evidence."""
 
+    NON_MOCK_CALL_NAMES = {
+        "Unexpected",
+        "Uninteresting",
+        "Function",
+        "FunctionCall",
+        "Mock",
+        "GMOCK",
+        "WARNING",
+        "NOTE",
+        "Expected",
+        "Actual",
+        "returning",
+        "directly",
+    }
+
     @classmethod
-    def apply(cls, backend: str, out_dir: Path, source: Path, run_result: RunResult) -> tuple[int, list[str]]:
-        if run_result.returncode in (0, None):
+    def _is_valid_mock_call_name(cls, name: object) -> bool:
+        clean = str(name or "").strip()
+        return bool(re.fullmatch(r"[A-Za-z_]\w*", clean)) and clean not in cls.NON_MOCK_CALL_NAMES
+
+    @classmethod
+    def apply(cls, backend: str, out_dir: Path | str, source: Path | str, run_result: RunResult) -> tuple[int, list[str]]:
+        out_dir = out_dir if isinstance(out_dir, Path) else Path(str(out_dir))
+        source = source if isinstance(source, Path) else Path(str(source))
+        if run_result.returncode is None:
             return 0, []
         test_source = TestOracleFallback._test_source_path(backend, out_dir, source)
         if not test_source.exists():
@@ -264,9 +741,9 @@ class TestMockFallback:
         except OSError as exc:
             return 0, [f"Mock fallback skipped: cannot read {test_source}: {exc}"]
 
-        failures = cls.mock_failures(run_result)
+        failures = cls.mock_failures(run_result, test_source) + cls.observed_mock_calls(run_result, test_source)
         if not failures:
-            return 0, ["Mock fallback found no parseable mock failures."]
+            return 0, ["Mock fallback found no parseable mock failures or uninteresting mock-call warnings."]
 
         mock_info = cls._mock_info_map(test_source)
         updated = 0
@@ -277,6 +754,8 @@ class TestMockFallback:
             action = failure.get("action", "")
             if not test_name or not function or action not in {"add", "remove"}:
                 continue
+            if not cls._is_valid_mock_call_name(function):
+                continue
             if action == "remove":
                 text, changed = cls._remove_mock_expectation(text, test_name, function)
                 if changed:
@@ -285,7 +764,7 @@ class TestMockFallback:
                 else:
                     notes.append(f"Mock fallback could not remove expectation: {test_name} -> {function}.")
             else:
-                text, changed = cls._add_mock_expectation(text, backend, test_name, function, mock_info)
+                text, changed = cls._add_mock_expectation(text, backend, test_name, function, mock_info, failure.get("args") or [])
                 if changed:
                     updated += 1
                     notes.append(f"Mock fallback added missing expectation: {test_name} -> {function}.")
@@ -301,22 +780,61 @@ class TestMockFallback:
         return updated, notes
 
     @staticmethod
-    def mock_failures(run_result: RunResult) -> list[dict[str, str]]:
-        text = "\n".join(part for part in (run_result.stdout, run_result.stderr) if part)
+    def mock_failures(run_result: RunResult, test_source: Path | str | None = None) -> list[dict[str, str]]:
+        text = TestOracleFallback.backend_execution_text(run_result)
         if not text.strip():
             return []
+        source_text = ""
+        if test_source is not None:
+            try:
+                source_text = Path(str(test_source)).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                source_text = ""
+        test_source_name = Path(str(test_source)).name if test_source is not None else ""
         failures: list[dict[str, str]] = []
         current_test = ""
+        pending_failure_line: int | None = None
         cpputest_unfulfilled = False
         unexpected_context = False
+        failed_tests = TestOracleFallback.failed_test_names_from_text(text)
         lines = text.splitlines()
         for index, line in enumerate(lines):
             test_match = re.search(r"\bTEST(?:_F)?\s*\(\s*[^,]+,\s*([^)]+)\)", line)
             if test_match:
                 current_test = test_match.group(1).strip()
+            failure_test_match = re.search(r"Failure\s+in\s+TEST\(([^,]+),\s*([^)]+)\)", line, re.I)
+            if failure_test_match:
+                current_test = failure_test_match.group(2).strip()
             run_match = re.search(r"^\[\s*RUN\s*\]\s+(.+)$", line)
             if run_match:
                 current_test = run_match.group(1).strip().rsplit(".", 1)[-1]
+            line_match = TestOracleFallback._output_cpp_line_match(line)
+            if line_match:
+                failure_file, failure_line = line_match
+                if TestOracleFallback._is_same_output_source(failure_file, test_source_name):
+                    pending_failure_line = failure_line
+                    mapped = TestOracleFallback._test_name_at_line(source_text, pending_failure_line)
+                    if mapped:
+                        current_test = mapped
+                else:
+                    # GMock VerifyAndClear may report from TearDown/stubs.cpp; keep the active [ RUN ] testcase.
+                    pending_failure_line = None
+
+            # Generated harnesses may assert stub call counters explicitly:
+            #   Expected: (TestingMate_Foo_CallCount()) > (0U), actual: 0 vs 0
+            # That is semantically the same as an unreachable expected mock call
+            # for this path, so remove the expectation from the owning testcase.
+            if "TestingMate_" in line and "CallCount" in line and re.search(r"actual:\s*0\s+vs\s+0", line, re.I):
+                mapped_test = (
+                    current_test
+                    or TestOracleFallback._test_name_at_line(source_text, pending_failure_line)
+                    or TestOracleFallback._next_failed_test_name(lines, index + 1)
+                )
+                for call_match in re.finditer(r"TestingMate_([A-Za-z_]\w*)_CallCount\s*\(\s*\)", line):
+                    function = call_match.group(1)
+                    if mapped_test:
+                        failures.append({"test": mapped_test, "function": function, "action": "remove"})
+                continue
 
             if "EXPECTED calls that WERE NOT fulfilled" in line:
                 cpputest_unfulfilled = True
@@ -327,8 +845,13 @@ class TestMockFallback:
                 continue
             if cpputest_unfulfilled:
                 call_match = re.search(r"^\s*([A-Za-z_]\w*)\s*->", line)
-                if call_match and current_test:
-                    failures.append({"test": current_test, "function": call_match.group(1), "action": "remove"})
+                mapped_test = (
+                    current_test
+                    or TestOracleFallback._test_name_at_line(source_text, pending_failure_line)
+                    or TestOracleFallback._next_failed_test_name(lines, index + 1)
+                )
+                if call_match and mapped_test:
+                    failures.append({"test": mapped_test, "function": call_match.group(1), "action": "remove"})
                 continue
 
             lower = line.lower()
@@ -337,38 +860,213 @@ class TestMockFallback:
                 line,
                 re.I,
             )
-            if unexpected_direct and current_test:
-                failures.append({"test": current_test, "function": unexpected_direct.group(1), "action": "add"})
+            mapped_test = (
+                current_test
+                or TestOracleFallback._test_name_at_line(source_text, pending_failure_line)
+                or TestOracleFallback._next_failed_test_name(lines, index + 1)
+            )
+            if unexpected_direct and mapped_test:
+                failures.append({"test": mapped_test, "function": unexpected_direct.group(1), "action": "add"})
                 continue
             if "unexpected mock function call" in lower or ("mock failure" in lower and "unexpected" in lower):
                 unexpected_context = True
             if unexpected_context:
-                call_match = re.search(r"(?:Function call:\s*|^\s*)([A-Za-z_]\w*)\s*(?:\(|->)", line)
-                if call_match and current_test and call_match.group(1) not in {"Mock", "Function"}:
-                    failures.append({"test": current_test, "function": call_match.group(1), "action": "add"})
+                call_match = re.search(r"(?:Function call:\s*|^\s*)([A-Za-z_]\w*)\s*(?:\(|->|\b)", line)
+                mapped_test = (
+                    current_test
+                    or TestOracleFallback._test_name_at_line(source_text, pending_failure_line)
+                    or TestOracleFallback._next_failed_test_name(lines, index + 1)
+                )
+                if call_match and mapped_test and call_match.group(1) not in {"Mock", "Function", "FunctionCall"}:
+                    failures.append({"test": mapped_test, "function": call_match.group(1), "action": "add"})
                     unexpected_context = False
                     continue
                 if index + 1 < len(lines):
-                    next_match = re.search(r"^\s*([A-Za-z_]\w*)\s*(?:\(|->)", lines[index + 1])
-                    if next_match and current_test:
-                        failures.append({"test": current_test, "function": next_match.group(1), "action": "add"})
+                    next_match = re.search(r"^\s*(?:Function call:\s*)?([A-Za-z_]\w*)\s*(?:\(|->|\b)", lines[index + 1])
+                    mapped_test = (
+                        current_test
+                        or TestOracleFallback._test_name_at_line(source_text, pending_failure_line)
+                        or TestOracleFallback._next_failed_test_name(lines, index + 2)
+                    )
+                    if next_match and mapped_test and next_match.group(1) not in {"Mock", "Function", "FunctionCall"}:
+                        failures.append({"test": mapped_test, "function": next_match.group(1), "action": "add"})
                         unexpected_context = False
                         continue
 
-            if "actual: never called" in lower:
-                window = "\n".join(lines[max(0, index - 8): index + 1])
-                for call_match in re.finditer(r"EXPECT_CALL\([^,]+,\s*([A-Za-z_]\w*)\s*\(", window):
-                    if current_test:
-                        failures.append({"test": current_test, "function": call_match.group(1), "action": "remove"})
+            if "actual function call count doesn't match" in lower and "expect_call" in lower:
+                for function in TestMockFallback._gmock_expect_call_functions(line):
+                    mapped_test = (
+                        current_test
+                        or TestOracleFallback._test_name_at_line(source_text, pending_failure_line)
+                        or TestOracleFallback._next_failed_test_name(lines, index + 1)
+                    )
+                    if mapped_test:
+                        failures.append({"test": mapped_test, "function": function, "action": "remove"})
+
+            if "actual: never called" in lower or "unsatisfied and active" in lower:
+                window = "\n".join(lines[max(0, index - 12): min(len(lines), index + 3)])
+                for function in TestMockFallback._gmock_expect_call_functions(window):
+                    mapped_test = (
+                        current_test
+                        or TestOracleFallback._test_name_at_line(source_text, pending_failure_line)
+                        or TestOracleFallback._next_failed_test_name(lines, index + 1)
+                    )
+                    if mapped_test:
+                        failures.append({"test": mapped_test, "function": function, "action": "remove"})
 
         unique: list[dict[str, str]] = []
         seen: set[tuple[str, str, str]] = set()
         for item in failures:
+            if not TestMockFallback._is_valid_mock_call_name(item.get("function", "")):
+                continue
+            if failed_tests and not TestOracleFallback._test_matches_failure_set(item.get("test", ""), failed_tests):
+                continue
             key = (item["test"], item["function"], item["action"])
             if key not in seen:
                 unique.append(item)
                 seen.add(key)
         return unique
+
+    @staticmethod
+    def observed_mock_calls(run_result: RunResult, test_source: Path | str | None = None) -> list[dict[str, object]]:
+        """Parse GoogleMock uninteresting-call warnings and keep exact observed arguments.
+
+        These warnings are emitted for calls that happened without a matching
+        EXPECT_CALL.  They are not hard failures by themselves, but they are
+        valuable fallback evidence: the generated testcase should explicitly
+        expect the mock call and preserve the parameter values that selected the
+        branch.
+        """
+        text = TestOracleFallback.backend_execution_text(run_result)
+        if not text.strip():
+            return []
+        source_text = ""
+        if test_source is not None:
+            try:
+                source_text = Path(str(test_source)).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                source_text = ""
+        test_source_name = Path(str(test_source)).name if test_source is not None else ""
+        observations: list[dict[str, object]] = []
+        current_test = ""
+        pending_failure_line: int | None = None
+        warning_context = False
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            run_match = re.search(r"^\[\s*RUN\s*\]\s+(.+)$", line)
+            if run_match:
+                current_test = run_match.group(1).strip().rsplit(".", 1)[-1]
+                pending_failure_line = None
+                warning_context = False
+            line_match = TestOracleFallback._output_cpp_line_match(line)
+            if line_match:
+                failure_file, failure_line = line_match
+                if TestOracleFallback._is_same_output_source(failure_file, test_source_name):
+                    pending_failure_line = failure_line
+                    mapped = TestOracleFallback._test_name_at_line(source_text, pending_failure_line)
+                    if mapped:
+                        current_test = mapped
+                else:
+                    pending_failure_line = None
+            lower = line.lower()
+            if "uninteresting mock function call" in lower:
+                warning_context = True
+            if warning_context or "function call:" in lower:
+                parsed = TestMockFallback._parse_gmock_function_call(line)
+                if parsed:
+                    function, args = parsed
+                    mapped_test = (
+                        current_test
+                        or TestOracleFallback._test_name_at_line(source_text, pending_failure_line)
+                        or TestOracleFallback._next_failed_test_name(lines, index + 1)
+                    )
+                    if mapped_test:
+                        observations.append({"test": mapped_test, "function": function, "action": "add", "args": args})
+                    warning_context = False
+                    continue
+        unique: list[dict[str, object]] = []
+        seen: set[tuple[str, str, tuple[str, ...]]] = set()
+        for item in observations:
+            if not TestMockFallback._is_valid_mock_call_name(item.get("function", "")):
+                continue
+            key = (str(item.get("test") or ""), str(item.get("function") or ""), tuple(str(v) for v in item.get("args", []) or []))
+            if key not in seen:
+                unique.append(item)
+                seen.add(key)
+        return unique
+
+    @staticmethod
+    def _parse_gmock_function_call(line: str) -> tuple[str, list[str]] | None:
+        match = re.search(r"Function call:\s*([A-Za-z_]\w*)\s*\((.*)\)\s*$", html.unescape(str(line or "")))
+        if not match:
+            return None
+        return match.group(1), TestMockFallback._split_mock_call_args(match.group(2))
+
+    @staticmethod
+    def _split_mock_call_args(raw: str) -> list[str]:
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        args: list[str] = []
+        current: list[str] = []
+        depth = 0
+        quote = ""
+        escape = False
+        for ch in text:
+            if quote:
+                current.append(ch)
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote:
+                    quote = ""
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                current.append(ch)
+                continue
+            if ch in "([{<":
+                depth += 1
+            elif ch in ")]}>":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                args.append("".join(current).strip())
+                current = []
+                continue
+            current.append(ch)
+        if current or text.endswith(","):
+            args.append("".join(current).strip())
+        return args
+
+    @staticmethod
+    def _literal_from_mock_arg(raw: str) -> str:
+        literal = TestOracleFallback._literal_from_observed_value(raw)
+        if literal:
+            return literal
+        clean = html.unescape(str(raw or "")).strip()
+        if clean in {"NULL", "nullptr", "0"}:
+            return "0" if clean == "0" else clean
+        if re.fullmatch(r"0[xX][0-9A-Fa-f]+", clean):
+            return clean
+        if re.fullmatch(r"[A-Za-z_]\w*", clean) or re.fullmatch(r"&[A-Za-z_]\w*", clean):
+            return clean
+        return ""
+
+    @staticmethod
+    def _gmock_expect_call_functions(text: str) -> list[str]:
+        result: list[str] = []
+        compact = " ".join(str(text or "").split())
+        patterns = [
+            r"EXPECT_CALL\s*\(\s*TestingMate_Mock\s*\(\s*\)\s*,\s*([A-Za-z_]\w*)\s*\(",
+            r"EXPECT_CALL\s*\([^,]+,\s*([A-Za-z_]\w*)\s*\(",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, compact):
+                name = match.group(1)
+                if TestMockFallback._is_valid_mock_call_name(name) and name not in result:
+                    result.append(name)
+        return result
 
     @staticmethod
     def _remove_mock_expectation(text: str, test_name: str, function: str) -> tuple[str, bool]:
@@ -398,26 +1096,49 @@ class TestMockFallback:
         test_name: str,
         function: str,
         mock_info: dict[str, dict[str, str]],
+        observed_args: list[str] | tuple[str, ...] | None = None,
     ) -> tuple[str, bool]:
         span = TestOracleFallback._test_block_span(text, test_name)
         if span is None:
             return text, False
         start, end = span
         block = text[start:end]
+        if not TestMockFallback._is_valid_mock_call_name(function):
+            return text, False
         safe = TestBackendGenerator._safe_identifier(function)
         if f'expectOneCall("{function}")' in block or f"EXPECT_CALL(TestingMate_Mock(), {safe}(" in block:
             return text, False
-        info = mock_info.get(safe, {})
+        info = mock_info.get(safe)
+        if info is None:
+            # Do not emit EXPECT_CALL for a name that is not present in the
+            # generated GMock harness. The model-level reconciler may persist
+            # the call so a later full regeneration can create a declaration,
+            # but direct source patching cannot safely update stubs.h here.
+            return text, False
+        observed_literals = {
+            idx: TestMockFallback._literal_from_mock_arg(str(raw))
+            for idx, raw in enumerate(observed_args or [])
+            if TestMockFallback._literal_from_mock_arg(str(raw))
+        }
         if backend == "CppUTest":
-            line = f'    mock().expectOneCall("{function}").ignoreOtherParameters();\n'
+            params = info.get("params", "")
+            symbol = StubSymbol(name=function, return_type=info.get("return_type", "void"), params=params, kind="function")
+            param_expectations = TestBackendGenerator._cpputest_expected_param_chain(symbol, observed_literals)
+            ignore_params = ".ignoreOtherParameters()" if not param_expectations else ""
+            line = f'    mock().expectOneCall("{function}"){param_expectations}{ignore_params};\n'
         else:
             arity = int(info.get("arity") or 0)
-            args = ", ".join("::testing::_" for _ in range(arity))
+            matcher_items: list[str] = []
+            for idx in range(max(arity, len(observed_literals))):
+                literal = observed_literals.get(idx)
+                matcher_items.append(f"::testing::Eq({literal})" if literal is not None else "::testing::_")
+            args = ", ".join(matcher_items)
             ret = info.get("return_type", "void")
             if ret == "void":
                 line = f"    EXPECT_CALL(TestingMate_Mock(), {safe}({args}));\n"
             else:
-                line = f"    EXPECT_CALL(TestingMate_Mock(), {safe}({args})).WillOnce(::testing::Return({cls_default_return(ret)}));\n"
+                typed_ret = TestBackendGenerator._typed_value(ret, cls_default_return(ret))
+                line = f"    EXPECT_CALL(TestingMate_Mock(), {safe}({args})).WillOnce(::testing::Return({typed_ret}));\n"
         marker = re.search(r"(?m)^(\s*/\*\s*PRECONDITION\s*\*/\s*\n)", block)
         if marker:
             insert_at = marker.end()
@@ -440,7 +1161,7 @@ class TestMockFallback:
         for match in re.finditer(r"MOCK_METHOD\s*\(\s*([^,]+?)\s*,\s*([A-Za-z_]\w*)\s*,\s*\((.*?)\)\s*,", text, re.S):
             params = match.group(3).strip()
             arity = 0 if not params else len(StubHarnessEngine._split_params(params))
-            result[match.group(2)] = {"return_type": " ".join(match.group(1).split()), "arity": str(arity)}
+            result[match.group(2)] = {"return_type": " ".join(match.group(1).split()), "arity": str(arity), "params": params}
         return result
 
 
@@ -459,36 +1180,92 @@ def cls_default_return(return_type: str) -> str:
 
 
 class TestBackendGenerator:
+    NON_MOCK_CALL_NAMES = TestCaseRunReconciler.NON_MOCK_CALL_NAMES
+
+    @classmethod
+    def _is_valid_mock_call_name(cls, name: object, stubbed_calls: set[str] | None = None) -> bool:
+        return TestCaseRunReconciler._is_valid_mock_call_name(name, stubbed_calls)
+
     include_pattern = re.compile(r"^\s*#\s*include\s*[<\"]([^>\"]+)[>\"]", re.M)
 
     def __init__(self, out_dir: Path, include_dirs: list[str] | None = None):
-        self.out_dir = out_dir
-        self.include_dirs = [Path(item).expanduser() for item in (include_dirs or []) if item]
+        self.out_dir = self._as_path(out_dir)
+        self.include_dirs = [self._as_path(item).expanduser() for item in (include_dirs or []) if item]
         self.out_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _as_path(value: Path | str) -> Path:
+        return value if isinstance(value, Path) else Path(str(value))
+
+    @classmethod
+    def _as_path_list(cls, values: list[Path | str] | tuple[Path | str, ...] | None) -> list[Path]:
+        return [cls._as_path(item).expanduser() for item in (values or []) if item]
+
+    @classmethod
+    def _safe_resolve(cls, value: Path | str) -> Path:
+        path = cls._as_path(value).expanduser()
+        try:
+            return path.resolve()
+        except OSError:
+            return path
 
     def write_backend(
         self,
         backend: str,
-        source: Path,
+        source: Path | str,
         functions: list[FunctionInfo],
         cases: list[TestCase],
         level: str,
-        unit_sources: list[Path] | None = None,
+        unit_sources: list[Path | str] | None = None,
         code_database: CodeDatabase | None = None,
     ) -> list[Path]:
+        # GUI/CLI/project JSON code can pass Windows paths as strings. Normalize
+        # at the public boundary so downstream path operations never fail with
+        # ``'str' object has no attribute 'resolve'``.
+        source_path = self._as_path(source).expanduser()
+        normalized_unit_sources = self._as_path_list(unit_sources) or [source_path]
         # Keep native LLVM MC/DC instrumentation strictly tied to the selected
         # coverage objective. C0/C1 generation must not compile or report with
         # -fcoverage-mcdc, even when the clang/llvm-cov backend is used.
         enable_mcdc = self._cases_request_mcdc(cases)
         if backend == "CppUTest":
-            return self._write_cpputest(source, functions, cases, unit_sources or [source], code_database, enable_mcdc)
+            return self._write_cpputest(source_path, functions, cases, normalized_unit_sources, code_database, enable_mcdc)
         if backend == "GoogleTest":
-            return self._write_gtest(source, functions, cases, unit_sources or [source], code_database, enable_mcdc)
+            return self._write_gtest(source_path, functions, cases, normalized_unit_sources, code_database, enable_mcdc)
         return []
 
     @staticmethod
     def _cases_request_mcdc(cases: list[TestCase]) -> bool:
         return any(str(case.coverage).strip().upper() in {"MC/DC", "MCDC"} for case in cases)
+
+    @staticmethod
+    def _dedupe_cases(cases: list[TestCase]) -> list[TestCase]:
+        from testing_mate.vector_generator import TestCaseRegistry
+
+        TestCaseRegistry.ensure_unique_test_ids(cases)
+        manual_keys = (
+            "__manual_precondition_code",
+            "__manual_action_code",
+            "__manual_expected_code",
+            "__manual_teardown_code",
+            "__manual_steps_only",
+        )
+        seen: set[str] = set()
+        result: list[TestCase] = []
+        for case in cases:
+            signature = TestVectorGenerator._vector_signature(case.function, case.values or {})
+            manual_parts = [
+                f"{key}={(case.values or {}).get(key)}"
+                for key in manual_keys
+                if (case.values or {}).get(key)
+            ]
+            if manual_parts:
+                signature = "|".join([signature, *manual_parts])
+            if signature in seen:
+                continue
+            seen.add(signature)
+            result.append(case)
+        return result
 
     def _write_cpputest(
         self,
@@ -502,15 +1279,18 @@ class TestBackendGenerator:
         test_dir = self.out_dir / f"{source.stem}_cpputest"
         test_dir.mkdir(parents=True, exist_ok=True)
         source_env_dir = test_dir / "src"
-        harness_sources = [source]
-        copied = self._copy_target_source(source, source_env_dir)
+        include_env_dir = test_dir / "stub" / "include"
+        harness_sources = self._ordered_unit_sources(source, unit_sources)
+        harness_include_dirs = self._workspace_include_discovery_roots(source, harness_sources)
+        copied = self._copy_workspace_files(source, harness_sources, source_env_dir, include_env_dir)
         test_file = test_dir / f"{source.stem}_cpputest_test.cpp"
         cmake_file = test_dir / "CMakeLists.txt"
         runner = test_dir / "run_cpputest.sh"
-        link_sources = self._link_unit_sources(harness_sources)
-        stub_result = StubHarnessEngine().write_for_backend("CppUTest", test_dir, source, functions, cases, harness_sources, self.include_dirs, code_database)
-        c_sources = " ".join([*(f"src/{path.name}" for path in link_sources), *self._relative_cmake_paths(stub_result.source_files, test_dir)])
-        include_dirs = self._cmake_include_dirs(source, harness_sources, [Path("src"), Path("stub/include")])
+        direct_source_include = self._includes_source_directly(source, harness_sources)
+        link_sources = self._workspace_link_sources(source, source_env_dir, direct_source_include)
+        stub_result = StubHarnessEngine().write_for_backend("CppUTest", test_dir, source, functions, cases, harness_sources, harness_include_dirs, code_database)
+        c_sources = " ".join([*self._cmake_source_paths(link_sources), *self._relative_cmake_paths(stub_result.source_files, test_dir)])
+        include_dirs = self._cmake_include_dirs([Path("stub/include")])
         test_file.write_text(
             self._cpp_test_source("CppUTest", source, functions, cases, harness_sources, stub_result.stub_symbols),
             encoding="utf-8",
@@ -567,7 +1347,7 @@ class TestBackendGenerator:
             ),
             encoding="utf-8",
         )
-        runner.write_text(self._cmake_runner(source.stem + "_cpputest", f"src/{source.name}", enable_mcdc), encoding="utf-8")
+        runner.write_text(self._cmake_runner(source.stem + "_cpputest", self._workspace_runner_target_source(source), enable_mcdc), encoding="utf-8")
         return [*copied, *stub_result.generated_paths, test_file, cmake_file, runner]
 
     def _write_gtest(
@@ -582,15 +1362,18 @@ class TestBackendGenerator:
         test_dir = self.out_dir / f"{source.stem}_gtest"
         test_dir.mkdir(parents=True, exist_ok=True)
         source_env_dir = test_dir / "src"
-        harness_sources = [source]
-        copied = self._copy_target_source(source, source_env_dir)
+        include_env_dir = test_dir / "stub" / "include"
+        harness_sources = self._ordered_unit_sources(source, unit_sources)
+        harness_include_dirs = self._workspace_include_discovery_roots(source, harness_sources)
+        copied = self._copy_workspace_files(source, harness_sources, source_env_dir, include_env_dir)
         test_file = test_dir / f"{source.stem}_gtest_test.cpp"
         cmake_file = test_dir / "CMakeLists.txt"
         runner = test_dir / "run_gtest.sh"
-        link_sources = self._link_unit_sources(harness_sources)
-        stub_result = StubHarnessEngine().write_for_backend("GoogleTest", test_dir, source, functions, cases, harness_sources, self.include_dirs, code_database)
-        c_sources = " ".join([*(f"src/{path.name}" for path in link_sources), *self._relative_cmake_paths(stub_result.source_files, test_dir)])
-        include_dirs = self._cmake_include_dirs(source, harness_sources, [Path("src"), Path("stub/include")])
+        direct_source_include = self._includes_source_directly(source, harness_sources)
+        link_sources = self._workspace_link_sources(source, source_env_dir, direct_source_include)
+        stub_result = StubHarnessEngine().write_for_backend("GoogleTest", test_dir, source, functions, cases, harness_sources, harness_include_dirs, code_database)
+        c_sources = " ".join([*self._cmake_source_paths(link_sources), *self._relative_cmake_paths(stub_result.source_files, test_dir)])
+        include_dirs = self._cmake_include_dirs([Path("stub/include")])
         test_file.write_text(
             self._cpp_test_source("GoogleTest", source, functions, cases, harness_sources, stub_result.stub_symbols),
             encoding="utf-8",
@@ -647,37 +1430,140 @@ class TestBackendGenerator:
             ),
             encoding="utf-8",
         )
-        runner.write_text(self._cmake_runner(source.stem + "_gtest", f"src/{source.name}", enable_mcdc), encoding="utf-8")
+        runner.write_text(self._cmake_runner(source.stem + "_gtest", self._workspace_runner_target_source(source), enable_mcdc), encoding="utf-8")
         return [*copied, *stub_result.generated_paths, test_file, cmake_file, runner]
 
-    def _copy_target_source(self, source: Path, test_dir: Path) -> list[Path]:
-        copied: list[Path] = []
-        if not source.exists() or not source.is_file():
-            return copied
-        test_dir.mkdir(parents=True, exist_ok=True)
-        target = test_dir / source.name
-        shutil.copy2(source, target)
-        copied.append(target)
-        return copied
+    @classmethod
+    def _ordered_unit_sources(cls, source: Path | str, unit_sources: list[Path | str] | None) -> list[Path]:
+        ordered: list[Path] = []
+        seen: set[str] = set()
+        for raw_item in [source, *(unit_sources or [])]:
+            if raw_item is None:
+                continue
+            item = cls._as_path(raw_item).expanduser()
+            key = str(cls._safe_resolve(item) if item.exists() else item).lower()
+            if key not in seen:
+                seen.add(key)
+                ordered.append(item)
+        return ordered
 
-    def _copy_unit_files(self, sources: list[Path], test_dir: Path) -> list[Path]:
+    def _includes_source_directly(self, source: Path, unit_sources: list[Path]) -> bool:
+        include_name = self._guess_header(source, unit_sources)
+        return source.suffix.lower() in C_SOURCE_EXTENSIONS and Path(include_name).name == source.name
+
+    def _workspace_link_sources(self, source: Path | str, source_env_dir: Path, direct_source_include: bool = False) -> list[Path]:
+        """Return source files compiled by the generated backend project.
+
+        The workspace model intentionally compiles only the selected target
+        source copied under ``src/``. Other project C/C++ files are treated as
+        dependencies and are represented by generated stubs, so they are not
+        copied or linked into the backend executable.
+        """
+        source_path = self._as_path(source).expanduser()
+        if source_path.suffix.lower() not in C_SOURCE_EXTENSIONS:
+            return []
+        if self._defines_application_main(source_path):
+            return []
+        if direct_source_include:
+            return []
+        return [Path("src") / source_path.name]
+
+    @classmethod
+    def _workspace_runner_target_source(cls, source: Path | str) -> str:
+        """Coverage target path used inside the generated backend folder."""
+        source_path = cls._as_path(source).expanduser()
+        return f"src/{source_path.name}".replace("\\", "/")
+
+    def _copy_workspace_files(
+        self,
+        source: Path | str,
+        unit_sources: list[Path | str],
+        source_env_dir: Path,
+        include_env_dir: Path,
+    ) -> list[Path]:
+        """Create the isolated backend workspace.
+
+        Layout:
+        - ``src/`` receives only the selected target source file.
+        - ``stub/include/`` receives headers required by the target source and
+          its copied header dependency chain.
+
+        Original project include directories are used only as discovery roots
+        while copying. Generated CMake does not expose those original include
+        directories to the compiler, which makes the backend project portable
+        and prevents accidental direct compilation against production folders.
+        """
         copied: list[Path] = []
         seen: set[Path] = set()
         queue: list[Path] = []
-        for source in sources:
-            for path in (source, source.with_suffix(".h")):
-                self._copy_project_file(path, test_dir, copied, seen, queue, preserve_from=None)
+        scanned: set[Path] = set()
+
+        source_path = self._as_path(source).expanduser()
+        normalized_sources = self._as_path_list(unit_sources)
+
+        local_source = self._copy_target_source(source_path, source_env_dir)
+        copied.extend(local_source)
+
+        if source_path.exists() and source_path.is_file():
+            queue.append(self._safe_resolve(source_path))  # scan includes from original source
+
+        # Prefer headers associated with the target source, then any explicitly
+        # supplied header unit files. Do not copy dependency C/C++ implementation
+        # files into the workspace.
+        for path in self._unit_header_candidates(source_path):
+            self._copy_project_file(path, include_env_dir, copied, seen, queue, preserve_from=None)
+        for unit in normalized_sources:
+            if unit.suffix.lower() in HEADER_SOURCE_EXTENSIONS:
+                self._copy_project_file(unit, include_env_dir, copied, seen, queue, preserve_from=self._matching_include_root(unit, normalized_sources))
+            elif unit != source_path:
+                for path in self._unit_header_candidates(unit):
+                    self._copy_project_file(path, include_env_dir, copied, seen, queue, preserve_from=self._matching_include_root(path, normalized_sources))
+
         index = 0
         while index < len(queue):
             path = queue[index]
             index += 1
+            resolved_path = self._safe_resolve(path) if path.exists() else path
+            if resolved_path in scanned:
+                continue
+            scanned.add(resolved_path)
             for include_name in self._extract_includes(path):
-                resolved = self._resolve_include(include_name, path.parent, sources)
-                if resolved:
-                    self._copy_project_file(resolved, test_dir, copied, seen, queue, preserve_from=self._matching_include_root(resolved, sources))
+                resolved = self._resolve_include(include_name, path.parent, normalized_sources)
+                if resolved and resolved.suffix.lower() in HEADER_SOURCE_EXTENSIONS:
+                    self._copy_project_file(
+                        resolved,
+                        include_env_dir,
+                        copied,
+                        seen,
+                        queue,
+                        preserve_from=self._matching_include_root(resolved, normalized_sources),
+                    )
         return copied
 
+    def _copy_target_source(self, source: Path | str, source_env_dir: Path) -> list[Path]:
+        copied: list[Path] = []
+        source = self._as_path(source).expanduser()
+        if not source.exists() or not source.is_file() or source.suffix.lower() not in C_SOURCE_EXTENSIONS:
+            return copied
+        source_env_dir.mkdir(parents=True, exist_ok=True)
+        target = source_env_dir / source.name
+        shutil.copy2(source, target)
+        copied.append(target)
+        return copied
+
+    @staticmethod
+    def _unit_header_candidates(source: Path) -> list[Path]:
+        candidates: list[Path] = []
+        source = TestBackendGenerator._as_path(source).expanduser()
+        if source.suffix.lower() in HEADER_SOURCE_EXTENSIONS:
+            candidates.append(source)
+        for suffix in sorted(HEADER_SOURCE_EXTENSIONS):
+            candidates.append(source.with_suffix(suffix))
+        return candidates
+
     def _link_unit_sources(self, sources: list[Path]) -> list[Path]:
+        # Kept for compatibility with any external callers. Backend generation
+        # now uses _workspace_link_sources() to compile only the local UUT copy.
         return [
             source
             for source in sources
@@ -705,13 +1591,16 @@ class TestBackendGenerator:
     ) -> None:
         if not path.exists() or not path.is_file():
             return
-        resolved = path.resolve()
+        if path.suffix.lower() not in HEADER_SOURCE_EXTENSIONS:
+            return
+        path = self._as_path(path).expanduser()
+        resolved = self._safe_resolve(path)
         if resolved in seen:
             return
         seen.add(resolved)
         if preserve_from:
             try:
-                relative = resolved.relative_to(preserve_from.resolve())
+                relative = resolved.relative_to(self._safe_resolve(preserve_from))
             except ValueError:
                 relative = Path(path.name)
         else:
@@ -720,7 +1609,7 @@ class TestBackendGenerator:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, target)
         copied.append(target)
-        if path.suffix.lower() in {".c", ".h", ".hpp"}:
+        if path.suffix.lower() in HEADER_SOURCE_EXTENSIONS:
             queue.append(resolved)
 
     def _cpp_test_source(
@@ -761,7 +1650,7 @@ class TestBackendGenerator:
                 "",
             ])
         grouped: dict[str, list[TestCase]] = {}
-        for case in cases:
+        for case in self._dedupe_cases(cases):
             grouped.setdefault(case.function, []).append(case)
         for fn in functions:
             if fn.return_type.strip().startswith("static"):
@@ -774,7 +1663,9 @@ class TestBackendGenerator:
             pointer_writes = self._written_pointer_observables(fn)
             global_type_map = self._global_variable_type_map(unit_sources)
             global_type_map.update(self._function_global_variable_type_map(fn))
-            global_writes = self._filter_global_names(fn, self._written_global_names(fn), global_type_map)
+            static_global_names = self._static_global_variable_names(unit_sources)
+            global_type_map = {name: ctype for name, ctype in global_type_map.items() if name not in static_global_names}
+            global_writes = self._filter_global_names(fn, self._written_global_names(fn), global_type_map, static_global_names)
             inferred_case_expectations = {
                 case.test_id: self._merge_expectation_sources(
                     self._infer_case_expected_literals_from_ast_or_source(fn, case, global_writes),
@@ -785,26 +1676,42 @@ class TestBackendGenerator:
             inferred_global_names: set[str] = set()
             inferred_output_names: set[str] = set()
             for inferred in inferred_case_expectations.values():
-                inferred["globals"] = self._filter_global_literals(fn, inferred.get("globals") or {}, global_type_map)
+                inferred["globals"] = self._filter_global_literals(fn, inferred.get("globals") or {}, global_type_map, static_global_names)
                 inferred_global_names.update((inferred.get("globals") or {}).keys())
                 inferred_output_names.update((inferred.get("outputs") or {}).keys())
-            global_writes = self._filter_global_names(fn, set(global_writes) | inferred_global_names, global_type_map)
-            suite_globals = self._filter_global_names(fn, self._suite_lifecycle_global_names(fn_cases, global_writes) | inferred_global_names, global_type_map)
+            global_writes = self._filter_global_names(fn, set(global_writes) | inferred_global_names, global_type_map, static_global_names)
+            suite_globals = self._filter_global_names(
+                fn,
+                self._suite_lifecycle_global_names(fn_cases, global_writes) | inferred_global_names,
+                global_type_map,
+                static_global_names,
+            )
+            param_by_name = {param.name: param for param in fn.parameters}
+            suite_expected_outputs = set(inferred_output_names)
+            for case in fn_cases:
+                suite_expected_outputs.update(self._expected_output_literals(case).keys())
 
             fixture_declarations: list[str] = []
             declared_fixture_names: set[str] = set()
 
-            def add_fixture_declaration(c_type: str, name: str) -> None:
+            def add_fixture_declaration(c_type: str, name: str, array_suffix: str = "") -> str:
                 # Every variable assigned in setup/teardown/PRECONDITION/ACTION must be
                 # declared once in the test group before any generated assignment uses it.
+                # Source locals are also materialized as fixture members so expected
+                # expressions such as `ret`, `status`, or `result` never become
+                # undeclared in the generated test translation unit.
                 safe_name = self._safe_identifier(name)
                 if not self._is_c_identifier(safe_name) or safe_name in declared_fixture_names:
-                    return
+                    return ""
                 safe_type = self._clean_fixture_type(c_type, defaults="uint8", mutable=True)
                 if not self._is_valid_fixture_type(safe_type):
                     safe_type = "uint8"
-                fixture_declarations.append(f"{safe_type} {safe_name};")
+                suffix = " ".join(str(array_suffix or "").split())
+                if suffix and not re.fullmatch(r"(?:\[[^;{}()]*\]\s*)+", suffix):
+                    suffix = ""
+                fixture_declarations.append(f"{safe_type} {safe_name}{suffix};")
                 declared_fixture_names.add(safe_name)
+                return safe_name
 
             setup_reset_lines: list[str] = ["TestingMate_ResetStubs();", "TestingMate_AllowUnexpectedMockCalls();"]
             teardown_reset_lines: list[str] = ["TestingMate_VerifyAndClearMocks();", "TestingMate_ResetStubs();"]
@@ -839,17 +1746,67 @@ class TestBackendGenerator:
             call = f"{fn.name}({', '.join(call_args)})"
 
             return_fixture_name = ""
+            expected_return_fixture_name = ""
+            return_type = ""
             if not self._is_void_return_type(fn.return_type):
                 return_fixture_name = "actual_return"
+                expected_return_fixture_name = "expected_return"
                 return_type = self._return_fixture_type(fn)
                 add_fixture_declaration(return_type, return_fixture_name)
+                add_fixture_declaration(return_type, expected_return_fixture_name)
                 setup_reset_lines.append(f"{return_fixture_name} = {{}};")
+                setup_reset_lines.append(f"{expected_return_fixture_name} = {{}};")
                 teardown_reset_lines.append(f"{return_fixture_name} = {{}};")
+                teardown_reset_lines.append(f"{expected_return_fixture_name} = {{}};")
+
+            expected_output_fixtures: dict[str, str] = {}
+            for output_name in sorted(suite_expected_outputs):
+                root = self._normalize_observable_name(output_name).split(".", 1)[0]
+                param = param_by_name.get(root)
+                if param is None or param.kind != "pointer" or root in expected_output_fixtures:
+                    continue
+                fixture_name = f"expected_{pointer_fixtures.get(root, 'tm_' + self._safe_identifier(root))}"
+                expected_output_fixtures[root] = fixture_name
+                add_fixture_declaration(self._pointer_fixture_type(param), fixture_name)
+                setup_reset_lines.append(f"{fixture_name} = {{}};")
+                teardown_reset_lines.append(f"{fixture_name} = {{}};")
+
+            expected_global_fixtures: dict[str, str] = {}
+            for global_name in sorted(suite_globals):
+                if not self._is_c_identifier(global_name):
+                    continue
+                global_type = global_type_map.get(global_name, "uint8")
+                expected_name = f"expected_global_{self._safe_identifier(global_name)}"
+                expected_global_fixtures[global_name] = expected_name
+                add_fixture_declaration(global_type, expected_name)
+                typed_zero = self._typed_value(global_type, self._default_expected_literal(global_type))
+                setup_reset_lines.append(f"{global_name} = {typed_zero};")
+                setup_reset_lines.append(f"{expected_name} = {typed_zero};")
+                teardown_reset_lines.append(f"{global_name} = {typed_zero};")
+                teardown_reset_lines.append(f"{expected_name} = {typed_zero};")
+
+            # Materialize all non-static implementation locals as fixture members.
+            # Static locals belong to the UUT and must not be duplicated in the test fixture.
+            for spec in self._local_variable_fixture_specs(fn):
+                local_name = str(spec.get("name") or "")
+                local_type = str(spec.get("ctype") or "uint8")
+                array_suffix = str(spec.get("array") or "")
+                safe_local_name = add_fixture_declaration(local_type, local_name, array_suffix)
+                if not safe_local_name:
+                    continue
+                if array_suffix:
+                    setup_reset_lines.append(f"memset({safe_local_name}, 0, sizeof({safe_local_name}));")
+                    teardown_reset_lines.append(f"memset({safe_local_name}, 0, sizeof({safe_local_name}));")
+                else:
+                    setup_reset_lines.append(f"{safe_local_name} = {{}};")
+                    teardown_reset_lines.append(f"{safe_local_name} = {{}};")
 
             for local_name, local_type in self._suite_local_fixture_declarations(fn_cases, fn).items():
-                add_fixture_declaration(local_type, local_name)
-                setup_reset_lines.append(f"{local_name} = {{}};")
-                teardown_reset_lines.append(f"{local_name} = {{}};")
+                safe_local_name = add_fixture_declaration(local_type, local_name)
+                if not safe_local_name:
+                    continue
+                setup_reset_lines.append(f"{safe_local_name} = {{}};")
+                teardown_reset_lines.append(f"{safe_local_name} = {{}};")
 
             lines.extend(self._test_group_lines(backend, suite_name, fn_cases[0], fixture_declarations, setup_reset_lines, teardown_reset_lines))
 
@@ -873,6 +1830,8 @@ class TestBackendGenerator:
                     backend,
                     stubbed_calls,
                     stub_symbols_by_name,
+                    global_type_map,
+                    static_global_names,
                 )
                 lines.append("    /* PRECONDITION */")
                 lines.extend(precondition_lines if precondition_lines else ["    /* No explicit precondition values were generated. */"])
@@ -880,6 +1839,38 @@ class TestBackendGenerator:
                 if manual_precondition:
                     lines.append("    /* MANUAL PRECONDITION CODE */")
                     lines.extend(manual_precondition)
+                
+                values = {**self._fixit_input_literals(fn, case), **(case.values or {})}
+                expected_calls = self._case_stub_call_names(fn, case, stubbed_calls or set())
+                if expected_calls:
+                    lines.append(f"    /* MOCK EXPECTATIONS */")
+                lines.extend(self._stub_expectation_setup_lines(
+                    backend,
+                    expected_calls,
+                    values,
+                    stub_symbols_by_name or {},
+                    "    ",
+                ))                
+
+                inferred_expectations = inferred_case_expectations.get(case.test_id, {})
+                case_expected_outputs = set((inferred_expectations.get("outputs") or {}).keys()) | set(self._expected_output_literals(case).keys())
+                case_expected_globals = set((inferred_expectations.get("globals") or {}).keys()) | set(self._expected_global_literals(case).keys())
+                expected_setup_lines = self._case_expected_precondition_lines(
+                    case,
+                    return_type,
+                    expected_return_fixture_name,
+                    case_expected_outputs,
+                    expected_output_fixtures,
+                    param_by_name,
+                    inferred_expectations,
+                    expected_global_fixtures,
+                    global_type_map,
+                    "    ",
+                    struct_field_types,
+                )
+                if expected_setup_lines:
+                    lines.append("    /* EXPECTED RESULTS SETUP */")
+                    lines.extend(expected_setup_lines)
 
                 lines.append("    /* ACTIONS */")
                 manual_action = self._manual_code_lines(case, "__manual_action_code", "    ")
@@ -892,12 +1883,33 @@ class TestBackendGenerator:
                     lines.append(f"    {return_fixture_name} = {call};")
                 expected_call_lines = self._stub_call_assertion_lines(
                     backend,
-                    self._expected_stub_call_names(case, stubbed_calls),
+                    self._case_stub_call_names(fn, case, stubbed_calls),
                     "    ",
                 )
-                if expected_call_lines:
-                    lines.append("    /* EXPECTED CALLS */")
-                    lines.extend(expected_call_lines)
+                # if expected_call_lines:
+                #     lines.append("    /* EXPECTED CALLS */")
+                #     lines.extend(expected_call_lines)
+                assertion_lines = self._case_expected_assertion_lines(
+                    backend,
+                    case,
+                    fn,
+                    return_type,
+                    expected_return_fixture_name,
+                    return_fixture_name,
+                    case_expected_outputs,
+                    expected_output_fixtures,
+                    pointer_fixtures,
+                    param_by_name,
+                    inferred_expectations,
+                    case_expected_globals,
+                    expected_global_fixtures,
+                    global_type_map,
+                    "    ",
+                    struct_field_types,
+                )
+                if assertion_lines:
+                    lines.append("    /* EXPECTED RESULTS */")
+                    lines.extend(assertion_lines)
                 manual_expected = self._manual_code_lines(case, "__manual_expected_code", "    ")
                 if manual_expected:
                     lines.append("    /* MANUAL EXPECTED CODE */")
@@ -926,15 +1938,27 @@ class TestBackendGenerator:
         return lines
 
     @staticmethod
-    def _state_setup_lines(case: TestCase | dict, indent: str = "") -> list[str]:
+    def _state_setup_lines(
+        case: TestCase | dict,
+        indent: str = "",
+        global_type_map: dict[str, str] | None = None,
+        blocked_global_names: set[str] | None = None,
+    ) -> list[str]:
         values = case if isinstance(case, dict) else (case.values or {})
+        global_type_map = global_type_map or {}
+        blocked_global_names = blocked_global_names or set()
         lines: list[str] = []
         for key, value in sorted(values.items()):
             for prefix in ("__global.", "__set_global.", "__input_global.", "__setup_global.", "setup.global."):
                 if key.startswith(prefix):
                     symbol = key[len(prefix) :]
+                    if symbol in blocked_global_names:
+                        break
+                    if global_type_map and symbol not in global_type_map:
+                        break
                     if TestBackendGenerator._is_c_identifier(symbol):
-                        lines.append(f"{indent}{symbol} = {value};")
+                        ctype = global_type_map.get(symbol, TestBackendGenerator._fixture_type_from_value(str(value)))
+                        lines.append(f"{indent}{symbol} = {TestBackendGenerator._typed_value(ctype, str(value))};")
                     break
         return lines
 
@@ -950,28 +1974,31 @@ class TestBackendGenerator:
             return []
         lines: list[str] = []
         for name in call_names:
+            if not TestBackendGenerator._is_valid_mock_call_name(name, set(stub_symbols)):
+                continue
             symbol = stub_symbols.get(name)
+            if symbol is None or getattr(symbol, "kind", "function") != "function":
+                continue
             safe = TestBackendGenerator._safe_identifier(name)
+            has_stub_return = f"__stub_return.{name}" in values
             value = values.get(f"__stub_return.{name}", "0")
             expected_args = TestBackendGenerator._expected_call_arg_values(name, values)
+            output_args = TestBackendGenerator._expected_call_output_values(name, values)
             if backend == "CppUTest":
                 param_expectations = TestBackendGenerator._cpputest_expected_param_chain(symbol, expected_args)
-                ignore_params = ".ignoreOtherParameters()" if symbol and TestBackendGenerator._has_mock_params(symbol.params) and not param_expectations else ""
+                output_decls, output_chain = TestBackendGenerator._cpputest_output_param_chain(symbol, output_args, safe, indent)
+                lines.extend(output_decls)
+                ignore_params = ".ignoreOtherParameters()" if symbol and TestBackendGenerator._has_mock_params(symbol.params) and not param_expectations and not output_chain else ""
                 if symbol and TestBackendGenerator._is_void_return_type(symbol.return_type):
-                    lines.append(f"{indent}mock().expectOneCall(\"{name}\"){param_expectations}{ignore_params};")
+                    lines.append(f'{indent}mock().expectOneCall("{name}"){param_expectations}{output_chain}{ignore_params};')
                 else:
                     return_type = TestBackendGenerator._mock_return_type(symbol.return_type if symbol else "")
-                    lines.append(f"{indent}mock().expectOneCall(\"{name}\"){param_expectations}{ignore_params}.andReturnValue({TestBackendGenerator._typed_value(return_type, str(value))});")
+                    lines.append(f'{indent}mock().expectOneCall("{name}"){param_expectations}{output_chain}{ignore_params}.andReturnValue({TestBackendGenerator._typed_value(return_type, str(value))});')
             else:
-                args = TestBackendGenerator._gmock_argument_matchers(symbol.params if symbol else "void", expected_args)
-                if symbol and TestBackendGenerator._is_void_return_type(symbol.return_type):
-                    lines.append(f"{indent}EXPECT_CALL(TestingMate_Mock(), {safe}({args}));")
-                else:
-                    return_type = TestBackendGenerator._mock_return_type(symbol.return_type if symbol else "")
-                    typed_value = TestBackendGenerator._typed_value(return_type, str(value)) if symbol else str(value)
-                    lines.append(
-                        f"{indent}EXPECT_CALL(TestingMate_Mock(), {safe}({args})).WillOnce(::testing::Return({typed_value}));"
-                    )
+                args = TestBackendGenerator._gmock_argument_matchers(symbol.params if symbol else "void", expected_args, output_args)
+                actions = TestBackendGenerator._gmock_mock_actions(symbol, value, output_args, has_stub_return)
+                action_suffix = f".WillOnce({actions})" if actions else ""
+                lines.append(f"{indent}EXPECT_CALL(TestingMate_Mock(), {safe}({args})){action_suffix};")
         return lines
 
     @staticmethod
@@ -982,20 +2009,53 @@ class TestBackendGenerator:
         def add(raw: object) -> None:
             for item in re.split(r"[,;\s]+", str(raw or "")):
                 clean = item.strip()
-                if clean in stubbed_calls and clean not in names:
+                if TestBackendGenerator._is_valid_mock_call_name(clean, stubbed_calls) and clean not in names:
                     names.append(clean)
 
         for key, value in sorted(values.items()):
             if key in {"__expected_calls", "__expect_calls", "expected_calls", "expect_calls"}:
                 add(value)
             elif key.startswith("__expected_call."):
-                add(key.split(".", 1)[1])
+                candidate = key.split(".", 1)[1]
+                if TestBackendGenerator._is_valid_mock_call_name(candidate, stubbed_calls):
+                    add(candidate)
             elif key.startswith("__stub_return."):
-                add(key.split(".", 1)[1])
+                clean = key.split(".", 1)[1]
+                if TestBackendGenerator._is_valid_mock_call_name(clean, stubbed_calls) and clean not in names:
+                    names.append(clean)
         return names
 
     @staticmethod
-    def _gmock_argument_matchers(params: str, expected_args: dict[int, str] | None = None) -> str:
+    def _case_stub_call_names(fn: FunctionInfo, case: TestCase, stubbed_calls: set[str]) -> list[str]:
+        values = case.values or {}
+        explicit_keys = {"__expected_calls", "__expect_calls", "expected_calls", "expect_calls"}
+        has_explicit = any(key in values for key in explicit_keys) or any(
+            key.startswith("__expected_call.") or key.startswith("__stub_return.")
+            for key in values
+        )
+        explicit = TestBackendGenerator._expected_stub_call_names(case, stubbed_calls)
+        if has_explicit:
+            return explicit
+        return TestBackendGenerator._auto_stub_call_names(fn, stubbed_calls)
+
+    @staticmethod
+    def _auto_stub_call_names(fn: FunctionInfo, stubbed_calls: set[str]) -> list[str]:
+        if not stubbed_calls:
+            return []
+        body = re.sub(r"//.*?$|/\*.*?\*/", " ", fn.body or "", flags=re.S | re.M)
+        names: list[str] = []
+        for match in re.finditer(r"(?<![.#>])\b([A-Za-z_]\w*)\s*\(", body):
+            name = match.group(1)
+            if TestBackendGenerator._is_valid_mock_call_name(name, stubbed_calls) and name not in names:
+                names.append(name)
+        return names
+
+    @staticmethod
+    def _gmock_argument_matchers(
+        params: str,
+        expected_args: dict[int, str] | None = None,
+        output_args: dict[int, str] | None = None,
+    ) -> str:
         trimmed = str(params or "").strip()
         if not trimmed or trimmed == "void" or trimmed == "...":
             return ""
@@ -1015,19 +2075,65 @@ class TestBackendGenerator:
         if current.strip():
             items.append(current.strip())
         expected_args = expected_args or {}
+        output_args = output_args or {}
         matchers: list[str] = []
         for index, item in enumerate(item for item in items if item and item != "void"):
             value = expected_args.get(index)
-            if value is None:
-                matchers.append("::testing::_")
-                continue
             name = StubHarnessEngine._param_name(item, index)
             ctype = StubHarnessEngine._param_type(item, name) if name else item
+            if value is None:
+                if index in output_args and "*" in ctype:
+                    matchers.append("::testing::NotNull()")
+                else:
+                    matchers.append("::testing::_")
+                continue
             if "*" in ctype and str(value).strip() not in {"0", "NULL", "nullptr"} and not str(value).strip().startswith("&"):
                 matchers.append("::testing::_")
                 continue
             matchers.append(f"::testing::Eq({TestBackendGenerator._typed_value(ctype, value)})")
         return ", ".join(matchers)
+
+    @staticmethod
+    def _gmock_mock_actions(
+        symbol: StubSymbol | None,
+        return_value: str,
+        output_args: dict[int, str],
+        has_stub_return: bool = True,
+    ) -> str:
+        if symbol is None:
+            return ""
+        actions: list[str] = []
+        pointer_types = TestBackendGenerator._pointer_pointee_types(symbol.params)
+        for index in sorted(output_args):
+            pointee_type = pointer_types.get(index)
+            if not pointee_type:
+                continue
+            typed = TestBackendGenerator._typed_value(pointee_type, str(output_args[index]))
+            actions.append(f"::testing::SetArgPointee<{index}>({typed})")
+        if not TestBackendGenerator._is_void_return_type(symbol.return_type) and has_stub_return:
+            return_type = TestBackendGenerator._mock_return_type(symbol.return_type)
+            typed_return = TestBackendGenerator._typed_value(return_type, str(return_value))
+            actions.append(f"::testing::Return({typed_return})")
+        if not actions:
+            return ""
+        if len(actions) == 1:
+            return actions[0]
+        return f"::testing::DoAll({', '.join(actions)})"
+
+    @staticmethod
+    def _pointer_pointee_types(params: str) -> dict[int, str]:
+        result: dict[int, str] = {}
+        trimmed = StubHarnessEngine._definition_params(params)
+        if trimmed == "void":
+            return result
+        for index, raw in enumerate(StubHarnessEngine._split_params(trimmed)):
+            name = StubHarnessEngine._param_name(raw, index) or f"p{index}"
+            ctype = StubHarnessEngine._param_type(raw, name)
+            if "*" not in ctype:
+                continue
+            pointee = ctype.replace("const", "").replace("volatile", "").replace("*", " ")
+            result[index] = " ".join(pointee.split()).strip() or "int"
+        return result
 
     @staticmethod
     def _expected_call_arg_values(call_name: str, values: dict[str, str]) -> dict[int, str]:
@@ -1040,6 +2146,49 @@ class TestBackendGenerator:
             if raw.isdigit():
                 result[int(raw)] = str(value)
         return result
+
+    @staticmethod
+    def _expected_call_output_values(call_name: str, values: dict[str, str]) -> dict[int, str]:
+        prefixes = (
+            f"__stub_output.{call_name}.",
+            f"__mock_output.{call_name}.",
+            f"__expected_call_output.{call_name}.",
+            f"__output_param.{call_name}.",
+        )
+        result: dict[int, str] = {}
+        for key, value in values.items():
+            for prefix in prefixes:
+                if key.startswith(prefix):
+                    raw = key[len(prefix):]
+                    if raw.isdigit():
+                        result[int(raw)] = str(value)
+                    break
+        return result
+
+    @staticmethod
+    def _cpputest_output_param_chain(
+        symbol: StubSymbol | None,
+        output_args: dict[int, str],
+        safe_name: str,
+        indent: str = "",
+    ) -> tuple[list[str], str]:
+        if symbol is None or not output_args:
+            return [], ""
+        params = StubHarnessEngine._definition_params(symbol.params)
+        if params == "void":
+            return [], ""
+        declarations: list[str] = []
+        parts: list[str] = []
+        pointer_types = TestBackendGenerator._pointer_pointee_types(symbol.params)
+        for index, raw in enumerate(StubHarnessEngine._split_params(params)):
+            if index not in output_args or index not in pointer_types:
+                continue
+            name = StubHarnessEngine._param_name(raw, index) or f"p{index}"
+            pointee_type = pointer_types[index]
+            local = f"testing_mate_mock_out_{safe_name}_{index}"
+            declarations.append(f"{indent}{pointee_type} {local} = {TestBackendGenerator._typed_value(pointee_type, str(output_args[index]))};")
+            parts.append(f'.withOutputParameterReturning("{name}", &{local}, sizeof({local}))')
+        return declarations, "".join(parts)
 
     @staticmethod
     def _cpputest_expected_param_chain(symbol: StubSymbol | None, expected_args: dict[int, str]) -> str:
@@ -1167,36 +2316,24 @@ class TestBackendGenerator:
 
     @staticmethod
     def _suite_local_fixture_declarations(cases: list[TestCase], fn: FunctionInfo | None = None) -> dict[str, str]:
-        """Return every function-local variable that must exist as a fixture member.
+        """Return explicit local fixture variables requested by a testcase.
 
-        Earlier versions only declared locals when a testcase or FixItHint referenced
-        them. That still allowed generated setup/precondition/oracle logic to touch a
-        function-local symbol before the fixture had declared it. Keep the source
-        function's local variables as first-class fixture members so all generated
-        assignments/check expressions have declarations before use.
-
-        Scope precedence is still enforced elsewhere: parameter > local > global.
-        Declaring these members does not make them expected globals; it only prevents
-        undeclared test-harness symbols when a heuristic/hint legitimately refers to a
-        function-local scratch value.
+        Function-scope locals from the implementation are not visible through the
+        public header in generated CppUTest/GTest translation units. Declaring all
+        parsed locals here can leak file-local typedefs into the harness and break
+        compilation, so only materialize locals requested by explicit testcase or
+        FixIt metadata.
         """
         locals_: dict[str, str] = {}
-        source_local_types = TestBackendGenerator._local_variable_type_map(fn) if fn is not None else {}
 
-        # Always declare every parsed function-local variable first, using the original
-        # source/header type when available. Testcase-specific local hints below can add
-        # extra review variables, but they must not override source-derived types.
-        for name, ctype in source_local_types.items():
-            if name and TestBackendGenerator._is_c_identifier(name):
-                locals_.setdefault(name, ctype or  "uint8")
         for case in cases:
             for name, value in TestBackendGenerator._fixit_local_literals(fn, case).items():
                 if name and TestBackendGenerator._is_c_identifier(name) and name not in locals_:
-                    locals_[name] = source_local_types.get(name) or TestBackendGenerator._fixture_type_from_value(str(value))
+                    locals_[name] = TestBackendGenerator._fixture_type_from_value(str(value))
             for key, value in (case.values or {}).items():
                 name = TestBackendGenerator._fixture_local_key_name(key)
                 if name and TestBackendGenerator._is_c_identifier(name) and name not in locals_:
-                    locals_[name] = source_local_types.get(name) or TestBackendGenerator._fixture_type_from_value(str(value))
+                    locals_[name] = TestBackendGenerator._fixture_type_from_value(str(value))
         return locals_
 
     @staticmethod
@@ -1258,9 +2395,18 @@ class TestBackendGenerator:
         global_type_map = global_type_map or {}
 
         if expected_return_name:
-            expected_return = self._expected_return_literal(case)
+            explicit_return = self._expected_return_literal(case)
+            inferred_return = str(inferred_expectations.get("return") or "")
+            expected_return = explicit_return
+            if expected_return and not self._is_safe_expected_expression_for_harness(expected_return, case.values or {}, param_by_name):
+                # Do not leak implementation-local variables such as `ret`, `status`,
+                # or `result` into the external GTest/CppUTest translation unit.
+                # Prefer the path-aware inferred literal when available.
+                expected_return = ""
             if not expected_return:
-                expected_return = str(inferred_expectations.get("return") or "")
+                expected_return = inferred_return
+            if expected_return and not self._is_safe_expected_expression_for_harness(expected_return, case.values or {}, param_by_name):
+                expected_return = ""
             if not expected_return:
                 expected_return = self._default_expected_literal(return_type)
             expected_return = self._harness_expression_for_expected(expected_return, case.values or {}, param_by_name)
@@ -1283,6 +2429,7 @@ class TestBackendGenerator:
             expected_value = expected_outputs.get(normalized, "")
             if not expected_value:
                 expected_value = self._default_expected_literal(output_type if not suffix else "")
+            expected_value = self._harness_expression_for_expected(str(expected_value), case.values or {}, param_by_name)
             if suffix:
                 field_type = self._field_type_for_path(output_type, suffix, struct_field_types or {})
                 lines.append(f"{indent}{expected_fixture}.{suffix} = {self._typed_field_value(field_type, expected_value)};")
@@ -1295,8 +2442,62 @@ class TestBackendGenerator:
             expected_fixture = expected_global_fixtures.get(global_name)
             if not expected_fixture:
                 continue
-            global_type = global_type_map.get(global_name) or self._fixture_type_from_value(str(expected_value))
-            lines.append(f"{indent}{expected_fixture} = {self._typed_value(global_type, str(expected_value))};")
+            expected_expr = self._harness_expression_for_expected(str(expected_value), case.values or {}, param_by_name)
+            global_type = global_type_map.get(global_name) or self._fixture_type_from_value(str(expected_expr))
+            lines.append(f"{indent}{expected_fixture} = {self._typed_value(global_type, expected_expr)};")
+        return lines
+
+    def _case_expected_assertion_lines(
+        self,
+        backend: str,
+        case: TestCase,
+        fn: FunctionInfo,
+        return_type: str,
+        expected_return_name: str,
+        actual_return_name: str,
+        required_outputs: set[str],
+        expected_output_fixtures: dict[str, str],
+        pointer_fixtures: dict[str, str],
+        param_by_name: dict[str, Parameter],
+        inferred_expectations: dict | None = None,
+        expected_global_names: set[str] | None = None,
+        expected_global_fixtures: dict[str, str] | None = None,
+        global_type_map: dict[str, str] | None = None,
+        indent: str = "",
+        struct_field_types: dict[str, dict[str, str]] | None = None,
+    ) -> list[str]:
+        lines: list[str] = []
+        inferred_expectations = inferred_expectations or {}
+        expected_global_fixtures = expected_global_fixtures or {}
+        global_type_map = global_type_map or {}
+        if expected_return_name and actual_return_name:
+            lines.extend(self._assert_observable_equal_lines(backend, expected_return_name, actual_return_name, return_type, struct_field_types, indent))
+
+        expected_outputs = {**(inferred_expectations.get("outputs") or {}), **self._expected_output_literals(case)}
+        for output_name in sorted(required_outputs):
+            normalized = self._normalize_observable_name(output_name)
+            if normalized not in expected_outputs:
+                continue
+            actual = self._output_actual_expression(normalized, pointer_fixtures)
+            expected = self._output_expected_expression(normalized, expected_output_fixtures)
+            if not actual or not expected:
+                continue
+            root, _, suffix = normalized.partition(".")
+            param = param_by_name.get(root)
+            ctype = self._pointer_fixture_type(param) if param else ""
+            if suffix:
+                ctype = self._field_type_for_path(ctype, suffix, struct_field_types or {})
+            lines.extend(self._assert_observable_equal_lines(backend, expected, actual, ctype, struct_field_types, indent))
+
+        expected_globals = {**(inferred_expectations.get("globals") or {}), **self._expected_global_literals(case)}
+        if expected_global_names is not None:
+            expected_globals = {name: value for name, value in expected_globals.items() if name in expected_global_names}
+        for global_name in sorted(expected_globals):
+            fixture = expected_global_fixtures.get(global_name)
+            if not fixture:
+                continue
+            ctype = global_type_map.get(global_name, "")
+            lines.extend(self._assert_observable_equal_lines(backend, fixture, global_name, ctype, struct_field_types, indent))
         return lines
 
     def _case_precondition_lines(
@@ -1311,23 +2512,28 @@ class TestBackendGenerator:
         backend: str = "",
         stubbed_calls: set[str] | None = None,
         stub_symbols: dict[str, StubSymbol] | None = None,
+        global_type_map: dict[str, str] | None = None,
+        blocked_global_names: set[str] | None = None,
     ) -> list[str]:
         values = {**self._fixit_input_literals(fn, case), **(case.values or {})}
         lines: list[str] = []
-        lines.extend(self._state_setup_lines(values, indent))
-        explicit_calls = self._expected_stub_call_names(case, stubbed_calls or set())
-        lines.extend(self._stub_expectation_setup_lines(
-            backend,
-            explicit_calls,
-            values,
-            stub_symbols or {},
-            indent,
-        ))
+        lines.extend(self._state_setup_lines(values, indent, global_type_map, blocked_global_names))
+        # expected_calls = self._case_stub_call_names(fn, case, stubbed_calls or set())
+        # if expected_calls:
+        #     lines.append(f"{indent}/* MOCK EXPECTATIONS */")
+        # lines.extend(self._stub_expectation_setup_lines(
+        #     backend,
+        #     expected_calls,
+        #     values,
+        #     stub_symbols or {},
+        #     indent,
+        # ))
 
         for key, value in sorted(values.items()):
             local_name = self._fixture_local_key_name(key)
             if local_name and self._is_c_identifier(local_name):
-                lines.append(f"{indent}{local_name} = {value};")
+                ctype = self._fixture_type_from_value(str(value))
+                lines.append(f"{indent}{local_name} = {self._typed_value(ctype, str(value))};")
 
         for param in fn.parameters:
             value = str(values.get(param.name, TestVectorGenerator._nominal_value(param)))
@@ -1489,6 +2695,8 @@ class TestBackendGenerator:
         # Empty return_type means the analyzer could not recover the type. Treat it as
         # non-void so the harness still declares/initializes actual_return/expected_return.
         clean = " ".join((return_type or "").replace("static", "").split()).strip()
+        clean = StubHarnessEngine._actual_return_type(clean)
+        clean = " ".join((clean or "").split()).strip()
         return clean == "void"
 
     @staticmethod
@@ -1633,6 +2841,9 @@ class TestBackendGenerator:
         selected = cls._select_if_else_return(body, values)
         if selected:
             return selected
+        selected_local = cls._select_local_return_assignment(body, values)
+        if selected_local:
+            return selected_local
         returns: list[str] = []
         for match in re.finditer(r"\breturn\s+([^;]+);", body):
             literal = cls._resolve_expected_expression(match.group(1), values)
@@ -1658,6 +2869,72 @@ class TestBackendGenerator:
                 if literal:
                     return literal
         return ""
+
+    @classmethod
+    def _select_local_return_assignment(cls, body: str, values: dict[str, str]) -> str:
+        """Resolve simple `ret = ...; ... return ret;` idioms path-sensitively."""
+        return_matches = list(re.finditer(r"\breturn\s+([A-Za-z_]\w*)\s*;", body))
+        if not return_matches:
+            return ""
+        ret_match = return_matches[-1]
+        local_name = ret_match.group(1)
+        # Upper-case identifiers are more likely direct macro/enum returns than locals.
+        if local_name.isupper():
+            return ""
+        prefix_body = body[: ret_match.start()]
+        selected = cls._select_if_else_assignment_with_prefix(prefix_body, local_name, values)
+        if selected:
+            return selected
+        # Fall back to the last straight-line assignment before `return ret;`.
+        return cls._last_assignment_before(prefix_body, local_name, len(prefix_body), values)
+
+    @classmethod
+    def _select_if_else_assignment_with_prefix(cls, body: str, name: str, values: dict[str, str]) -> str:
+        escaped = re.escape(name)
+        pattern = re.compile(
+            rf"if\s*\((?P<cond>[^(){{}};]+)\)\s*"
+            rf"(?P<then_block>\{{(?P<then_body>.*?)\}}|(?P<then_stmt>(?:(?!else).)*?;))\s*"
+            rf"(?:else\s*(?P<else_block>\{{(?P<else_body>.*?)\}}|(?P<else_stmt>.*?;)))?",
+            re.S,
+        )
+        for match in pattern.finditer(body):
+            then_text = match.group("then_body") if match.group("then_body") is not None else (match.group("then_stmt") or "")
+            else_text = match.group("else_body") if match.group("else_body") is not None else (match.group("else_stmt") or "")
+            then_value = cls._last_assignment_before(then_text, name, len(then_text), values)
+            else_value = cls._last_assignment_before(else_text, name, len(else_text), values) if else_text else ""
+            if not then_value and not else_value:
+                continue
+            verdict = cls._eval_simple_condition(match.group("cond"), values)
+            if verdict is True and then_value:
+                return then_value
+            if verdict is False:
+                if else_value:
+                    return else_value
+                prefix_value = cls._last_assignment_before(body, name, match.start(), values)
+                if prefix_value:
+                    return prefix_value
+        return ""
+
+    @classmethod
+    def _last_assignment_before(cls, body: str, name: str, pos: int, values: dict[str, str]) -> str:
+        escaped = re.escape(name)
+        text = body[:pos]
+        assignments: list[str] = []
+        # Declaration initializer: Std_ReturnType ret = E_NOT_OK;
+        decl_pattern = re.compile(
+            rf"\b(?:const\s+|volatile\s+|static\s+|unsigned\s+|signed\s+|long\s+|short\s+|struct\s+\w+\s+|enum\s+\w+\s+|union\s+\w+\s+|"
+            rf"char\s+|int\s+|float\s+|double\s+|bool\s+|uint\d+_t\s+|int\d+_t\s+|size_t\s+|[A-Za-z_]\w+_t\s+|[A-Za-z_]\w+\s+)+[*\s]*"
+            rf"\b{escaped}\b\s*=\s*([^;]+);"
+        )
+        for match in decl_pattern.finditer(text):
+            literal = cls._resolve_expected_expression(match.group(1), values)
+            if literal:
+                assignments.append(literal)
+        for match in re.finditer(rf"(?<![.>])\b{escaped}\b\s*=\s*([^;]+);", text):
+            literal = cls._resolve_expected_expression(match.group(1), values)
+            if literal:
+                assignments.append(literal)
+        return assignments[-1] if assignments else ""
 
     @classmethod
     def _infer_global_expected_from_stored_ast(
@@ -1903,17 +3180,14 @@ class TestBackendGenerator:
                     result.setdefault(f"struct {tag}", fields)
         return result
 
-    def _type_map_sources(self, source: Path, unit_sources: list[Path] | None) -> list[Path]:
-        roots = [source, *(unit_sources or [])]
+    def _type_map_sources(self, source: Path | str, unit_sources: list[Path | str] | None) -> list[Path]:
+        roots = [self._as_path(source).expanduser(), *self._as_path_list(unit_sources)]
         result: list[Path] = []
         seen: set[str] = set()
         queue: list[tuple[Path, int]] = [(path, 0) for path in roots if path]
         while queue:
             path, depth = queue.pop(0)
-            try:
-                resolved = path.resolve()
-            except OSError:
-                resolved = path
+            resolved = self._safe_resolve(path)
             key = str(resolved).lower()
             if key in seen or not path.exists() or not path.is_file():
                 continue
@@ -1976,15 +3250,88 @@ class TestBackendGenerator:
         return TestBackendGenerator._typed_value(ctype, value) if ctype else str(value).strip()
 
     @staticmethod
+    def _is_enum_or_macro_identifier(name: str) -> bool:
+        clean = str(name or "").strip()
+        if not TestBackendGenerator._is_c_identifier(clean):
+            return False
+        # Only all-caps identifiers are safe to emit as external constants.
+        # Mixed-case items such as Rte_VehicleSpeed are usually implementation
+        # globals and may not be declared in the harness translation unit.
+        if not clean.isupper():
+            return False
+        return bool(re.match(r"(?:E_|STD_|RTE_|DEM_|DCM_|COM_|CAN_|LIN_|NM_|PDUR_|PDU_|BSW_|ECUM_)", clean) or clean.isupper())
+
+    @staticmethod
     def _harness_expression_for_expected(value: str, values: dict[str, str], param_by_name: dict[str, Parameter]) -> str:
         expr = str(value or "").strip()
+        if not expr:
+            return "0"
         if not TestBackendGenerator._is_c_identifier(expr):
             return expr
         if expr in values:
-            return str(values[expr])
+            candidate = str(values.get(expr, "")).strip()
+            if not candidate or candidate == expr:
+                return "0"
+            literal = TestBackendGenerator._cpp_expected_literal(candidate)
+            if literal and not TestBackendGenerator._is_c_identifier(literal):
+                return literal
+            if candidate in param_by_name:
+                return f"tm_{TestBackendGenerator._safe_identifier(candidate)}"
+            if TestBackendGenerator._is_enum_or_macro_identifier(candidate):
+                return candidate
+            if not TestBackendGenerator._is_c_identifier(candidate):
+                # Keep simple literal/expression values only when they do not
+                # contain unknown identifiers.
+                if TestBackendGenerator._is_safe_expected_expression_for_harness(candidate, values, param_by_name):
+                    return candidate
+            return "0"
         if expr in param_by_name:
             return f"tm_{TestBackendGenerator._safe_identifier(expr)}"
-        return expr
+        if TestBackendGenerator._is_enum_or_macro_identifier(expr):
+            return expr
+        return "0"
+
+    @staticmethod
+    def _is_safe_expected_expression_for_harness(value: str, values: dict[str, str], param_by_name: dict[str, Parameter]) -> bool:
+        """Return True when an expected expression can compile in the harness.
+
+        Implementation-local names from the source file, for example `ret`,
+        `status`, or `result`, are not visible in generated GTest/CppUTest
+        code.  Enum constants and macros are allowed only when they look like
+        real constants.  Mixed-case globals such as Rte_VehicleSpeed are unsafe
+        unless they are parameters or resolved to a literal in testcase values.
+        """
+        expr = str(value or "").strip()
+        if not expr:
+            return False
+        literal = TestBackendGenerator._cpp_expected_literal(expr)
+        if literal and not TestBackendGenerator._is_c_identifier(literal):
+            return True
+        if expr in param_by_name:
+            return True
+        if expr in values:
+            candidate = str(values.get(expr, "")).strip()
+            if not candidate or candidate == expr:
+                return False
+            return TestBackendGenerator._is_safe_expected_expression_for_harness(candidate, values, param_by_name)
+        if TestBackendGenerator._is_c_identifier(expr):
+            return TestBackendGenerator._is_enum_or_macro_identifier(expr)
+        # Allow simple expressions composed from literals, enum-like constants,
+        # case values, and parameters. Reject unknown identifiers.
+        identifiers = re.findall(r"\b[A-Za-z_]\w*\b", expr)
+        allowed_keywords = {"true", "false", "TRUE", "FALSE", "NULL", "nullptr", "sizeof"}
+        for ident in identifiers:
+            if ident in allowed_keywords or ident in param_by_name:
+                continue
+            if ident in values:
+                candidate = str(values.get(ident, "")).strip()
+                if candidate and candidate != ident and TestBackendGenerator._is_safe_expected_expression_for_harness(candidate, values, param_by_name):
+                    continue
+                return False
+            if TestBackendGenerator._is_enum_or_macro_identifier(ident):
+                continue
+            return False
+        return True
 
     @staticmethod
     def _can_initialize_fixture_from_literal(ctype: str, value: str) -> bool:
@@ -1999,6 +3346,8 @@ class TestBackendGenerator:
 
     @staticmethod
     def _parse_global_declaration(statement: str) -> tuple[str, str] | None:
+        if re.search(r"\bstatic\b", statement or ""):
+            return None
         statement = re.sub(r"\b(?:extern|static)\b", " ", statement).strip()
         if "(" in statement or not statement.endswith(";"):
             return None
@@ -2016,6 +3365,55 @@ class TestBackendGenerator:
         if ctype.split()[:1] and ctype.split()[0] in bad_starts:
             return None
         return name, TestBackendGenerator._clean_fixture_type(ctype, defaults="uint8", mutable=True)
+
+    @staticmethod
+    def _static_global_variable_names(unit_sources: list[Path] | None) -> set[str]:
+        result: set[str] = set()
+        for source in unit_sources or []:
+            if not source.exists() or not source.is_file():
+                continue
+            try:
+                text = source.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            sanitized = TestBackendGenerator._strip_comments_and_strings(text)
+            sanitized = re.sub(r"^\s*#.*$", "", sanitized, flags=re.MULTILINE)
+            depth = 0
+            statement: list[str] = []
+            for ch in sanitized:
+                if ch == "{":
+                    depth += 1
+                    statement.clear()
+                    continue
+                if ch == "}":
+                    depth = max(0, depth - 1)
+                    statement.clear()
+                    continue
+                if depth != 0:
+                    continue
+                statement.append(ch)
+                if ch == ";":
+                    raw = "".join(statement).strip()
+                    statement.clear()
+                    if not re.search(r"\bstatic\b", raw):
+                        continue
+                    parsed = TestBackendGenerator._parse_static_global_declaration(raw)
+                    if parsed:
+                        result.add(parsed)
+        return result
+
+    @staticmethod
+    def _parse_static_global_declaration(statement: str) -> str | None:
+        if "(" in statement or not statement.endswith(";"):
+            return None
+        statement = statement[:-1].strip()
+        if "=" in statement:
+            statement = statement.split("=", 1)[0].strip()
+        match = re.match(r"(?P<type>.+?)(?P<ptr>\*\s*)?(?P<name>[A-Za-z_]\w*)\s*(?:\[[^\]]+\])?$", statement)
+        if not match:
+            return None
+        name = match.group("name")
+        return name if TestBackendGenerator._is_c_identifier(name) else None
 
     @classmethod
     def _merge_expectation_sources(cls, base: dict | None, override: dict | None) -> dict:
@@ -2247,6 +3645,15 @@ class TestBackendGenerator:
                 if value and fn_name and value != fn_name:
                     if key in {"function", "function_name", "fn"}:
                         return False
+        condition = str(hint.get("condition") or hint.get("path_condition") or "").strip()
+        if condition and case is not None:
+            values = cls._case_symbol_values(case)
+            verdict = cls._eval_simple_condition(condition, values)
+            # A conditional oracle is unsafe if the current vector does not prove
+            # that path. Drop it instead of applying THEN expectations to ELSE
+            # vectors or vice versa.
+            if verdict is not True:
+                return False
         return True
     @classmethod
     def _fixit_kind_target_value(cls, hint) -> tuple[str, str, str]:
@@ -2528,56 +3935,77 @@ class TestBackendGenerator:
 
     @staticmethod
     def _parse_local_declaration(stmt: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for spec in TestBackendGenerator._parse_local_declaration_specs(stmt):
+            name = str(spec.get("name") or "")
+            ctype = str(spec.get("ctype") or "")
+            if name and ctype:
+                result.setdefault(name, ctype)
+        return result
+
+    @staticmethod
+    def _parse_local_declaration_specs(stmt: str) -> list[dict[str, str]]:
+        """Parse non-static C local declarations into fixture specs.
+
+        The harness may need implementation-local names for expected expressions
+        produced by AST/fixit engines.  Static locals are deliberately excluded:
+        they are persistent UUT state, not per-test fixture variables.
+        """
         stmt = " ".join((stmt or "").replace("\n", " ").split()).strip()
         if not stmt:
-            return {}
-        first_word = stmt.split(None, 1)[0]
-        first_word = first_word.rstrip(":")
+            return []
+        first_word = stmt.split(None, 1)[0].rstrip(":")
         forbidden_starts = {
             "if", "else", "for", "while", "switch", "case", "default",
             "return", "break", "continue", "goto", "do", "sizeof",
         }
         if first_word in forbidden_starts:
-            return {}
+            return []
         if re.match(r"^(?:case\b.*|default)\s*:", stmt):
-            return {}
+            return []
         if ":" in stmt.split("=", 1)[0]:
-            return {}
+            return []
         if stmt.startswith(("*", "&", "++", "--")):
-            return {}
-        # Function calls/control headers are not declarations. Casts in initializers
-        # are allowed because we only inspect the declarator head before '=' below.
+            return []
         head_for_call_check = stmt.split("=", 1)[0]
         if "(" in head_for_call_check or ")" in head_for_call_check:
-            return {}
-        if re.search(r"(==|!=|<=|>=|&&|\|\||->|\.)", head_for_call_check):
-            return {}
+            return []
+        if re.search(r"(==|!=|<=|>=|&&|\|\||->|\.|[<>])", head_for_call_check):
+            return []
 
         declarators = TestBackendGenerator._split_top_level_commas(stmt)
         if not declarators:
-            return {}
+            return []
         first_decl = declarators[0].split("=", 1)[0].strip()
-        first_match = re.search(r"(?P<prefix>.*?)(?P<name>[A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)?$", first_decl)
+        first_match = re.search(
+            r"(?P<prefix>.*?)(?P<name>[A-Za-z_]\w*)\s*(?P<array>(?:\[[^\]]*\]\s*)*)$",
+            first_decl,
+        )
         if not first_match:
-            return {}
+            return []
         type_part = first_match.group("prefix").strip()
         if not type_part:
-            return {}
-        # A declaration needs a plausible type, not just an assignment target.
+            return []
+        if re.search(r"\b(?:static|STATIC)\b", type_part):
+            return []
         type_tokens = [token for token in re.split(r"\s+", type_part.replace("*", " ").strip()) if token]
         if not type_tokens or type_tokens[0] in forbidden_starts:
-            return {}
+            return []
         if len(type_tokens) == 1 and type_tokens[0] in {"true", "false", "NULL", "nullptr"}:
-            return {}
+            return []
         base_type = TestBackendGenerator._clean_fixture_type(type_part.replace("*", " "), defaults="uint8", mutable=True)
         if not base_type:
-            return {}
+            return []
 
-        result: dict[str, str] = {}
+        result: list[dict[str, str]] = []
+        seen: set[str] = set()
         first_name = first_match.group("name")
         for index, raw_item in enumerate(declarators):
             item = raw_item.split("=", 1)[0].strip()
-            name_match = re.search(r"(?P<prefix>.*?)(?P<name>[A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)?$", item)
+            name_match = re.search(
+                r"(?P<prefix>.*?)(?P<name>[A-Za-z_]\w*)\s*(?P<array>(?:\[[^\]]*\]\s*)*)$",
+                item,
+            )
             if not name_match:
                 continue
             name = name_match.group("name")
@@ -2588,28 +4016,59 @@ class TestBackendGenerator:
                 continue
             pointer = "*" in prefix
             ctype = (base_type.rstrip(" *") + (" *" if pointer else "")).strip()
-            if ctype and ctype.split()[0] not in forbidden_starts:
-                result.setdefault(name, ctype)
+            array_suffix = " ".join((name_match.group("array") or "").split())
+            if ctype and ctype.split()[0] not in forbidden_starts and name not in seen:
+                result.append({"name": name, "ctype": ctype, "array": array_suffix})
+                seen.add(name)
         return result
 
     @staticmethod
-    def _local_variable_type_map(fn: FunctionInfo | None) -> dict[str, str]:
+    def _local_variable_fixture_specs(fn: FunctionInfo | None) -> list[dict[str, str]]:
         if fn is None:
-            return {}
+            return []
         body = TestBackendGenerator._strip_comments_and_strings(fn.body)
-        result: dict[str, str] = {}
+        specs: list[dict[str, str]] = []
+        seen: set[str] = set()
+
+        def add(name: str, ctype: str, array: str = "") -> None:
+            if not TestBackendGenerator._is_c_identifier(name) or name in seen:
+                return
+            safe_type = TestBackendGenerator._clean_fixture_type(ctype, defaults="uint8", mutable=True)
+            if not TestBackendGenerator._is_valid_fixture_type(safe_type):
+                safe_type = "uint8"
+            specs.append({"name": name, "ctype": safe_type, "array": array or ""})
+            seen.add(name)
+
         for statement in TestBackendGenerator._local_declaration_candidates(body):
-            result.update(TestBackendGenerator._parse_local_declaration(statement))
+            for spec in TestBackendGenerator._parse_local_declaration_specs(statement):
+                add(str(spec.get("name") or ""), str(spec.get("ctype") or "uint8"), str(spec.get("array") or ""))
+
+        for match in re.finditer(r"\bfor\s*\(\s*(?P<init>[^;]+);", body):
+            for spec in TestBackendGenerator._parse_local_declaration_specs(match.group("init")):
+                add(str(spec.get("name") or ""), str(spec.get("ctype") or "uint8"), str(spec.get("array") or ""))
+
         macro_decl = re.compile(
-            r"\b(?P<macro>VAR|CONST|P2VAR|P2CONST|CONSTP2VAR)\s*\((?P<type>[^,()]+)(?:,[^()]*)?\)\s*"
-            r"(?P<name>[A-Za-z_]\w*)\s*(?:=|;|\[)"
+            r"\b(?P<static>static|STATIC)?\s*"
+            r"(?P<macro>VAR|CONST|P2VAR|P2CONST|CONSTP2VAR)\s*\((?P<type>[^,()]+)(?:,[^()]*)?\)\s*"
+            r"(?P<name>[A-Za-z_]\w*)\s*(?P<array>(?:\[[^\]]*\]\s*)*)\s*(?:=|;|\[)?"
         )
         for match in macro_decl.finditer(body):
+            if match.group("static"):
+                continue
             name = match.group("name")
-            if TestBackendGenerator._is_c_identifier(name):
-                ctype = TestBackendGenerator._clean_fixture_type(match.group("type"), defaults="uint8", mutable=True)
-                if match.group("macro") in {"P2VAR", "P2CONST", "CONSTP2VAR"}:
-                    ctype = ctype.rstrip(" *") + " *"
+            ctype = TestBackendGenerator._clean_fixture_type(match.group("type"), defaults="uint8", mutable=True)
+            if match.group("macro") in {"P2VAR", "P2CONST", "CONSTP2VAR"}:
+                ctype = ctype.rstrip(" *") + " *"
+            add(name, ctype, " ".join((match.group("array") or "").split()))
+        return specs
+
+    @staticmethod
+    def _local_variable_type_map(fn: FunctionInfo | None) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for spec in TestBackendGenerator._local_variable_fixture_specs(fn):
+            name = str(spec.get("name") or "")
+            ctype = str(spec.get("ctype") or "")
+            if name and ctype:
                 result.setdefault(name, ctype)
         return result
 
@@ -2635,15 +4094,8 @@ class TestBackendGenerator:
 
     @staticmethod
     def _local_variable_names(fn: FunctionInfo) -> set[str]:
-        body = TestBackendGenerator._strip_comments_and_strings(fn.body)
-        names: set[str] = set(TestBackendGenerator._local_variable_type_map(fn).keys())
-        macro_decl = re.compile(
-            r"\b(?:VAR|CONST|P2VAR|P2CONST|CONSTP2VAR|P2FUNC)\s*\([^;()]*\)\s*"
-            r"(?P<name>[A-Za-z_]\w*)\s*(?:=|;|\[)"
-        )
-        for match in macro_decl.finditer(body):
-            names.add(match.group("name"))
-        return names
+        # Keep this aligned with fixture materialization: non-static locals only.
+        return set(TestBackendGenerator._local_variable_type_map(fn).keys())
     @classmethod
     def _function_internal_local_names(cls, fn: FunctionInfo | None) -> set[str]:
         if fn is None:
@@ -2671,25 +4123,38 @@ class TestBackendGenerator:
             return {str(item): "uint8" for item in symbols}
         return {}
     @classmethod
-    def _filter_global_names(cls, fn: FunctionInfo | None, names: set[str], global_type_map: dict[str, str] | None = None) -> set[str]:
+    def _filter_global_names(
+        cls,
+        fn: FunctionInfo | None,
+        names: set[str],
+        global_type_map: dict[str, str] | None = None,
+        blocked_global_names: set[str] | None = None,
+    ) -> set[str]:
         locals_ = cls._function_internal_local_names(fn)
         params = {getattr(param, "name", "") for param in getattr(fn, "parameters", []) or []} if fn is not None else set()
         known_globals = set((global_type_map or {}).keys()) | set(cls._function_global_variable_type_map(fn).keys())
+        blocked_global_names = blocked_global_names or set()
         result: set[str] = set()
         for name in names:
             if not name or not cls._is_c_identifier(name):
                 continue
-            if name in locals_ or name in params:
+            if name in blocked_global_names or name in locals_ or name in params:
                 continue
             if known_globals:
-                if name in known_globals or cls._looks_like_global_name(name):
+                if name in known_globals:
                     result.add(name)
             elif cls._looks_like_global_name(name):
                 result.add(name)
         return result
     @classmethod
-    def _filter_global_literals(cls, fn: FunctionInfo | None, values: dict[str, str], global_type_map: dict[str, str] | None = None) -> dict[str, str]:
-        allowed = cls._filter_global_names(fn, set(values.keys()), global_type_map)
+    def _filter_global_literals(
+        cls,
+        fn: FunctionInfo | None,
+        values: dict[str, str],
+        global_type_map: dict[str, str] | None = None,
+        blocked_global_names: set[str] | None = None,
+    ) -> dict[str, str]:
+        allowed = cls._filter_global_names(fn, set(values.keys()), global_type_map, blocked_global_names)
         return {name: value for name, value in values.items() if name in allowed}
 
     @staticmethod
@@ -2856,11 +4321,17 @@ class TestBackendGenerator:
             ctype = ctype.replace("*", " ")
         return " ".join(ctype.split()).strip() or "uint8"
 
-    def _cmake_include_dirs(self, source: Path, unit_sources: list[Path], extra_roots: list[Path] | None = None) -> str:
-        roots: list[Path | str] = ["."]
-        seen = {"."}
-        for root in [*(extra_roots or []), *self._include_roots(source, unit_sources)]:
-            key = str(root.resolve() if root.exists() else root)
+    def _cmake_include_dirs(self, workspace_roots: list[Path | str] | None = None) -> str:
+        """CMake include directories for the isolated backend workspace.
+
+        Do not leak original project include paths into generated CMake. The
+        compiler should see only the current generated stub header folder.
+        """
+        roots: list[Path | str] = []
+        seen: set[str] = set()
+        for raw_root in (workspace_roots or [Path("stub/include")]):
+            root = self._as_path(raw_root).expanduser()
+            key = str(root).replace("\\", "/").lower()
             if key in seen:
                 continue
             seen.add(key)
@@ -2877,22 +4348,99 @@ class TestBackendGenerator:
             result.append(self._cmake_path(relative))
         return result
 
-    def _include_roots(self, source: Path, unit_sources: list[Path]) -> list[Path]:
-        roots: list[Path] = []
-        for candidate in [source.parent, *(path.parent for path in unit_sources), *self.include_dirs]:
-            if candidate and candidate.exists() and candidate.is_dir():
-                roots.append(candidate.resolve())
-        return roots
+    def _cmake_source_paths(self, paths: list[Path | str]) -> list[str]:
+        result: list[str] = []
+        for raw_path in paths:
+            path = self._as_path(raw_path).expanduser()
+            # Preserve workspace-relative paths such as src/AppSwc.c. Only
+            # absolute external paths are resolved.
+            if path.is_absolute() and path.exists():
+                result.append(self._cmake_path(self._safe_resolve(path)))
+            else:
+                result.append(self._cmake_path(path))
+        return result
 
-    def _matching_include_root(self, path: Path, unit_sources: list[Path]) -> Path | None:
-        candidates = [*self.include_dirs, *(source.parent for source in unit_sources)]
-        for root in sorted((item for item in candidates if item.exists()), key=lambda item: len(str(item.resolve())), reverse=True):
+    @classmethod
+    def _runner_target_source(cls, source: Path | str) -> str:
+        source_path = cls._as_path(source).expanduser()
+        if source_path.suffix.lower() in C_SOURCE_EXTENSIONS:
+            return f"src/{source_path.name}".replace("\\", "/")
+        return str(source_path).replace("\\", "/")
+
+    def _include_roots(self, source: Path | str, unit_sources: list[Path | str]) -> list[Path]:
+        source_path = self._as_path(source).expanduser()
+        unit_paths = self._as_path_list(unit_sources)
+        roots: list[Path] = []
+        for candidate in [
+            source_path.parent,
+            *(path.parent for path in unit_paths),
+            *self.include_dirs,
+            *self._workspace_include_discovery_roots(source_path, unit_paths),
+        ]:
+            if candidate and candidate.exists() and candidate.is_dir():
+                roots.append(self._safe_resolve(candidate))
+        return self._unique_paths(roots)
+
+    def _matching_include_root(self, path: Path | str, unit_sources: list[Path | str]) -> Path | None:
+        path = self._as_path(path).expanduser()
+        unit_paths = self._as_path_list(unit_sources)
+        candidates = [
+            *self.include_dirs,
+            *(source.parent for source in unit_paths),
+            *self._workspace_include_discovery_roots(path, unit_paths),
+        ]
+        for root in sorted((item for item in candidates if item.exists()), key=lambda item: len(str(self._safe_resolve(item))), reverse=True):
             try:
-                path.resolve().relative_to(root.resolve())
+                self._safe_resolve(path).relative_to(self._safe_resolve(root))
                 return root
             except ValueError:
                 continue
         return None
+
+    @classmethod
+    def _workspace_include_discovery_roots(cls, source: Path | str, unit_sources: list[Path | str] | None = None) -> list[Path]:
+        roots: list[Path] = []
+        for raw_source in [source, *(unit_sources or [])]:
+            path = cls._as_path(raw_source).expanduser()
+            start_dir = path.parent if path.suffix else path
+            if start_dir.exists() and start_dir.is_dir():
+                roots.append(start_dir)
+            current = start_dir
+            visited: set[Path] = set()
+            while current and current not in visited:
+                visited.add(current)
+                if current.exists() and current.is_dir() and current.name.lower() in {"include", "includes", "inc", "header", "headers"}:
+                    roots.append(current)
+                    break
+                found_child: Path | None = None
+                if current.exists() and current.is_dir():
+                    for child in current.iterdir():
+                        if child.is_dir() and child.name.lower() in {"include", "includes", "inc", "header", "headers"}:
+                            found_child = child
+                            break
+                if found_child is not None:
+                    roots.append(found_child)
+                    break
+                parent = current.parent
+                if parent == current:
+                    break
+                current = parent
+        return cls._unique_paths([root for root in roots if root.exists() and root.is_dir()])
+
+    @classmethod
+    def _unique_paths(cls, paths: list[Path]) -> list[Path]:
+        result: list[Path] = []
+        seen: set[Path] = set()
+        for path in paths:
+            try:
+                key = cls._safe_resolve(path)
+            except OSError:
+                key = path
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(path)
+        return result
 
     @staticmethod
     def _cmake_path(path: Path | str) -> str:
@@ -2908,7 +4456,8 @@ class TestBackendGenerator:
             return []
         return [match.group(1).strip() for match in self.include_pattern.finditer(text)]
 
-    def _resolve_include(self, include_name: str, current_dir: Path, unit_sources: list[Path]) -> Path | None:
+    def _resolve_include(self, include_name: str, current_dir: Path | str, unit_sources: list[Path | str]) -> Path | None:
+        current_dir = self._as_path(current_dir).expanduser()
         candidates = [current_dir / include_name]
         candidates.extend(root / include_name for root in self._include_roots(current_dir, unit_sources))
         for candidate in candidates:
@@ -2916,7 +4465,9 @@ class TestBackendGenerator:
                 return candidate
         return None
 
-    def _guess_header(self, source: Path, unit_sources: list[Path]) -> str:
+    def _guess_header(self, source: Path | str, unit_sources: list[Path | str]) -> str:
+        source = self._as_path(source).expanduser()
+        unit_sources = self._as_path_list(unit_sources)
         candidate = source.with_suffix(".h")
         if candidate.exists():
             return candidate.name
@@ -2933,6 +4484,11 @@ class TestBackendGenerator:
             suffix = Path(include_name).suffix.lower()
             if suffix in {".h", ".hpp"} and self._resolve_include(include_name, source.parent, unit_sources):
                 return include_name
+        if source.suffix.lower() in C_SOURCE_EXTENSIONS:
+            # Last-resort direct-source harness: include the copied local source,
+            # not the original project path. This keeps generated CMake include
+            # directories scoped to stub/include/.
+            return f"src/{source.name}"
         return source.name
 
     @staticmethod
@@ -2964,6 +4520,12 @@ cd "$SCRIPT_DIR"
 target="@@TARGET@@"
 target_source="@@TARGET_SOURCE@@"
 native_mcdc="@@NATIVE_MCDC@@"
+skip_coverage="${TESTING_MATE_SKIP_COVERAGE:-0}"
+gtest_filter="${TESTING_MATE_GTEST_FILTER:-}"
+cpputest_filters="${TESTING_MATE_CPPUTEST_FILTERS:-}"
+cpputest_group_filter="${TESTING_MATE_CPPUTEST_GROUP:-}"
+cpputest_name_filter="${TESTING_MATE_CPPUTEST_NAME:-}"
+clean_build="${TESTING_MATE_CLEAN_BUILD:-0}"
 
 report_base="${target}"
 report_base="${report_base%_cpputest}"
@@ -3173,7 +4735,7 @@ if [ "$coverage_backend" = "legacy_lcov" ]; then
   build_dir="build-lcov"
 fi
 
-if [ -e "$build_dir" ]; then
+if [ -e "$build_dir" ] && [ "$clean_build" = "1" ]; then
   if ! rm -rf "$build_dir"; then
     build_dir="build_${target}_$(date +%Y%m%d%H%M%S)_$$"
     echo "Existing build directory is locked; using fresh build directory: ${build_dir}"
@@ -3219,15 +4781,78 @@ export LLVM_PROFILE_FILE="$SCRIPT_DIR/${build_dir}/${target}-%p.profraw"
 cmake "${cmake_configure_args[@]}"
 cmake --build "$build_dir"
 
-test_status=0
-ctest --test-dir "$build_dir" --output-on-failure || test_status=$?
-
 exe_path=""
 if [ -x "${build_dir}/${target}.exe" ]; then
   exe_path="${build_dir}/${target}.exe"
 elif [ -x "${build_dir}/${target}" ]; then
   exe_path="${build_dir}/${target}"
 fi
+
+# Keep coverage evidence scoped to the current execution only.  Fallback
+# discovery/filtered runs produce .profraw files too; delete old profiles before
+# every run so the final full-suite coverage pass is not polluted by stale data.
+if [ "$coverage_backend" = "clang_llvmcov" ]; then
+  rm -f "${build_dir}"/*.profraw coverage.profdata coverage.json coverage.llvm.json coverage.summary.txt llvm_report.txt || true
+fi
+
+test_status=0
+if [ -n "$gtest_filter" ] && [[ "$target" == *_gtest ]]; then
+  if [ -z "$exe_path" ]; then
+    echo "Cannot run GoogleTest filter because executable was not found."
+    exit 1
+  fi
+  echo "Running GoogleTest filter: ${gtest_filter}"
+  "$exe_path" --gtest_filter="$gtest_filter" || test_status=$?
+elif [ -n "$cpputest_filters" ] && [[ "$target" == *_cpputest ]]; then
+  if [ -z "$exe_path" ]; then
+    echo "Cannot run CppUTest filter because executable was not found."
+    exit 1
+  fi
+  echo "Running CppUTest failed-case filter list: ${cpputest_filters}"
+  IFS=';' read -r -a cpputest_filter_entries <<< "$cpputest_filters"
+  for cpputest_entry in "${cpputest_filter_entries[@]}"; do
+    if [ -z "$cpputest_entry" ]; then
+      continue
+    fi
+    if [[ "$cpputest_entry" != *"::"* ]]; then
+      echo "Skipping malformed CppUTest filter entry: ${cpputest_entry}"
+      test_status=1
+      continue
+    fi
+    cpputest_group="${cpputest_entry%%::*}"
+    cpputest_name="${cpputest_entry#*::}"
+    if [ -z "$cpputest_group" ] || [ -z "$cpputest_name" ]; then
+      echo "Skipping incomplete CppUTest filter entry: ${cpputest_entry}"
+      test_status=1
+      continue
+    fi
+    echo "Running CppUTest filter: -g ${cpputest_group} -n ${cpputest_name}"
+    "$exe_path" -g "$cpputest_group" -n "$cpputest_name" || test_status=$?
+  done
+elif { [ -n "$cpputest_group_filter" ] || [ -n "$cpputest_name_filter" ]; } && [[ "$target" == *_cpputest ]]; then
+  if [ -z "$exe_path" ]; then
+    echo "Cannot run CppUTest filter because executable was not found."
+    exit 1
+  fi
+  cpputest_args=()
+  if [ -n "$cpputest_group_filter" ]; then
+    cpputest_args+=("-g" "$cpputest_group_filter")
+  fi
+  if [ -n "$cpputest_name_filter" ]; then
+    cpputest_args+=("-n" "$cpputest_name_filter")
+  fi
+  echo "Running CppUTest filter: ${cpputest_args[*]}"
+  "$exe_path" "${cpputest_args[@]}" || test_status=$?
+else
+  ctest --test-dir "$build_dir" --output-on-failure || test_status=$?
+fi
+
+case "$skip_coverage" in
+  1|true|TRUE|yes|YES|on|ON)
+    echo "Skipping coverage generation for fallback/discovery run."
+    exit "$test_status"
+    ;;
+esac
 
 if [ "$coverage_backend" = "clang_llvmcov" ]; then
   if [ -z "$exe_path" ]; then
@@ -3386,38 +5011,202 @@ exit "$test_status"
         )
 
 class TestBackendRunner:
-    def run(self, backend: str, out_dir: Path, source: Path) -> RunResult:
+    @staticmethod
+    def gtest_failed_filter_from_result(run_result: RunResult, max_cases: int = 80) -> str:
+        text = TestOracleFallback.backend_execution_text(run_result)
+        if not text.strip():
+            return ""
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for match in re.finditer(r"(?m)^\[\s*FAILED\s*\]\s+([^\s(]+)", text):
+            name = match.group(1).strip()
+            if not name or name.isdigit() or "." not in name:
+                continue
+            if name not in seen:
+                seen.add(name)
+                ordered.append(name)
+        if not ordered or len(ordered) > max_cases:
+            return ""
+        return ":".join(ordered)
+
+    @staticmethod
+    def cpputest_failed_filter_from_result(run_result: RunResult, max_cases: int = 80) -> str:
+        text = TestOracleFallback.backend_execution_text(run_result)
+        if not text.strip():
+            return ""
+        ordered: list[str] = []
+        seen: set[str] = set()
+        patterns = [
+            r"Failure\s+in\s+TEST\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+            r"(?m)^\s*TEST\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)\s*(?:failed|failure|error)",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, re.I):
+                group = match.group(1).strip()
+                name = match.group(2).strip()
+                if not group or not name or name.isdigit():
+                    continue
+                entry = f"{group}::{name}"
+                if entry not in seen:
+                    seen.add(entry)
+                    ordered.append(entry)
+        if not ordered or len(ordered) > max_cases:
+            return ""
+        return ";".join(ordered)
+
+    @classmethod
+    def failed_filter_from_result(cls, backend: str, run_result: RunResult, max_cases: int = 80) -> str:
+        if backend == "GoogleTest":
+            return cls.gtest_failed_filter_from_result(run_result, max_cases)
+        if backend == "CppUTest":
+            return cls.cpputest_failed_filter_from_result(run_result, max_cases)
+        return ""
+
+    @staticmethod
+    def _as_path(value: Path | str) -> Path:
+        return value if isinstance(value, Path) else Path(str(value))
+
+    @staticmethod
+    def output_limit() -> int:
+        raw = os.environ.get("TESTING_MATE_RUN_OUTPUT_LIMIT", "2000000")
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 2000000
+
+    @classmethod
+    def trim_output(cls, text: str) -> str:
+        limit = cls.output_limit()
+        text = str(text or "")
+        return text if limit <= 0 or len(text) <= limit else text[-limit:]
+
+    def run(
+        self,
+        backend: str,
+        out_dir: Path | str,
+        source: Path | str,
+        *,
+        test_filter: str | None = None,
+        skip_coverage: bool = False,
+        clean_build: bool = False,
+    ) -> RunResult:
+        out_dir = self._as_path(out_dir).expanduser()
+        source = self._as_path(source).expanduser()
+        env_extra: dict[str, str] = {}
+        if skip_coverage:
+            env_extra["TESTING_MATE_SKIP_COVERAGE"] = "1"
+        if clean_build:
+            env_extra["TESTING_MATE_CLEAN_BUILD"] = "1"
+        if test_filter:
+            if backend == "GoogleTest":
+                env_extra["TESTING_MATE_GTEST_FILTER"] = str(test_filter)
+            elif backend == "CppUTest":
+                filter_text = str(test_filter)
+                if "::" in filter_text or ";" in filter_text:
+                    env_extra["TESTING_MATE_CPPUTEST_FILTERS"] = filter_text
+                else:
+                    env_extra["TESTING_MATE_CPPUTEST_NAME"] = filter_text
         if backend == "CppUTest":
             script = out_dir / f"{source.stem}_cpputest" / "run_cpputest.sh"
-            return self._run_msys_script(script, backend)
+            return self._run_msys_script(script, backend, env_extra=env_extra)
         if backend == "GoogleTest":
             script = out_dir / f"{source.stem}_gtest" / "run_gtest.sh"
-            return self._run_msys_script(script, backend)
+            return self._run_msys_script(script, backend, env_extra=env_extra)
         return RunResult(backend=backend, command="", returncode=None, skipped_reason="Unknown backend")
 
-    def _run_msys_script(self, script: Path, backend: str) -> RunResult:
+    def _run_msys_script(self, script: Path | str, backend: str, env_extra: dict[str, str] | None = None) -> RunResult:
+        script = self._as_path(script).expanduser()
         bash = msys_bash_path()
         command_label = f"MSYS2 bash {script}"
         if not script.exists():
             return RunResult(backend=backend, command=command_label, returncode=None, skipped_reason="Runner script was not generated")
         if not bash:
             return RunResult(backend=backend, command=command_label, returncode=None, skipped_reason="MSYS2 bash was not found")
+        env_extra = dict(env_extra or {})
+        direct_filtered_run = any(key in env_extra for key in {
+            "TESTING_MATE_GTEST_FILTER",
+            "TESTING_MATE_CPPUTEST_FILTERS",
+            "TESTING_MATE_CPPUTEST_GROUP",
+            "TESTING_MATE_CPPUTEST_NAME",
+        })
+        self._cleanup_ctest_temp_logs(script.parent)
+        run_started_at = time.time()
         msys_script = windows_to_msys_path(script)
         if bash.lower().endswith("bash.exe"):
             work_dir = windows_to_msys_path(script.parent)
             mingw_dir = windows_to_msys_path(local_mingw_bin())
-            return self._run_command([bash, "-lc", f"export MSYSTEM=MINGW64; export HOME='{work_dir}/.home'; export TMPDIR='{work_dir}/.tmp'; export PATH='{mingw_dir}':/usr/bin:$PATH; bash '{msys_script}'"], backend, command_label)
-        return self._run_command([bash, "-defterm", "-no-start", "-mingw64", "-c", f"bash '{msys_script}'"], backend, command_label)
+            result = self._run_command([bash, "-lc", f"export MSYSTEM=MINGW64; export HOME='{work_dir}/.home'; export TMPDIR='{work_dir}/.tmp'; export PATH='{mingw_dir}':/usr/bin:$PATH; bash '{msys_script}'"], backend, command_label, env_extra=env_extra)
+        else:
+            result = self._run_command([bash, "-defterm", "-no-start", "-mingw64", "-c", f"bash '{msys_script}'"], backend, command_label, env_extra=env_extra)
+        if direct_filtered_run:
+            # Direct --gtest_filter / CppUTest -g/-n runs do not refresh CTest's
+            # LastTest.log.  Do not append stale full-suite evidence to the
+            # current filtered retry output.
+            return result
+        return self._attach_ctest_lasttest(result, script.parent, run_started_at=run_started_at)
 
-    def _run_command(self, cmd: list[str], backend: str, command_label: str) -> RunResult:
+    def _run_command(self, cmd: list[str], backend: str, command_label: str, env_extra: dict[str, str] | None = None) -> RunResult:
         try:
             timeout = int(os.environ.get("TESTING_MATE_RUN_TIMEOUT", "900"))
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False, env=toolchain_env())
-            return RunResult(backend=backend, command=command_label, returncode=result.returncode, stdout=result.stdout[-12000:], stderr=result.stderr[-12000:])
+            env = toolchain_env()
+            if env_extra:
+                env.update({str(key): str(value) for key, value in env_extra.items()})
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False, env=env)
+            return RunResult(backend=backend, command=command_label, returncode=result.returncode, stdout=self.trim_output(result.stdout), stderr=self.trim_output(result.stderr))
         except Exception as exc:
             return RunResult(backend=backend, command=command_label, returncode=None, skipped_reason=str(exc))
+
+    @staticmethod
+    def _cleanup_ctest_temp_logs(test_dir: Path | str) -> None:
+        """Remove stale CTest temp logs before a new backend execution."""
+        base = Path(str(test_dir))
+        temporary_dirs = [base / "build-clang-cov" / "Testing" / "Temporary", base / "build-lcov" / "Testing" / "Temporary"]
+        for temp_dir in temporary_dirs:
+            for name in ("LastTest.log", "LastTestsFailed.log", "CTestCostData.txt"):
+                try:
+                    path = temp_dir / name
+                    if path.exists():
+                        path.unlink()
+                except OSError:
+                    pass
+
+    @classmethod
+    def _attach_ctest_lasttest(cls, run_result: RunResult, test_dir: Path | str, run_started_at: float | None = None) -> RunResult:
+        """Append fresh CTest LastTest.log as parse evidence.
+
+        CTest logs are only valid for the current run. Filtered direct test
+        reruns and stale temp files must not be mixed into reconciliation.
+        """
+        base = Path(str(test_dir))
+        try:
+            candidates = list(base.rglob("LastTest.log"))
+        except OSError:
+            candidates = []
+        if not candidates:
+            return run_result
+        latest = max(candidates, key=lambda item: item.stat().st_mtime if item.exists() else 0)
+        try:
+            latest_mtime = latest.stat().st_mtime
+        except OSError:
+            return run_result
+        if run_started_at is not None and latest_mtime + 1.0 < float(run_started_at):
+            # Stale log from an older full-suite run. Ignore it.
+            return run_result
+        try:
+            log_text = latest.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return run_result
+        if not log_text.strip():
+            return run_result
+        stdout = str(run_result.stdout or "")
+        if log_text[:1000] in stdout:
+            return run_result
+        run_result.stdout = cls.trim_output(stdout + "\n\n=== CTest LastTest.log ===\n" + log_text)
+        return run_result
     
-    def extract_mcdc_metrics(self, out_dir: Path, source: Path, backend: str) -> dict[str, float | None]:
+    def extract_mcdc_metrics(self, out_dir: Path | str, source: Path | str, backend: str) -> dict[str, float | None]:
+        out_dir = self._as_path(out_dir).expanduser()
+        source = self._as_path(source).expanduser()
         """Extract MC/DC metrics from test execution coverage outputs.
         
         Looks for llvm-cov generated files:

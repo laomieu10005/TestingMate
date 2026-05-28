@@ -59,7 +59,7 @@ def toolchain_env() -> dict[str, str]:
 
 
 def windows_to_msys_path(path: Path) -> str:
-    resolved = path.resolve()
+    resolved = Path(path).resolve()
     drive = resolved.drive.rstrip(":").lower()
     rest = resolved.as_posix()[3:] if resolved.drive else resolved.as_posix()
     return f"/{drive}/{rest}" if drive else rest

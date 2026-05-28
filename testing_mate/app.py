@@ -1,14 +1,16 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox
 import tkinter as tk
@@ -16,9 +18,9 @@ from tkinter import ttk
 from typing import Callable
 
 from testing_mate.constants import *
-from testing_mate.models import CoverageFeedback, CoverageGap, Condition, FunctionInfo, Parameter, RunResult, TestCase
+from testing_mate.models import CoverageFeedback, CoverageGap, Condition, ExecutionContext, FunctionInfo, Parameter, RunResult, TestCase
 from testing_mate.c_backend import *
-from testing_mate.generator import TestBackendGenerator, TestBackendRunner, TestMockFallback, TestOracleFallback, backend_harness_path, format_run_result
+from testing_mate.generator import TestBackendGenerator, TestBackendRunner, TestCaseRunReconciler, TestMockFallback, TestOracleFallback, backend_harness_path, format_run_result
 from testing_mate.boolean_expression import BooleanExpressionEvaluator
 from testing_mate.clang_analyzer import ClangEnhancedAnalyzer
 from testing_mate.code_database import CodeDatabase
@@ -210,7 +212,7 @@ class TestingMateApp(tk.Tk):
         coverage_title.pack(fill="x", pady=(0, 8))
         ttk.Label(coverage_title, text="Coverage & Level", style="Section.TLabel").pack(side="left")
         ttk.Label(coverage_title, text="Retry", style="Muted.TLabel").pack(side="right", padx=(8, 0))
-        self.mock_retry_limit = tk.StringVar(value="5")
+        self.mock_retry_limit = tk.StringVar(value="8")
         ttk.Entry(coverage_title, textvariable=self.mock_retry_limit, width=4).pack(side="right")
         self.coverage = tk.StringVar(value="MC/DC")
         Coverages = ttk.Frame(left, style="Panel.TFrame")
@@ -246,7 +248,7 @@ class TestingMateApp(tk.Tk):
         self.preprocess = tk.BooleanVar(value=True)
         ttk.Checkbutton(compilerFR, text="Preprocess source first", variable=self.preprocess).pack(anchor="w", padx=(8, 0))
 
-        ttk.Label(left, text="Include dirs (; separated)", style="Muted.TLabel").pack(anchor="w", pady=(8, 4))
+        ttk.Label(left, text="Extra include dirs (; separated)", style="Muted.TLabel").pack(anchor="w", pady=(8, 4))
         self.include_dirs = tk.StringVar()
         ttk.Entry(left, textvariable=self.include_dirs).pack(fill="x")
 
@@ -290,6 +292,10 @@ class TestingMateApp(tk.Tk):
         self.target_coverage = tk.StringVar(value="100")
         self.target_coverage_entry = ttk.Entry(target_row, textvariable=self.target_coverage, width=7)
         self.target_coverage_entry.pack(side="left", padx=(8, 16))
+        ttk.Label(target_row, text="Density", style="Panel.TLabel").pack(side="left")
+        self.coverage_density = tk.StringVar(value="3")
+        self.coverage_density_entry = ttk.Entry(target_row, textvariable=self.coverage_density, width=5)
+        self.coverage_density_entry.pack(side="left", padx=(8, 16))
         ttk.Label(target_row, text="Rounds", style="Panel.TLabel").pack(side="left")
         self.max_ai_rounds = tk.StringVar(value="1")
         self.max_ai_rounds_entry = ttk.Entry(target_row, textvariable=self.max_ai_rounds, width=5)
@@ -307,7 +313,6 @@ class TestingMateApp(tk.Tk):
         self.ollama_controls = [
             self.ollama_model_entry,
             self.ollama_timeout_entry,
-            self.target_coverage_entry,
             self.max_ai_rounds_entry,
             self.report_file_entry,
             self.report_button,
@@ -444,19 +449,18 @@ class TestingMateApp(tk.Tk):
             database = CompileCommandsDatabase.load(Path(selected))
             sources = database.source_files()
             self._add_source_paths(sources)
-            existing_includes = [item.strip() for item in self.include_dirs.get().split(";") if item.strip()]
-            merged_includes = Orchestrator._unique_strings(existing_includes + database.include_dirs() + discover_include_dirs_for_sources(sources))
-            self.include_dirs.set(";".join(merged_includes))
             existing_defines = [item.strip() for item in self.defines.get().split(";") if item.strip()]
             merged_defines = Orchestrator._unique_strings(existing_defines + database.defines())
             self.defines.set(";".join(merged_defines))
-            self._append_log(f"Loaded compile_commands.json: added {len(sources)} files; merged include dirs and defines.")
+            ignored_includes = len(database.include_dirs())
+            include_note = f"; ignored {ignored_includes} compile include dirs" if ignored_includes else ""
+            self._append_log(f"Loaded compile_commands.json: added {len(sources)} files; merged defines{include_note}.")
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"Could not load compile_commands.json:\n{exc}")
 
     def _add_source_paths(self, paths: list[Path]) -> None:
         added = 0
-        existing = {path.resolve() for path in self.sources if path.exists()}
+        existing = {Path(str(path)).expanduser().resolve() for path in self.sources if Path(str(path)).expanduser().exists()}
         for path in paths:
             if path.suffix.lower() not in SOURCE_EXTENSIONS or not path.exists():
                 continue
@@ -468,18 +472,7 @@ class TestingMateApp(tk.Tk):
             added += 1
         self._refresh_source_list()
         if added:
-            auto_added = self._merge_auto_include_dirs_for_sources(self.sources)
-            msg = f"Added {added} source input files."
-            if auto_added:
-                msg += f" Auto-added {auto_added} include dirs."
-            self._append_log(msg)
-    def _merge_auto_include_dirs_for_sources(self, sources: list[Path]) -> int:
-        existing = [item.strip() for item in self.include_dirs.get().split(";") if item.strip()]
-        merged = Orchestrator._unique_strings([*existing, *discover_include_dirs_for_sources(sources)])
-        added = max(0, len(merged) - len(existing))
-        if added:
-            self.include_dirs.set(";".join(merged))
-        return added
+            self._append_log(f"Added {added} source input files.")
 
     def _refresh_source_list(self) -> None:
         self.source_list.delete(0, "end")
@@ -564,6 +557,7 @@ class TestingMateApp(tk.Tk):
         thread.start()
 
     def _rerun_async(self) -> None:
+        RERUN_CMD = 1
         if not self.sources and not self.compile_commands.get().strip():
             messagebox.showwarning(APP_NAME, "Add source files, a source folder, or compile_commands.json.")
             return
@@ -775,7 +769,7 @@ class TestingMateApp(tk.Tk):
 
         hint = ttk.Label(
             body,
-            text="Template keys: normal parameter names set harness inputs. Internal keys such as __expected_return, __expected_output.<name>, __expected_global.<name>, and __expected_calls are also supported. In Harness Code mode, the code block is inserted directly into the generated TEST body.",
+            text="Template keys: normal parameter names set harness inputs. Internal keys include __expected_return, __expected_output.<name>, __expected_global.<name>, __expected_calls, __expected_call_arg.<Mock>.<index>, __stub_return.<Mock>, and __stub_output.<Mock>.<index>. In Harness Code mode, the code block is inserted directly into the generated TEST body.",
             style="Muted.TLabel",
             wraplength=900,
         )
@@ -964,6 +958,8 @@ class TestingMateApp(tk.Tk):
                 self._append_log(f"  {path}")
         title = "Rerun testcases failed" if result.exit_code else "Rerun testcases complete"
         self._show_completion_popup(title, result.summary_lines, result.generated_paths, is_error=bool(result.exit_code))
+        RERUN_CMD = 0
+
 
     def _add_uncovered_cases(self, selected_gap: dict | None = None) -> None:
         self._set_log("")
@@ -1006,8 +1002,10 @@ class TestingMateApp(tk.Tk):
             ollama_model=self.ollama_model.get(),
             ollama_timeout_seconds=max(5, int(self._float_setting(self.ollama_timeout.get(), 45.0))),
             target_coverage_percent=self._float_setting(self.target_coverage.get(), 100.0),
+            coverage_density=max(1, min(12, int(self._float_setting(self.coverage_density.get(), 3.0)))),
             max_ai_rounds=max(1, int(self._float_setting(self.max_ai_rounds.get(), 1.0))),
-            mock_retry_limit=max(0, min(5, int(self._float_setting(self.mock_retry_limit.get(), 5.0)))),
+            mock_retry_limit=max(0, min(12, int(self._float_setting(self.mock_retry_limit.get(), 8.0)))),
+            clean_before_generate=True,
         )
 
     @staticmethod
@@ -1153,8 +1151,11 @@ class OrchestratorOptions:
     ollama_model: str = "qwen2.5-coder:3b"
     ollama_timeout_seconds: int = 45
     target_coverage_percent: float = 100.0
+    coverage_density: int = 3
     max_ai_rounds: int = 1
     mock_retry_limit: int = 5
+    clean_before_generate: bool = True
+    unit_sources_override: list[Path] = field(default_factory=list)
 
 
 @dataclass
@@ -1174,37 +1175,304 @@ class Orchestrator:
     def _log(self, text: str) -> None:
         self.log_callback(text)
 
-    def _run_backend_with_oracle_fallback(self, backend: str, backend_out_dir: Path, source: Path, retry_limit: int = 5) -> RunResult:
+    @staticmethod
+    def _path_contains(parent: Path, child: Path) -> bool:
+        try:
+            child.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+    def _unsafe_clean_generate_path(self, out_dir: Path, project_sources: list[Path]) -> bool:
+        """Return True when deleting out_dir could remove user source/project data."""
+        try:
+            resolved_out = out_dir.expanduser().resolve(strict=False)
+        except Exception:
+            resolved_out = out_dir.expanduser().absolute()
+
+        dangerous_roots = {
+            Path.cwd().resolve(strict=False),
+            Path.home().resolve(strict=False),
+        }
+        try:
+            dangerous_roots.add(Path(resolved_out.anchor).resolve(strict=False))
+        except Exception:
+            pass
+        if resolved_out in dangerous_roots:
+            return True
+
+        for source in project_sources:
+            try:
+                resolved_source = Path(source).expanduser().resolve(strict=False)
+            except Exception:
+                resolved_source = Path(source).expanduser().absolute()
+            if resolved_out == resolved_source or resolved_out == resolved_source.parent:
+                return True
+            if self._path_contains(resolved_out, resolved_source):
+                return True
+        return False
+
+    def _clean_generate_workspace(self, out_dir: Path, project_sources: list[Path], backend: str) -> None:
+        """Clean stale generated artifacts for a normal Generate run. Rerun keeps this data."""
+        out_dir = out_dir.expanduser()
+        if not out_dir.exists():
+            return
+
+        if self._unsafe_clean_generate_path(out_dir, project_sources):
+            # Safety fallback: never recursively delete a path that looks like a source/project folder.
+            backend_out_dir = out_dir / backend
+            if backend_out_dir.exists():
+                shutil.rmtree(backend_out_dir, ignore_errors=True)
+                self._log(f"Cleaned old {backend} generated workspace: {backend_out_dir}")
+            else:
+                self._log(f"Skipped broad cleanup for safety; output path may contain source data: {out_dir}")
+            return
+
+        shutil.rmtree(out_dir, ignore_errors=True)
+        self._log(f"Cleaned old Generate workspace: {out_dir}")
+
+    @staticmethod
+    def _gtest_failed_filter_from_result(run_result: RunResult, max_cases: int = 80) -> str:
+        """Build a GoogleTest --gtest_filter from the latest failed-test list."""
+        text = TestOracleFallback.backend_execution_text(run_result)
+        if not text.strip():
+            return ""
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for match in re.finditer(r"(?m)^\[\s*FAILED\s*\]\s+([^\s(]+)", text):
+            name = match.group(1).strip()
+            if not name or name.isdigit() or "." not in name:
+                continue
+            if name not in seen:
+                seen.add(name)
+                ordered.append(name)
+        if not ordered:
+            return ""
+        # GoogleTest OR-filters are colon separated. Keep the list bounded so
+        # command lines remain safe on Windows shells; fall back to full-suite
+        # rerun if the failing set is too large.
+        if len(ordered) > max_cases:
+            return ""
+        return ":".join(ordered)
+
+    @staticmethod
+    def _cpputest_failed_filter_from_result(run_result: RunResult, max_cases: int = 80) -> str:
+        """Build a CppUTest failed-case filter list from the latest failed tests.
+
+        CppUTest does not support GoogleTest-style colon OR filters.  The
+        generated runner accepts TESTING_MATE_CPPUTEST_FILTERS as a semicolon
+        list of ``Group::TestName`` entries and executes each failed case with
+        ``-g Group -n TestName``.  If the failing set is too large or cannot be
+        mapped to TEST(Group, Name), the caller falls back to a full-suite rerun.
+        """
+        text = TestOracleFallback.backend_execution_text(run_result)
+        if not text.strip():
+            return ""
+        ordered: list[str] = []
+        seen: set[str] = set()
+        patterns = [
+            r"Failure\s+in\s+TEST\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+            r"(?m)^\s*TEST\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)\s*(?:failed|failure|error)",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, re.I):
+                group = match.group(1).strip()
+                name = match.group(2).strip()
+                if not group or not name or name.isdigit():
+                    continue
+                entry = f"{group}::{name}"
+                if entry not in seen:
+                    seen.add(entry)
+                    ordered.append(entry)
+        if not ordered or len(ordered) > max_cases:
+            return ""
+        return ";".join(ordered)
+
+    @staticmethod
+    def _fallback_skip_coverage_enabled() -> bool:
+        raw = os.environ.get("TESTING_MATE_FAST_FALLBACK", "1").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    @staticmethod
+    def _final_coverage_enabled() -> bool:
+        raw = os.environ.get("TESTING_MATE_FINAL_COVERAGE", "1").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    @staticmethod
+    def _strict_escalation_before_fallback_enabled() -> bool:
+        raw = os.environ.get("TESTING_MATE_STRICT_ESCALATION_SEQUENCE", "1").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    def _run_backend_with_oracle_fallback(
+        self,
+        backend: str,
+        backend_out_dir: Path | str,
+        source: Path | str,
+        retry_limit: int = 8,
+        cases: list[TestCase] | None = None,
+        functions: list[FunctionInfo] | None = None,
+        code_database: CodeDatabase | None = None,
+    ) -> RunResult:
+        backend_out_dir = backend_out_dir if isinstance(backend_out_dir, Path) else Path(str(backend_out_dir))
+        source = source if isinstance(source, Path) else Path(str(source))
         runner = TestBackendRunner()
-        run_result = runner.run(backend, backend_out_dir, source)
+        fast_fallback = self._fallback_skip_coverage_enabled()
+
+        # First pass is a discovery/oracle pass: it should execute the tests but
+        # avoid llvm-profdata/llvm-cov/html work. Coverage is generated once,
+        # after expected values and mocks have stabilized.
+        run_result = runner.run(backend, backend_out_dir, source, skip_coverage=fast_fallback)
+        if fast_fallback:
+            self._log("Fallback discovery run: coverage generation is skipped until the final full-suite pass.")
         self._log(format_run_result(run_result))
         self._log_run_output(run_result)
-        retry_limit = max(0, min(5, int(retry_limit)))
+        retry_limit = max(0, min(12, int(retry_limit)))
+        case_updates_total = 0
+        fallback_changed = False
+
         for attempt in range(1, retry_limit + 1):
-            if run_result.returncode in (0, None):
+            if run_result.returncode is None:
                 break
+            if run_result.returncode == 0:
+                # A passing GoogleMock run can still contain uninteresting-call
+                # warnings. Preserve those observed mock parameters so the next
+                # generated suite controls the same branch instead of relying on
+                # wildcard/default mock behaviour.
+                notes: list[str] = []
+                case_updated, case_notes = TestCaseRunReconciler.apply(backend, backend_out_dir, source, run_result, cases)
+                case_updates_total += case_updated
+                notes.extend(case_notes)
+                mock_updated, mock_notes = TestMockFallback.apply(backend, backend_out_dir, source, run_result)
+                notes.extend(mock_notes if mock_updated else [])
+                for note in notes:
+                    self._log(note)
+                fallback_changed = fallback_changed or bool(case_updated or mock_updated)
+                break
+
             notes: list[str] = []
+            if backend == "GoogleTest":
+                failed_filter = self._gtest_failed_filter_from_result(run_result)
+            elif backend == "CppUTest":
+                failed_filter = self._cpputest_failed_filter_from_result(run_result)
+            else:
+                failed_filter = ""
+            case_updated, case_notes = TestCaseRunReconciler.apply(backend, backend_out_dir, source, run_result, cases)
+            case_updates_total += case_updated
+            notes.extend(case_notes)
             oracle_updated, oracle_notes = TestOracleFallback.apply(backend, backend_out_dir, source, run_result)
             notes.extend(oracle_notes)
             mock_updated, mock_notes = TestMockFallback.apply(backend, backend_out_dir, source, run_result)
             notes.extend(mock_notes)
             for note in notes:
                 self._log(note)
-            updated = oracle_updated + mock_updated
+            updated = case_updated + oracle_updated + mock_updated
+            fallback_changed = fallback_changed or bool(updated)
             if not updated:
                 break
-            self._log(f"Fallback retry {attempt}/{retry_limit}: patched {updated} generated test line(s); rerunning {backend}.")
-            next_result = runner.run(backend, backend_out_dir, source)
+
+            if backend == "GoogleTest" and failed_filter:
+                rerun_note = f"rerunning only failed GoogleTest cases ({len(failed_filter.split(':'))})."
+            elif backend == "CppUTest" and failed_filter:
+                rerun_note = f"rerunning only failed CppUTest cases ({len(failed_filter.split(';'))})."
+            else:
+                rerun_note = f"rerunning {backend}."
+            self._log(
+                f"Fallback retry {attempt}/{retry_limit}: stored {case_updated} testcase oracle/mock update(s), "
+                f"patched {oracle_updated + mock_updated} generated test line(s); {rerun_note}"
+            )
+            next_result = runner.run(
+                backend,
+                backend_out_dir,
+                source,
+                test_filter=failed_filter if backend in {"GoogleTest", "CppUTest"} else None,
+                skip_coverage=fast_fallback,
+            )
             fallback_log = "\n".join([
                 "",
                 f"=== Testing Mate Fallback Retry {attempt}/{retry_limit} ===",
                 *notes,
                 format_run_result(next_result),
             ])
-            next_result.stdout = (next_result.stdout + fallback_log)[-12000:]
+            next_result.stdout = TestBackendRunner.trim_output(str(next_result.stdout or "") + fallback_log)
             run_result = next_result
             self._log(format_run_result(run_result))
             self._log_run_output(run_result)
+
+        if case_updates_total and cases is not None and functions is not None:
+            try:
+                writer = ArtifactWriter(backend_out_dir)
+                writer._write_json(source, functions, cases, code_database, None)
+                writer._write_csv(source, cases, backend_csv_id(backend))
+                self._log(f"Persisted {case_updates_total} reconciled testcase oracle/mock update(s) into analysis JSON and cases CSV.")
+            except Exception as exc:
+                self._log(f"Could not persist reconciled testcase updates: {exc}")
+
+        # Final evidence pass: once the fallback run is stable, run the complete
+        # suite once with coverage enabled so the HTML/JSON/summary evidence is
+        # generated from a full, unfiltered execution.
+        if (
+            fast_fallback
+            and self._final_coverage_enabled()
+            and run_result.returncode == 0
+            and run_result.returncode is not None
+        ):
+            self._log("Final full-suite coverage run: generating coverage evidence once after fallback stabilization.")
+            final_result = runner.run(backend, backend_out_dir, source, skip_coverage=False)
+            self._log(format_run_result(final_result))
+            self._log_run_output(final_result)
+            run_result = final_result
+
+            final_retry_limit = max(1, min(3, retry_limit))
+            for final_attempt in range(1, final_retry_limit + 1):
+                if run_result.returncode in (0, None):
+                    break
+                if backend == "GoogleTest":
+                    failed_filter = self._gtest_failed_filter_from_result(run_result)
+                elif backend == "CppUTest":
+                    failed_filter = self._cpputest_failed_filter_from_result(run_result)
+                else:
+                    failed_filter = ""
+                notes: list[str] = []
+                case_updated, case_notes = TestCaseRunReconciler.apply(backend, backend_out_dir, source, run_result, cases)
+                case_updates_total += case_updated
+                notes.extend(case_notes)
+                oracle_updated, oracle_notes = TestOracleFallback.apply(backend, backend_out_dir, source, run_result)
+                notes.extend(oracle_notes)
+                mock_updated, mock_notes = TestMockFallback.apply(backend, backend_out_dir, source, run_result)
+                notes.extend(mock_notes)
+                updated = case_updated + oracle_updated + mock_updated
+                for note in notes:
+                    self._log(note)
+                if not updated:
+                    self._log("Final coverage reconciliation found no patchable oracle/mock failure.")
+                    break
+                self._log(
+                    f"Final coverage reconciliation {final_attempt}/{final_retry_limit}: "
+                    f"stored {case_updated} testcase update(s), patched {oracle_updated + mock_updated} generated line(s)."
+                )
+                if case_updated and cases is not None and functions is not None:
+                    try:
+                        writer = ArtifactWriter(backend_out_dir)
+                        writer._write_json(source, functions, cases, code_database, None)
+                        writer._write_csv(source, cases, backend_csv_id(backend))
+                    except Exception as exc:
+                        self._log(f"Could not persist final reconciled testcase updates: {exc}")
+                probe_result = runner.run(
+                    backend,
+                    backend_out_dir,
+                    source,
+                    test_filter=failed_filter if backend in {"GoogleTest", "CppUTest"} else None,
+                    skip_coverage=True,
+                )
+                self._log(format_run_result(probe_result))
+                self._log_run_output(probe_result)
+                if probe_result.returncode not in (0, None):
+                    run_result = probe_result
+                    continue
+                self._log("Final full-suite coverage rerun after reconciliation.")
+                run_result = runner.run(backend, backend_out_dir, source, skip_coverage=False)
+                self._log(format_run_result(run_result))
+                self._log_run_output(run_result)
         return run_result
 
     def _log_run_output(self, run_result: RunResult) -> None:
@@ -1214,6 +1482,29 @@ class Orchestrator:
         if run_result.stderr.strip():
             self._log("Run stderr:")
             self._log(run_result.stderr[-1200:])
+
+    @staticmethod
+    def _preserve_execution_layers(previous: CoverageFeedback, refreshed: CoverageFeedback) -> CoverageFeedback:
+        prev_layers = list(getattr(previous, "execution_layers", []) or [])
+        new_layers = list(getattr(refreshed, "execution_layers", []) or [])
+        if not prev_layers:
+            return refreshed
+        merged_layers = list(new_layers)
+        for item in prev_layers:
+            if item not in merged_layers:
+                merged_layers.append(item)
+        if merged_layers == new_layers:
+            return refreshed
+        return CoverageFeedback(
+            source=refreshed.source,
+            raw_text=refreshed.raw_text,
+            coverage_percent=refreshed.coverage_percent,
+            metrics=refreshed.metrics,
+            metric_notes=refreshed.metric_notes,
+            uncovered_items=refreshed.uncovered_items,
+            failures=refreshed.failures,
+            execution_layers=merged_layers,
+        )
 
     @staticmethod
     def _merge_run_failures(feedback: CoverageFeedback, run_result: RunResult | None) -> CoverageFeedback:
@@ -1231,7 +1522,51 @@ class Orchestrator:
             metric_notes=feedback.metric_notes,
             uncovered_items=feedback.uncovered_items,
             failures=failures[:120],
+            execution_layers=getattr(feedback, "execution_layers", []),
         )
+
+    @staticmethod
+    def _feedback_meets_selected_target(feedback: CoverageFeedback, coverage: str, target_percent: float) -> bool:
+        selected = str(coverage or "").strip().upper()
+        required = ["C0", "C1"]
+        if selected in {"MC/DC", "MCDC"}:
+            required.append("MC/DC")
+        target = max(0.0, min(100.0, target_percent))
+        for metric in required:
+            value = feedback.metrics.get(metric)
+            if value is None or value < target:
+                return False
+        return True
+
+    def _prepare_backend_analysis_workspace(
+        self,
+        backend_out_dir: Path,
+        source: Path,
+        backend: str,
+        unit_sources: list[Path],
+    ) -> tuple[Path, Path | None]:
+        if backend not in {"CppUTest", "GoogleTest"}:
+            return source, None
+
+        test_dir = backend_harness_path(backend_out_dir, source, backend).parent
+        source_dir = test_dir / "src"
+        stub_include_dir = test_dir / "stub" / "include"
+        try:
+            TestBackendGenerator(backend_out_dir, [])._copy_workspace_files(
+                source,
+                unit_sources or [source],
+                source_dir,
+                stub_include_dir,
+            )
+        except Exception as exc:
+            self._log(f"Could not prepare local analysis workspace for {source.name}; using selected source. {exc}")
+            return source, None
+
+        local_source = source_dir / source.name
+        if local_source.exists():
+            self._log(f"Analysis source staged: {local_source}")
+            return local_source, test_dir
+        return source, None
 
     def analyze_and_generate(self, options: OrchestratorOptions) -> OrchestratorResult:
         return self._run(options, refine_from_report=False)
@@ -1243,11 +1578,15 @@ class Orchestrator:
         result = OrchestratorResult()
         project_sources, _include_dirs, _defines, _compiler = self._resolve_project_inputs(options)
         out_dir = source_scoped_output_dir(options.output_dir.expanduser(), project_sources)
+        out_dir.mkdir(parents=True, exist_ok=True)
         if out_dir != options.output_dir.expanduser():
             self._log(f"Output folder: {out_dir}")
+        if len(project_sources) > 1:
+            return self._rerun_parallel_source_nodes(options, project_sources, out_dir)
         backend = options.backend
         report_parser = CoverageReportParser()
         report_items: list[dict] = []
+        code_database = None
 
         for source in project_sources:
             try:
@@ -1258,7 +1597,7 @@ class Orchestrator:
                     raise FileNotFoundError(f"Runner script was not generated: {runner_path}")
 
                 self._log(f"Rerunning existing {backend} testcase environment: {runner_path}")
-                run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit)
+                run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit, cases, functions, code_database)
                 if run_result.returncode not in (0, None):
                     result.exit_code = run_result.returncode
 
@@ -1275,7 +1614,6 @@ class Orchestrator:
                 if run_result.returncode not in (0, None) or (run_result.returncode is None and run_result.skipped_reason):
                     result.exit_code = run_result.returncode or 1
                     result.summary_lines.append(f"{source.name}: ERROR {format_run_result(run_result)}")
-                    return result
                 report_items.append(
                     {
                         "source": source,
@@ -1318,20 +1656,28 @@ class Orchestrator:
         if requested_source:
             project_sources = [source for source in project_sources if source.name == requested_source or source.stem == Path(requested_source).stem] or project_sources
 
-        preprocessor = CPreprocessor(compiler, include_dirs, defines)
         analyzer = ClangEnhancedAnalyzer(include_dirs, defines, compiler, self._log)
         generator = TestVectorGenerator()
         report_parser = CoverageReportParser()
         loaded_feedback = load_coverage_feedback(options.report_file, report_parser, self._log)
         backend = options.backend
-        unit_sources = self._project_unit_sources(project_sources, include_dirs) if backend in {"CppUTest", "GoogleTest"} else list(project_sources)
+        unit_sources = list(options.unit_sources_override) if options.unit_sources_override else (self._project_unit_sources(project_sources, include_dirs) if backend in {"CppUTest", "GoogleTest"} else list(project_sources))
         report_items: list[dict] = []
 
         for source in project_sources[:1]:
             try:
-                analysis_source = source
+                backend_out_dir = out_dir / backend
+                analysis_input_source, analysis_stub_dir = self._prepare_backend_analysis_workspace(
+                    backend_out_dir,
+                    source,
+                    backend,
+                    unit_sources or [source],
+                )
+                analysis_source = analysis_input_source
                 if options.preprocess:
-                    analysis_source, note = preprocessor.preprocess_file(source, out_dir / "preprocessed")
+                    preprocess_out_dir = (analysis_stub_dir / "preprocessed") if analysis_stub_dir else (out_dir / "preprocessed")
+                    preprocessor = CPreprocessor(compiler, [], defines, stub_dir=analysis_stub_dir)
+                    analysis_source, note = preprocessor.preprocess_file(analysis_input_source, preprocess_out_dir)
                     self._log(note)
                 functions = analyzer.analyze(
                     analysis_source,
@@ -1341,7 +1687,6 @@ class Orchestrator:
                 if analysis_source != source:
                     analyzer.apply_original_source_context(functions, source)
                 code_database = CodeDatabase.from_functions(source, analysis_source, functions, analyzer=analyzer.last_analyzer)
-                backend_out_dir = out_dir / backend
                 writer = ArtifactWriter(backend_out_dir)
                 try:
                     _saved_functions, existing_cases = self._load_existing_analysis(backend_out_dir, source)
@@ -1381,7 +1726,7 @@ class Orchestrator:
                 result.generated_paths.extend(paths)
                 self._log(f"Added manual testcase {manual_case.test_id} for {manual_case.function}.")
 
-                run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit)
+                run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit, cases, functions, code_database)
                 if run_result.returncode not in (0, None):
                     result.exit_code = run_result.returncode
                 refreshed_feedback = collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or feedback
@@ -1504,20 +1849,28 @@ class Orchestrator:
         if out_dir != options.output_dir.expanduser():
             self._log(f"Output folder: {out_dir}")
 
-        preprocessor = CPreprocessor(compiler, include_dirs, defines)
         analyzer = ClangEnhancedAnalyzer(include_dirs, defines, compiler, self._log)
         generator = TestVectorGenerator()
         report_parser = CoverageReportParser()
         loaded_feedback = load_coverage_feedback(options.report_file, report_parser, self._log)
         backend = options.backend
-        unit_sources = self._project_unit_sources(project_sources, include_dirs) if backend in {"CppUTest", "GoogleTest"} else list(project_sources)
+        unit_sources = list(options.unit_sources_override) if options.unit_sources_override else (self._project_unit_sources(project_sources, include_dirs) if backend in {"CppUTest", "GoogleTest"} else list(project_sources))
         report_items: list[dict] = []
 
         for source in project_sources:
             try:
-                analysis_source = source
+                backend_out_dir = out_dir / backend
+                analysis_input_source, analysis_stub_dir = self._prepare_backend_analysis_workspace(
+                    backend_out_dir,
+                    source,
+                    backend,
+                    unit_sources or [source],
+                )
+                analysis_source = analysis_input_source
                 if options.preprocess:
-                    analysis_source, note = preprocessor.preprocess_file(source, out_dir / "preprocessed")
+                    preprocess_out_dir = (analysis_stub_dir / "preprocessed") if analysis_stub_dir else (out_dir / "preprocessed")
+                    preprocessor = CPreprocessor(compiler, [], defines, stub_dir=analysis_stub_dir)
+                    analysis_source, note = preprocessor.preprocess_file(analysis_input_source, preprocess_out_dir)
                     self._log(note)
                 functions = analyzer.analyze(
                     analysis_source,
@@ -1527,7 +1880,6 @@ class Orchestrator:
                 if analysis_source != source:
                     analyzer.apply_original_source_context(functions, source)
                 code_database = CodeDatabase.from_functions(source, analysis_source, functions, analyzer=analyzer.last_analyzer)
-                backend_out_dir = out_dir / backend
                 writer = ArtifactWriter(backend_out_dir)
                 try:
                     _saved_functions, existing_cases = self._load_existing_analysis(backend_out_dir, source)
@@ -1569,6 +1921,7 @@ class Orchestrator:
                     options.coverage,
                     options.asil_level,
                     code_database,
+                    max_cases_per_gap=options.coverage_density,
                 )
                 if not new_cases:
                     result.summary_lines.append(f"{source.name}: gaps found, but all generated candidate vectors duplicated existing cases.")
@@ -1595,7 +1948,7 @@ class Orchestrator:
                 result.generated_paths.extend(paths)
                 self._log(f"Added {len(new_cases)} coverage-gap candidate cases for {source.name}.")
 
-                run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit)
+                run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit, cases, functions, code_database)
                 if run_result.returncode not in (0, None):
                     result.exit_code = run_result.returncode
                 refreshed_feedback = collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or feedback
@@ -1666,29 +2019,249 @@ class Orchestrator:
             condition=condition,
         )]
 
+    def _node_worker_count(self, source_count: int) -> int:
+        """Return the bounded number of parallel source nodes for folder/multi-file mode."""
+        raw = os.environ.get("TESTING_MATE_NODE_WORKERS", "")
+        try:
+            configured = int(raw) if raw.strip() else 0
+        except ValueError:
+            configured = 0
+        cpu_default = max(1, min(4, os.cpu_count() or 1))
+        workers = configured if configured > 0 else cpu_default
+        return max(1, min(source_count, workers))
+
+    @staticmethod
+    def _safe_node_name(source: Path) -> str:
+        return safe_output_folder_name(Path(source).stem, "source")
+
+    def _write_source_node_status(
+        self,
+        node_out_dir: Path,
+        source: Path,
+        node_result: OrchestratorResult,
+        report_path: Path | None,
+    ) -> Path:
+        """Write a completion marker for one parallel source node."""
+        node_out_dir.mkdir(parents=True, exist_ok=True)
+        status_path = node_out_dir / "testing_mate_node_status.json"
+        status = "PASS" if node_result.exit_code == 0 else "FAIL"
+        payload = {
+            "done": True,
+            "source": str(source),
+            "source_name": source.name,
+            "status": status,
+            "exit_code": int(node_result.exit_code or 0),
+            "report_path": str(report_path) if report_path else "",
+            "generated_paths": [str(path) for path in node_result.generated_paths],
+            "summary_lines": list(node_result.summary_lines),
+        }
+        status_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return status_path
+
+    @staticmethod
+    def _pick_node_report_path(source: Path, generated_paths: list[Path]) -> Path | None:
+        html_paths = [Path(path) for path in generated_paths if Path(path).suffix.lower() in {".html", ".htm"}]
+        preferred = [path for path in html_paths if path.name.lower() == f"{source.stem.lower()}.html"]
+        return (preferred or html_paths or [None])[-1]
+
+    def _run_parallel_source_nodes(
+        self,
+        options: OrchestratorOptions,
+        refine_from_report: bool,
+        project_sources: list[Path],
+        out_dir: Path,
+    ) -> OrchestratorResult:
+        """Execute one isolated node per target source and merge their final reports.
+
+        Each node runs the strict sequence on one target file:
+        1. generate base cases,
+        2. run coverage escalation layers,
+        3. collect improved layer candidates into the final test file,
+        4. apply expected/mock fallback on that final file.
+        """
+        result = OrchestratorResult()
+        backend = options.backend
+        node_root = out_dir / "modules"
+        node_root.mkdir(parents=True, exist_ok=True)
+        report_items: list[dict] = []
+        workers = self._node_worker_count(len(project_sources))
+        self._log(f"Parallel folder mode: {len(project_sources)} source node(s), {workers} worker(s).")
+
+        def run_one(source: Path) -> tuple[Path, Path, OrchestratorResult, Path | None, Path]:
+            node_name = self._safe_node_name(source)
+            node_out_dir = node_root / node_name
+            node_options = replace(
+                options,
+                sources=[source],
+                output_dir=node_out_dir,
+                compile_commands=None,
+                clean_before_generate=False,
+                unit_sources_override=list(project_sources),
+            )
+            node_logger = lambda text, name=source.name: self._log(f"[{name}] {text}")
+            node_result = Orchestrator(node_logger)._run(node_options, refine_from_report=refine_from_report)
+            report_path = self._pick_node_report_path(source, node_result.generated_paths)
+            status_path = self._write_source_node_status(node_out_dir, source, node_result, report_path)
+            return source, node_out_dir, node_result, report_path, status_path
+
+        if workers <= 1:
+            completed = [run_one(source) for source in project_sources]
+        else:
+            completed = []
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_map = {executor.submit(run_one, source): source for source in project_sources}
+                for future in as_completed(future_map):
+                    source = future_map[future]
+                    try:
+                        completed.append(future.result())
+                    except Exception as exc:
+                        node_out_dir = node_root / self._safe_node_name(source)
+                        node_result = OrchestratorResult(exit_code=1)
+                        node_result.summary_lines.append(f"{source.name}: ERROR {exc}")
+                        status_path = self._write_source_node_status(node_out_dir, source, node_result, None)
+                        completed.append((source, node_out_dir, node_result, None, status_path))
+                        self._log(f"[{source.name}] ERROR node failed: {exc}")
+
+        completed.sort(key=lambda item: project_sources.index(item[0]))
+        for source, _node_out_dir, node_result, report_path, status_path in completed:
+            result.generated_paths.extend(node_result.generated_paths)
+            result.generated_paths.append(status_path)
+            result.functions.extend(node_result.functions)
+            result.cases.extend(node_result.cases)
+            if node_result.feedback is not None:
+                result.feedback = node_result.feedback
+            if node_result.exit_code:
+                result.exit_code = node_result.exit_code or 1
+            status = "PASS" if node_result.exit_code == 0 else f"FAIL ({node_result.exit_code})"
+            result.summary_lines.extend(node_result.summary_lines or [f"{source.name}: {status}"])
+            report_items.append({
+                "source": source,
+                "functions": node_result.functions,
+                "cases": node_result.cases,
+                "feedback": node_result.feedback or CoverageFeedback(source="none", raw_text=""),
+                "run_result": RunResult(backend=backend, command=f"source node {source.name}", returncode=node_result.exit_code),
+                "report_path": report_path,
+            })
+            self._log(f"[{source.name}] Node done: {status}; marker: {status_path}")
+
+        if report_items:
+            final_report = ArtifactWriter(out_dir / backend)._write_multi_file_report(backend, report_items)
+            result.generated_paths.append(final_report)
+            self._log(f"All-target final report: {final_report}")
+            result.summary_lines.append(f"All files: {len(report_items)} source node reports collected in {final_report}")
+        return result
+
+    def _rerun_parallel_source_nodes(
+        self,
+        options: OrchestratorOptions,
+        project_sources: list[Path],
+        out_dir: Path,
+    ) -> OrchestratorResult:
+        """Rerun existing per-source nodes in parallel without cleaning their artifacts."""
+        result = OrchestratorResult()
+        backend = options.backend
+        node_root = out_dir / "modules"
+        node_root.mkdir(parents=True, exist_ok=True)
+        report_items: list[dict] = []
+        workers = self._node_worker_count(len(project_sources))
+        self._log(f"Parallel rerun mode: {len(project_sources)} source node(s), {workers} worker(s).")
+
+        def run_one(source: Path) -> tuple[Path, Path, OrchestratorResult, Path | None, Path]:
+            node_out_dir = node_root / self._safe_node_name(source)
+            node_options = replace(
+                options,
+                sources=[source],
+                output_dir=node_out_dir,
+                compile_commands=None,
+                unit_sources_override=list(project_sources),
+            )
+            node_logger = lambda text, name=source.name: self._log(f"[{name}] {text}")
+            node_result = Orchestrator(node_logger).rerun_existing(node_options)
+            report_path = self._pick_node_report_path(source, node_result.generated_paths)
+            status_path = self._write_source_node_status(node_out_dir, source, node_result, report_path)
+            return source, node_out_dir, node_result, report_path, status_path
+
+        if workers <= 1:
+            completed = [run_one(source) for source in project_sources]
+        else:
+            completed = []
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_map = {executor.submit(run_one, source): source for source in project_sources}
+                for future in as_completed(future_map):
+                    source = future_map[future]
+                    try:
+                        completed.append(future.result())
+                    except Exception as exc:
+                        node_out_dir = node_root / self._safe_node_name(source)
+                        node_result = OrchestratorResult(exit_code=1)
+                        node_result.summary_lines.append(f"{source.name}: ERROR {exc}")
+                        status_path = self._write_source_node_status(node_out_dir, source, node_result, None)
+                        completed.append((source, node_out_dir, node_result, None, status_path))
+                        self._log(f"[{source.name}] ERROR rerun node failed: {exc}")
+
+        completed.sort(key=lambda item: project_sources.index(item[0]))
+        for source, _node_out_dir, node_result, report_path, status_path in completed:
+            result.generated_paths.extend(node_result.generated_paths)
+            result.generated_paths.append(status_path)
+            result.functions.extend(node_result.functions)
+            result.cases.extend(node_result.cases)
+            if node_result.feedback is not None:
+                result.feedback = node_result.feedback
+            if node_result.exit_code:
+                result.exit_code = node_result.exit_code or 1
+            result.summary_lines.extend(node_result.summary_lines or [f"{source.name}: {'PASS' if node_result.exit_code == 0 else 'FAIL'}"])
+            report_items.append({
+                "source": source,
+                "functions": node_result.functions,
+                "cases": node_result.cases,
+                "feedback": node_result.feedback or CoverageFeedback(source="none", raw_text=""),
+                "run_result": RunResult(backend=backend, command=f"rerun source node {source.name}", returncode=node_result.exit_code),
+                "report_path": report_path,
+            })
+            self._log(f"[{source.name}] Rerun node done: {'PASS' if node_result.exit_code == 0 else f'FAIL ({node_result.exit_code})'}; marker: {status_path}")
+
+        if report_items:
+            final_report = ArtifactWriter(out_dir / backend)._write_multi_file_report(backend, report_items)
+            result.generated_paths.append(final_report)
+            self._log(f"All-target rerun report: {final_report}")
+            result.summary_lines.append(f"All files: {len(report_items)} source node reports collected in {final_report}")
+        return result
+
     def _run(self, options: OrchestratorOptions, refine_from_report: bool) -> OrchestratorResult:
         result = OrchestratorResult()
         project_sources, include_dirs, defines, compiler = self._resolve_project_inputs(options)
         out_dir = source_scoped_output_dir(options.output_dir.expanduser(), project_sources)
+        if not refine_from_report and options.clean_before_generate:
+            self._clean_generate_workspace(out_dir, project_sources, options.backend)
         out_dir.mkdir(parents=True, exist_ok=True)
         if out_dir != options.output_dir.expanduser():
             self._log(f"Output folder: {out_dir}")
-        preprocessor = CPreprocessor(compiler, include_dirs, defines)
+        if len(project_sources) > 1:
+            return self._run_parallel_source_nodes(options, refine_from_report, project_sources, out_dir)
         analyzer = ClangEnhancedAnalyzer(include_dirs, defines, compiler, self._log)
         generator = TestVectorGenerator()
         report_parser = CoverageReportParser()
         feedback = load_coverage_feedback(options.report_file, report_parser, self._log)
         backend = options.backend
-        unit_sources = self._project_unit_sources(project_sources, include_dirs) if backend in {"CppUTest", "GoogleTest"} else list(project_sources)
+        unit_sources = list(options.unit_sources_override) if options.unit_sources_override else (self._project_unit_sources(project_sources, include_dirs) if backend in {"CppUTest", "GoogleTest"} else list(project_sources))
         if len(unit_sources) > len(project_sources):
             self._log(f"Auto-linked {len(unit_sources) - len(project_sources)} project source files for {backend} harness build.")
         report_items: list[dict] = []
 
         for source in project_sources:
             try:
-                analysis_source = source
+                backend_out_dir = out_dir / backend
+                analysis_input_source, analysis_stub_dir = self._prepare_backend_analysis_workspace(
+                    backend_out_dir,
+                    source,
+                    backend,
+                    unit_sources or [source],
+                )
+                analysis_source = analysis_input_source
                 if options.preprocess:
-                    analysis_source, note = preprocessor.preprocess_file(source, out_dir / "preprocessed")
+                    preprocess_out_dir = (analysis_stub_dir / "preprocessed") if analysis_stub_dir else (out_dir / "preprocessed")
+                    preprocessor = CPreprocessor(compiler, [], defines, stub_dir=analysis_stub_dir)
+                    analysis_source, note = preprocessor.preprocess_file(analysis_input_source, preprocess_out_dir)
                     self._log(note)
                 functions = analyzer.analyze(
                     analysis_source,
@@ -1697,6 +2270,11 @@ class Orchestrator:
                 )
                 if analysis_source != source:
                     analyzer.apply_original_source_context(functions, source)
+                if backend in {"GoogleTest", "CppUTest"} and os.environ.get("TESTING_MATE_TEST_MAIN", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+                    before_main_filter = len(functions)
+                    functions = [fn for fn in functions if str(getattr(fn, "name", "")) != "main"]
+                    if len(functions) != before_main_filter:
+                        self._log("Skipped target main() for unit-test backend. Set TESTING_MATE_TEST_MAIN=1 to force main() generation.")
                 code_database = CodeDatabase.from_functions(source, analysis_source, functions, analyzer=analyzer.last_analyzer)
                 self._log(f"Code database: {len(code_database.functions)} functions extracted for {source.name}.")
                 if options.include_static_functions and backend in {"CppUTest", "GoogleTest"} and any(fn.return_type.strip().startswith("static") for fn in functions):
@@ -1712,7 +2290,43 @@ class Orchestrator:
                     code_database,
                 )
                 active_feedback = merge_generated_coverage_feedback(feedback, functions, cases, options.coverage)
+                execution_context = ExecutionContext(
+                    source_path=source,
+                    backend=backend,
+                    out_dir=backend_out_dir,
+                    include_dirs=include_dirs,
+                    defines=defines,
+                    compiler=compiler,
+                    coverage=options.coverage,
+                    level=options.level,
+                    asil_level=options.asil_level,
+                    target_coverage_percent=options.target_coverage_percent,
+                    unit_sources=unit_sources or [source],
+                    toolchain_options={"compile_commands": str(options.compile_commands) if options.compile_commands else ""},
+                    run_after_generate=options.run_after_generate,
+                )
+                cases, active_feedback, escalation_statuses = generator.run_escalation(
+                    source.name,
+                    functions,
+                    cases,
+                    active_feedback,
+                    options.level,
+                    options.coverage,
+                    options.asil_level,
+                    code_database,
+                    target_percent=options.target_coverage_percent,
+                    density=options.coverage_density,
+                    execution_context=execution_context,
+                )
+                if escalation_statuses:
+                    status_counts: dict[str, int] = {}
+                    for status in escalation_statuses.values():
+                        status_counts[status] = status_counts.get(status, 0) + 1
+                    status_note = ", ".join(f"{status}={count}" for status, count in sorted(status_counts.items()))
+                    self._log(f"Layer fallback coverage gate: {status_note}")
+
                 backend_out_dir = out_dir / backend
+
                 writer = ArtifactWriter(backend_out_dir)
                 run_result: RunResult | None = None
 
@@ -1761,19 +2375,69 @@ class Orchestrator:
 
                 should_run = options.run_after_generate or refine_from_report
                 if should_run:
-                    run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit)
+                    run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit, cases, functions, code_database)
                     if run_result.returncode not in (0, None):
                         result.exit_code = run_result.returncode
-                    active_feedback = collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or active_feedback
+                    active_feedback = self._preserve_execution_layers(active_feedback, collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or active_feedback)
                     active_feedback = merge_generated_coverage_feedback(active_feedback, functions, cases, options.coverage)
                     active_feedback = self._merge_run_failures(active_feedback, run_result)
+                    below_target = not self._feedback_meets_selected_target(active_feedback, options.coverage, options.target_coverage_percent)
+                    strict_sequence = self._strict_escalation_before_fallback_enabled()
+                    if below_target and strict_sequence:
+                        self._log(
+                            "Strict sequence active: post-fallback coverage escalation is skipped. "
+                            "Escalation layers already ran before the final merged testcase file and oracle/mock fallback."
+                        )
+                    if below_target and not strict_sequence:
+                        before_count = len(cases)
+                        cases, active_feedback, escalation_statuses = generator.run_escalation(
+                            source.name,
+                            functions,
+                            cases,
+                            active_feedback,
+                            options.level,
+                            options.coverage,
+                            options.asil_level,
+                            code_database,
+                            target_percent=options.target_coverage_percent,
+                            density=options.coverage_density,
+                            execution_context=execution_context,
+                        )
+                        added = len(cases) - before_count
+                        if added > 0:
+                            self._log(
+                                f"Layer fallback added {added} gap-driven case(s) below target "
+                                f"{options.target_coverage_percent:.2f}% at density {options.coverage_density}; rerunning."
+                            )
+                            source_paths = writer.write(
+                                source,
+                                functions,
+                                cases,
+                                options.level,
+                                backend,
+                                active_feedback,
+                                run_result,
+                                include_backend=True,
+                                unit_sources=unit_sources or [source],
+                                include_dirs=include_dirs,
+                                target_coverage_percent=options.target_coverage_percent,
+                                code_database=code_database,
+                            )
+                            result.generated_paths.extend(source_paths)
+                            run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit, cases, functions, code_database)
+                            if run_result.returncode not in (0, None):
+                                result.exit_code = run_result.returncode
+                            active_feedback = self._preserve_execution_layers(active_feedback, collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or active_feedback)
+                            active_feedback = merge_generated_coverage_feedback(active_feedback, functions, cases, options.coverage)
+                            active_feedback = self._merge_run_failures(active_feedback, run_result)
+                        elif escalation_statuses:
+                            self._log("Layer fallback found no new non-duplicate gap case below target.")
                     report_path = writer._write_html_report(source, functions, cases, backend, active_feedback, run_result)
                     result.generated_paths.append(report_path)
                     result.generated_paths.append(writer._write_summary(source, functions, cases, active_feedback, run_result))
                     if run_result.returncode not in (0, None) or (run_result.returncode is None and run_result.skipped_reason):
                         result.exit_code = run_result.returncode or 1
                         result.summary_lines.append(f"{source.name}: ERROR {format_run_result(run_result)}")
-                        return result
 
                 result.functions.extend(functions)
                 result.cases.extend(cases)
@@ -1812,42 +2476,40 @@ class Orchestrator:
         return result
 
     def _resolve_project_inputs(self, options: OrchestratorOptions) -> tuple[list[Path], list[str], list[str], str]:
-        sources = list(options.sources)
-        include_dirs = list(options.include_dirs)
-        defines = list(options.defines)
-        compiler = options.compiler.strip() or DEFAULT_COMPILER
+        sources = [item if isinstance(item, Path) else Path(str(item)) for item in list(options.sources)]
+        include_dirs = [str(item) for item in list(options.include_dirs)]
+        defines = [str(item) for item in list(options.defines)]
+        compiler = str(options.compiler or "").strip() or DEFAULT_COMPILER
 
         if options.compile_commands:
             try:
-                database = CompileCommandsDatabase.load(options.compile_commands)
+                compile_commands = options.compile_commands if isinstance(options.compile_commands, Path) else Path(str(options.compile_commands))
+                database = CompileCommandsDatabase.load(compile_commands)
                 compile_sources = database.source_files()
                 sources.extend(compile_sources)
-                include_dirs.extend(database.include_dirs())
                 defines.extend(database.defines())
                 database_compiler = database.compiler()
                 if database_compiler and not options.compiler.strip():
                     compiler = database_compiler
                 self._log(
                     f"Loaded compile_commands.json: {len(compile_sources)} source files, "
-                    f"{len(database.include_dirs())} include dirs, {len(database.defines())} defines."
+                    f"{len(database.defines())} defines; ignored {len(database.include_dirs())} compile include dirs."
                 )
             except Exception as exc:
                 self._log(f"compile_commands.json could not be loaded: {exc}")
 
         sources = self._unique_existing_sources(sources)
-        auto_include_dirs = discover_include_dirs_for_sources(sources)
-        include_dirs = self._unique_strings([*include_dirs, *auto_include_dirs])
+        include_dirs = self._unique_strings(include_dirs)
         defines = self._unique_strings(defines)
-        if auto_include_dirs:
-            self._log(f"Auto include dirs: {len(auto_include_dirs)} discovered from source parents/include-inc-header folders.")
         return sources, include_dirs, defines, compiler
 
     @staticmethod
-    def _unique_existing_sources(sources: list[Path]) -> list[Path]:
+    def _unique_existing_sources(sources: list[Path | str]) -> list[Path]:
         result: list[Path] = []
         seen: set[Path] = set()
         for source in sources:
-            path = source.expanduser()
+            path = source if isinstance(source, Path) else Path(str(source))
+            path = path.expanduser()
             if path.suffix.lower() not in SOURCE_EXTENSIONS:
                 continue
             try:
@@ -1873,12 +2535,13 @@ class Orchestrator:
         return result
 
     @staticmethod
-    def _project_unit_sources(sources: list[Path], include_dirs: list[str]) -> list[Path]:
+    def _project_unit_sources(sources: list[Path | str], _include_dirs: list[str]) -> list[Path]:
         discovered: list[Path] = []
         seen: set[Path] = set()
 
-        def add(path: Path) -> None:
-            if path.suffix.lower() not in C_SOURCE_EXTENSIONS or not path.exists():
+        def add(path: Path | str) -> None:
+            path = path if isinstance(path, Path) else Path(str(path))
+            if path.suffix.lower() not in SOURCE_EXTENSIONS or not path.exists():
                 return
             resolved = path.resolve()
             if resolved in seen:
@@ -1888,22 +2551,6 @@ class Orchestrator:
 
         for source in sources:
             add(source)
-
-        project_roots: list[Path] = []
-        for include_dir in include_dirs:
-            inc = Path(include_dir).expanduser()
-            if inc.exists() and inc.is_dir() and inc.name.lower() in {"include", "inc", "includes"}:
-                project_roots.append(inc.parent)
-
-        for root in project_roots:
-            src_dir = root / "src"
-            if not src_dir.exists():
-                continue
-            for extension in C_SOURCE_EXTENSIONS:
-                for candidate in src_dir.rglob(f"*{extension}"):
-                    if any(part.lower() in {"generated", "build", "out"} for part in candidate.parts):
-                        continue
-                    add(candidate)
 
         return discovered
 
