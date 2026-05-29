@@ -410,8 +410,7 @@ class TestVectorGenerator:
                 return fn
         return None
 
-    @staticmethod
-    def _condition_for_gap_line(fn: FunctionInfo, line: int | None, text: str = "") -> Condition | None:
+    def _condition_for_gap_line(self, fn: FunctionInfo, line: int | None, text: str = "") -> Condition | None:
         if line is not None:
             for condition in fn.conditions:
                 if condition.line == line:
@@ -424,7 +423,7 @@ class TestVectorGenerator:
         lowered = str(text or "").lower()
         for condition in fn.conditions:
             for candidate in self._condition_texts(condition):
-                if candidate.lower() in lowered:
+                if str(candidate).lower() in lowered:
                     return condition
         return None
 
@@ -662,7 +661,8 @@ class TestVectorGenerator:
             if param.kind == "pointer":
                 vec[param.name] = "NULL"
             else:
-                vec[param.name] = self._interesting_values(param)[0]
+                values = self._interesting_values_from_function(param, fn)
+                vec[param.name] = values[0]
             self._append_unique(vectors, vec)
         return vectors
 
@@ -689,7 +689,7 @@ class TestVectorGenerator:
         vectors = list(base_vectors[:3])
         base = base_vectors[0] if base_vectors else {}
         for param in fn.parameters:
-            values = self._interesting_values(param)
+            values = self._interesting_values_from_function(param, fn)
             if len(values) > 2:
                 vec = dict(base)
                 vec[param.name] = values[len(values) // 2]
@@ -700,7 +700,7 @@ class TestVectorGenerator:
         vectors: list[dict[str, str]] = []
         base = base_vectors[0] if base_vectors else {}
         for param in fn.parameters:
-            values = self._interesting_values(param)
+            values = self._interesting_values_from_function(param, fn)
             for value in (values[:2] + values[-2:]):
                 vec = dict(base)
                 vec[param.name] = value
@@ -1524,6 +1524,114 @@ class TestVectorGenerator:
         if "unsigned" in ctype or re.search(r"\buint(?:8|16|32|64)?(?:_t)?\b", ctype):
             return ["0", "1", "2", "3", "15", "16", "255"]
         return ["-2", "-1", "0", "1", "2", "3", "15", "16"]
+
+    @staticmethod
+    def _interesting_values_from_function(param: Parameter, fn: FunctionInfo | None) -> list[str]:
+        """Extract boundary and equivalence values from function conditions and AST.
+        
+        Returns default interesting values merged with constants extracted from conditions
+        that reference this parameter. Useful for driving test generation toward actual
+        decision boundaries found in the source code.
+        """
+        default_values = list(TestVectorGenerator._interesting_values(param))
+        
+        if fn is None or not fn.conditions:
+            return default_values
+        
+        extracted = TestVectorGenerator._extract_constants_for_param(param.name, fn)
+        if not extracted:
+            return default_values
+        
+        # Merge extracted values with defaults, preserve order, remove duplicates
+        result: list[str] = []
+        seen: set[str] = set()
+        
+        # Add extracted values first (they're from actual code)
+        for value in extracted:
+            if value not in seen:
+                result.append(value)
+                seen.add(value)
+        
+        # Then add defaults if not already present
+        for value in default_values:
+            if value not in seen:
+                result.append(value)
+                seen.add(value)
+        
+        return result[:12]  # Limit to prevent explosion
+
+    @staticmethod
+    def _extract_constants_for_param(param_name: str, fn: FunctionInfo) -> list[str]:
+        """Extract numeric and enum constants from conditions referencing this parameter.
+        
+        Scans all conditions in the function to find comparison values, boundaries, and
+        equivalence class representatives for the given parameter.
+        """
+        constants: list[str] = []
+        seen: set[str] = set()
+        
+        for condition in fn.conditions:
+            condition_text = str(condition.text or "")
+            
+            # Pattern 1: param == value or param != value or param > value, etc.
+            match = re.search(
+                rf"\b{re.escape(param_name)}\b\s*(?:==|!=|>=|<=|>|<)\s*([-+]?\d+(?:\.\d+)?[uUlL]*|[A-Z][A-Za-z0-9_]*|true|false|TRUE|FALSE|NULL|nullptr)",
+                condition_text,
+                re.I
+            )
+            if match:
+                value = match.group(1)
+                if value.upper() not in {"TRUE", "FALSE", "NULL"}:
+                    if value not in seen:
+                        constants.append(value)
+                        seen.add(value)
+            
+            # Pattern 2: value == param or value != param, etc. (reversed)
+            match = re.search(
+                rf"([-+]?\d+(?:\.\d+)?[uUlL]*|[A-Z][A-Za-z0-9_]*)\s*(?:==|!=|>=|<=|>|<)\s*\b{re.escape(param_name)}\b",
+                condition_text,
+                re.I
+            )
+            if match:
+                value = match.group(1)
+                if value.upper() not in {"TRUE", "FALSE", "NULL"}:
+                    if value not in seen:
+                        constants.append(value)
+                        seen.add(value)
+            
+            # Pattern 3: param in range checks (between, or bounds)
+            # e.g., param >= 10 && param <= 20
+            for bound_match in re.finditer(
+                rf"\b{re.escape(param_name)}\b\s*(?:>=|<=|>|<)\s*([-+]?\d+(?:\.\d+)?[uUlL]*)",
+                condition_text,
+                re.I
+            ):
+                value = bound_match.group(1)
+                if value not in seen:
+                    constants.append(value)
+                    seen.add(value)
+        
+        # Add boundary-related values (min-1, max, max+1 based on extracted values)
+        numeric_constants: list[int] = []
+        for const in constants:
+            try:
+                num = int(const.rstrip("uUlL"))
+                numeric_constants.append(num)
+            except (ValueError, AttributeError):
+                pass
+        
+        if numeric_constants:
+            numeric_constants.sort()
+            # Add boundary values: min-1, min, max, max+1
+            min_val = numeric_constants[0]
+            max_val = numeric_constants[-1]
+            for boundary in [min_val - 1, min_val, max_val, max_val + 1]:
+                boundary_str = str(boundary)
+                if boundary_str not in seen:
+                    constants.append(boundary_str)
+                    seen.add(boundary_str)
+        
+        return constants
 
     @staticmethod
     def _nominal_enum_value(param: Parameter) -> str | None:

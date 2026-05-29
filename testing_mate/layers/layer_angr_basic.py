@@ -93,7 +93,7 @@ def _try_angr(fn: FunctionInfo, compile_db: Any, targets: list[Any], timeout: in
                 {
                     "test_id": f"{'ANGR_DEEP' if deep else 'ANGR_BASIC'}_{fn.name}_{len(tests) + 1:04d}",
                     "function": fn.name,
-                    "coverage": "C0/C1",
+                    "coverage": str(_target_metric(target) or "C0/C1"),
                     "values": values,
                     "description": f"angr reached target {hex(target_addr)}",
                     "rationale": f"angr {'deep' if deep else 'basic'} symbolic execution reached {hex(target_addr)}.",

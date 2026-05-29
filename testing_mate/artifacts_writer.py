@@ -4,10 +4,10 @@ import csv
 import html
 from pathlib import Path
 from datetime import datetime
-from testing_mate.models import CoverageFeedback, CoverageGap, Condition, FunctionInfo, Parameter, RunResult, TestCase
+from testing_mate.models import CoverageFeedback, FunctionInfo, RunResult, TestCase
 from testing_mate.code_database import CodeDatabase
 from testing_mate.c1_engine import C1CoverageEngine
-from testing_mate.constants import DEFAULT_ENHANCEMENT_STAGES, RERUN_CMD
+from testing_mate.constants import DEFAULT_ENHANCEMENT_STAGES
 from testing_mate.generator import TestVectorGenerator, TestBackendGenerator
 from testing_mate.vector_generator import TestCaseRegistry
 from testing_mate.coverage_gap import CoverageGapPlanner
@@ -23,8 +23,27 @@ class ArtifactWriter:
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
+    def _coverage_requests_mcdc(selected_coverage: str | None, cases: list[TestCase]) -> bool:
+        """Return whether official backend evidence should enable native MC/DC.
+
+        The GUI/CLI-selected metric is the authoritative run mode. Escalation
+        layers may add C0/C1/MC/DC-labelled cases while trying to improve
+        coverage, but those labels must not silently change the final backend
+        instrumentation/report mode.  If a legacy caller does not provide the
+        selected mode, fall back to testcase labels for compatibility.
+        """
+        selected = str(selected_coverage or "").strip().upper().replace(" ", "")
+        if selected:
+            return selected in {"MC/DC", "MCDC"}
+        return any("MC/DC" in str(case.coverage).strip().upper() or "MCDC" in str(case.coverage).strip().upper() for case in cases)
+
+
+    @staticmethod
     def _cases_request_mcdc(cases: list[TestCase]) -> bool:
-        return any(str(case.coverage).strip().upper() in {"MC/DC", "MCDC"} for case in cases)
+        # Backward-compatible helper for report sections that still decide
+        # visibility from testcase labels. Backend instrumentation itself uses
+        # _coverage_requests_mcdc(selected_coverage, cases).
+        return any("MC/DC" in str(case.coverage).strip().upper() or "MCDC" in str(case.coverage).strip().upper() for case in cases)
 
     def write(
         self,
@@ -41,14 +60,19 @@ class ArtifactWriter:
         target_coverage_percent: float = 100.0,
         enhancement_stages: list[str] | None = None,
         code_database: CodeDatabase | None = None,
+        selected_coverage: str | None = None,
+        **_ignored_kwargs,
     ) -> list[Path]:
         source = source if isinstance(source, Path) else Path(str(source))
         unit_sources = [item if isinstance(item, Path) else Path(str(item)) for item in (unit_sources or []) if item]
         TestCaseRegistry.ensure_unique_test_ids(cases)
         active_feedback = feedback or CoverageFeedback(source="none", raw_text="")
-        if any(case.coverage in {"C0/C1", "C1", "MC/DC"} for case in cases) and active_feedback.metrics.get("C1") is None:
+        selected = str(selected_coverage or "").strip().upper().replace(" ", "")
+        selected_c0c1_or_mcdc = selected in {"", "C0/C1", "C1", "MC/DC", "MCDC"}
+        selected_mcdc = self._coverage_requests_mcdc(selected_coverage, cases)
+        if selected_c0c1_or_mcdc and active_feedback.metrics.get("C1") is None:
             active_feedback = C1CoverageEngine.merge(active_feedback, C1CoverageEngine().analyze(functions, cases))
-        if any(case.coverage == "MC/DC" for case in cases) and active_feedback.metrics.get("MC/DC") is None:
+        if selected_mcdc and active_feedback.metrics.get("MC/DC") is None:
             notes = dict(active_feedback.metric_notes)
             notes["MC/DC"] = "MC/DC unavailable: LLVM native MC/DC records were not found. LCOV/gcov branch counters and generated vectors are not used as official MC/DC coverage."
             active_feedback = CoverageFeedback(
@@ -78,8 +102,19 @@ class ArtifactWriter:
         ]
         paths.append(self._write_csv(source, cases, backend.lower()))
         if include_backend:
-            paths.extend(TestBackendGenerator(self.out_dir, include_dirs).write_backend(backend, source, functions, cases, level, unit_sources, code_database))
-        paths.append(self._write_html_report(source, functions, cases, backend, active_feedback, run_result))
+            paths.extend(
+                TestBackendGenerator(self.out_dir, include_dirs).write_backend(
+                    backend,
+                    source,
+                    functions,
+                    cases,
+                    level,
+                    unit_sources,
+                    code_database,
+                    selected_coverage=selected_coverage,
+                )
+            )
+        paths.append(self._write_html_report(source, functions, cases, backend, active_feedback, run_result, selected_coverage=selected_coverage))
         paths.append(self._write_audit_checklist(source, functions, cases, backend))
         return paths
 
@@ -413,22 +448,40 @@ class ArtifactWriter:
     def _percent_from_llvm_metric(metric: object) -> float | None:
         if not isinstance(metric, dict):
             return None
+        count = metric.get("count", metric.get("total", metric.get("found")))
+        covered = metric.get("covered", metric.get("hit", metric.get("executed")))
+        try:
+            count_f = float(count)
+        except (TypeError, ValueError):
+            count_f = None
+        # LLVM may emit an MC/DC node with count=0 and percent=0 when
+        # -fcoverage-mcdc is ON but the file has no eligible MC/DC decision
+        # records.  This is not 0% coverage; it is N/A/no obligations.
+        if count_f is not None and count_f <= 0:
+            return None
         for key in ("percent", "coverage", "ratio"):
             if key in metric:
                 try:
                     return float(metric[key])
                 except (TypeError, ValueError):
                     pass
-        count = metric.get("count", metric.get("total", metric.get("found")))
-        covered = metric.get("covered", metric.get("hit", metric.get("executed")))
         try:
-            count_f = float(count)
             covered_f = float(covered)
         except (TypeError, ValueError):
             return None
-        if count_f <= 0:
+        if count_f is None:
             return None
         return (covered_f / count_f) * 100.0
+
+    @staticmethod
+    def _llvm_metric_count(metric: object) -> float | None:
+        if not isinstance(metric, dict):
+            return None
+        value = metric.get("count", metric.get("total", metric.get("found")))
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _read_backend_metrics(self, source: Path, backend: str) -> tuple[dict[str, float | None], dict[str, str]]:
         """Read executed C0/C1/MC/DC metrics from backend artifacts when present.
@@ -475,6 +528,12 @@ class ArtifactWriter:
                     if percent is not None:
                         metrics[display_key] = percent
                         notes[display_key] = f"From {json_path.name}."
+                    elif display_key == "MC/DC" and self._llvm_metric_count(metric_node) == 0:
+                        notes[display_key] = (
+                            f"From {json_path.name}: native MC/DC instrumentation was enabled, "
+                            "but LLVM reported 0 MC/DC conditions. This is N/A, not 0%; "
+                            "single-atomic decisions are covered by C1 branch evidence."
+                        )
             except Exception as exc:
                 notes["parser"] = f"Could not parse {json_path.name}: {exc}"
 
@@ -500,21 +559,28 @@ class ArtifactWriter:
     @staticmethod
     def _extract_llvm_report_total_metrics(text: str) -> dict[str, float | None]:
         metrics: dict[str, float | None] = {"C0": None, "C1": None, "MC/DC": None}
+        has_mcdc_columns = "MC/DC Conditions" in text or "Missed Conditions" in text
         for raw_line in text.splitlines():
             line = " ".join(raw_line.strip().split())
             if not line.startswith("TOTAL"):
                 continue
             percentages = [float(item) for item in re.findall(r"(\d+(?:\.\d+)?)\s*%", line)]
-            # llvm-cov report with region/function/line/branch/mcdc columns normally
-            # ends with: Lines %, Branches %, MC/DC %.
-            if len(percentages) >= 5:
+            # llvm-cov report table has several percentage columns.  When MC/DC
+            # columns are present but the MC/DC coverage cell is '-' there are
+            # only four percentages: region, function, line, branch.  Do not
+            # mis-read branch coverage as MC/DC.
+            mcdc_cell_is_dash = has_mcdc_columns and bool(re.search(r"\s-\s*$", line))
+            if has_mcdc_columns and mcdc_cell_is_dash and len(percentages) >= 4:
+                metrics["C0"] = percentages[-2]
+                metrics["C1"] = percentages[-1]
+                metrics["MC/DC"] = None
+            elif len(percentages) >= 5:
                 metrics["C0"] = percentages[-3]
                 metrics["C1"] = percentages[-2]
                 metrics["MC/DC"] = percentages[-1]
-            elif len(percentages) >= 3:
-                metrics["C0"] = percentages[-3]
-                metrics["C1"] = percentages[-2]
-                metrics["MC/DC"] = percentages[-1]
+            elif len(percentages) >= 2:
+                metrics["C0"] = percentages[-2]
+                metrics["C1"] = percentages[-1]
         return metrics
 
     def _effective_coverage_metrics(
@@ -539,7 +605,9 @@ class ArtifactWriter:
         if metrics.get("MC/DC") is None:
             notes["MC/DC"] = notes.get(
                 "MC/DC",
-                "MC/DC unavailable: use Clang/LLVM source coverage with -fcoverage-mcdc; LCOV/gcov branch counters are not official MC/DC evidence.",
+                "MC/DC N/A: native MC/DC is only reported by LLVM for eligible decisions. "
+                "For simple single-atomic decisions, use C1 true/false branch evidence; "
+                "LCOV/gcov branch counters are not official MC/DC evidence.",
             )
 
         return metrics, notes
@@ -552,12 +620,13 @@ class ArtifactWriter:
         backend: str,
         feedback: CoverageFeedback | None,
         run_result: RunResult | None,
+        selected_coverage: str | None = None,
     ) -> Path:
         path = self.out_dir / f"{source.stem}.html"
         condition_count = sum(len(fn.conditions) for fn in functions)
         decision_count = sum(max(1, len(condition.decisions) or 1) for fn in functions for condition in fn.conditions)
         metrics, metric_notes = self._effective_coverage_metrics(source, backend, feedback)
-        include_mcdc = self._cases_request_mcdc(cases)
+        include_mcdc = self._coverage_requests_mcdc(selected_coverage, cases)
         active_metric_keys = ("C0", "C1", "MC/DC") if include_mcdc else ("C0", "C1")
         min_executed_metric = min([metrics.get(key) for key in active_metric_keys if metrics.get(key) is not None], default=None)
         coverage = f"{min_executed_metric:.2f}%" if min_executed_metric is not None else "N/A"
@@ -1418,16 +1487,27 @@ class ArtifactWriter:
                     "</tr>"
                 )
                 if include_mcdc:
-                    for decision in decisions:
+                    if len(decisions) <= 1:
                         rows.append(
                             "<tr>"
                             "<td><span class=\"pill na\">MC/DC</span></td>"
                             f"<td>{html.escape(fn.name)}</td>"
                             f"<td>{condition.line}</td>"
-                            f"<td>Independent effect pair for <code>{html.escape(decision)}</code></td>"
-                            "<td>LLVM native MC/DC from -fcoverage-mcdc; N/A when LLVM MC/DC records are absent</td>"
+                            f"<td>Single-atomic decision <code>{html.escape(decisions[0])}</code>; MC/DC degenerates to true/false decision coverage.</td>"
+                            "<td>C1 branch evidence is the applicable executed evidence; LLVM may report 0 native MC/DC conditions for this pattern.</td>"
                             "</tr>"
                         )
+                    else:
+                        for decision in decisions:
+                            rows.append(
+                                "<tr>"
+                                "<td><span class=\"pill na\">MC/DC</span></td>"
+                                f"<td>{html.escape(fn.name)}</td>"
+                                f"<td>{condition.line}</td>"
+                                f"<td>Independent effect pair for <code>{html.escape(decision)}</code></td>"
+                                "<td>LLVM native MC/DC from -fcoverage-mcdc; N/A when LLVM MC/DC records are absent</td>"
+                                "</tr>"
+                            )
         if not rows:
             return "<tr><td colspan=\"5\" class=\"subtle\">No coverage obligations were extracted.</td></tr>"
         return "".join(rows)

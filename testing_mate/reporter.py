@@ -318,7 +318,14 @@ class CoverageReportParser:
             if total:
                 notes[key] = f"From llvm-cov JSON{target_note}: {int(total.get('covered', 0))}/{int(total.get('count', 0))} {label} covered."
         if metrics.get("MC/DC") is None:
-            notes["MC/DC"] = "LLVM coverage exists, but no MC/DC records were found. Rebuild target sources with -fcoverage-mcdc and rerun tests."
+            mcdc_total = totals.get("mcdc") or {}
+            if float(mcdc_total.get("count", 0) or 0) <= 0:
+                notes["MC/DC"] = (
+                    "LLVM coverage contains MC/DC columns, but the selected target has 0 native MC/DC conditions. "
+                    "This is N/A, not 0%; it commonly occurs for single-atomic decisions where C1 true/false branch evidence is sufficient."
+                )
+            else:
+                notes["MC/DC"] = "LLVM coverage exists, but no MC/DC records were found. Rebuild target sources with -fcoverage-mcdc and rerun tests."
 
         uncovered = self._extract_llvm_json_uncovered_items(payload, targets)
 
@@ -538,19 +545,24 @@ class CoverageReportParser:
     @staticmethod
     def _extract_llvm_cov_report_metrics(text: str) -> dict[str, float | None]:
         metrics: dict[str, float | None] = {"C0": None, "C1": None, "MC/DC": None}
+        has_mcdc_columns = "MC/DC Conditions" in text or "Missed Conditions" in text
         for raw_line in text.splitlines():
             line = " ".join(raw_line.strip().split())
             if not line.startswith("TOTAL"):
                 continue
             percentages = [float(item) for item in re.findall(r"(\d+(?:\.\d+)?)\s*%", line)]
-            if len(percentages) >= 5:
+            mcdc_cell_is_dash = has_mcdc_columns and bool(re.search(r"\s-\s*$", line))
+            if has_mcdc_columns and mcdc_cell_is_dash and len(percentages) >= 4:
+                metrics["C0"] = percentages[-2]
+                metrics["C1"] = percentages[-1]
+                metrics["MC/DC"] = None
+            elif len(percentages) >= 5:
                 metrics["C0"] = percentages[-3]
                 metrics["C1"] = percentages[-2]
                 metrics["MC/DC"] = percentages[-1]
-            elif len(percentages) >= 3:
-                metrics["C0"] = percentages[-3]
-                metrics["C1"] = percentages[-2]
-                metrics["MC/DC"] = percentages[-1]
+            elif len(percentages) >= 2:
+                metrics["C0"] = percentages[-2]
+                metrics["C1"] = percentages[-1]
         return metrics
 
     @staticmethod

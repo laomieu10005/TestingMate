@@ -619,22 +619,35 @@ class MCDCCoverageCollector:
         
         text = summary_path.read_text(encoding="utf-8", errors="replace")
         
-        # Look for TOTAL line with percentages
+        has_mcdc_columns = "MC/DC Conditions" in text or "Missed Conditions" in text
+        # Look for TOTAL line with percentages.  If LLVM prints '-' in the MC/DC
+        # cover column, there are no native MC/DC obligations; do not treat the
+        # branch percentage as MC/DC.
         for line in text.splitlines():
-            if "TOTAL" in line.upper():
+            normalized = " ".join(line.strip().split())
+            if "TOTAL" in normalized.upper():
                 percentages = [
-                    float(m) for m in re.findall(r"(\d+(?:\.\d+)?)\s*%", line)
+                    float(m) for m in re.findall(r"(\d+(?:\.\d+)?)\s*%", normalized)
                 ]
-                if len(percentages) >= 3:
-                    # Typically: Lines, Branches, MC/DC
-                    metrics["lines"] = percentages[0] if len(percentages) > 0 else None
-                    metrics["branches"] = percentages[1] if len(percentages) > 1 else None
-                    metrics["mc_dc"] = percentages[2] if len(percentages) > 2 else None
+                mcdc_cell_is_dash = has_mcdc_columns and bool(re.search(r"\s-\s*$", normalized))
+                if has_mcdc_columns and mcdc_cell_is_dash and len(percentages) >= 4:
+                    metrics["lines"] = percentages[-2]
+                    metrics["branches"] = percentages[-1]
+                    metrics["mc_dc"] = None
+                elif len(percentages) >= 5:
+                    metrics["lines"] = percentages[-3]
+                    metrics["branches"] = percentages[-2]
+                    metrics["mc_dc"] = percentages[-1]
+                elif len(percentages) >= 2:
+                    metrics["lines"] = percentages[-2]
+                    metrics["branches"] = percentages[-1]
         
-        # Extract MC/DC specific patterns
+        # Extract MC/DC-specific percentage only when a real MC/DC percent is
+        # present, not when the MC/DC table exists but the TOTAL cell is '-'.
         for line in text.splitlines():
-            if "MC/DC" in line or "MCDC" in line:
-                match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+            normalized = " ".join(line.strip().split())
+            if ("MC/DC" in normalized or "MCDC" in normalized) and not re.search(r"\s-\s*$", normalized):
+                match = re.search(r"(\d+(?:\.\d+)?)\s*%", normalized)
                 if match:
                     metrics["mc_dc"] = float(match.group(1))
         

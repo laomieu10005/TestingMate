@@ -12,7 +12,7 @@ from pathlib import Path
 from testing_mate.code_database import CodeDatabase
 from testing_mate.constants import C_SOURCE_EXTENSIONS, HEADER_SOURCE_EXTENSIONS, SCALAR_TOKENS
 from testing_mate.mcdc_engine import MCDCCoverageCollector
-from testing_mate.models import FunctionInfo, Parameter, RunResult, TestCase, Condition
+from testing_mate.models import FunctionInfo, Parameter, RunResult, TestCase
 from testing_mate.boolean_expression import ConditionEvaluator
 from testing_mate.stub_engine import StubHarnessEngine, StubSymbol
 from testing_mate.toolchain import local_mingw_bin, msys_bash_path, toolchain_env, windows_to_msys_path
@@ -58,6 +58,7 @@ class TestOracleFallback:
             return 0, ["Oracle fallback found no parseable expected/actual equality failures."]
 
         type_map = cls._fixture_type_map(text)
+        return_types = cls._extract_function_return_types(text)
         updated = 0
         notes: list[str] = []
         for mismatch in mismatches:
@@ -66,7 +67,7 @@ class TestOracleFallback:
             test_name = mismatch.get("test", "")
             if not literal or not expected or not test_name:
                 continue
-            next_text, changed = cls._patch_expected_assignment(text, test_name, expected, literal, type_map)
+            next_text, changed = cls._patch_expected_assignment(text, test_name, expected, literal, type_map, return_types)
             if not changed:
                 notes.append(f"Oracle fallback could not patch {test_name}: expected fixture {expected} was not assigned.")
                 continue
@@ -356,12 +357,60 @@ class TestOracleFallback:
         return result
 
     @staticmethod
+    def _extract_function_return_types(text: str) -> dict[str, str]:
+        """Extract function return types from test harness.
+        
+        For each TEST(Fixture, TestName), find actual_return type declaration
+        and map it from test_name -> return_type_string.
+        
+        This fallback allows oracle patching to use the correct return type
+        instead of assuming Std_ReturnType when patching expected_return values.
+        """
+        result: dict[str, str] = {}
+        
+        # Pattern: TEST(..., TestName) { ... actual_return_type actual_return = ...; ... }
+        for test_match in re.finditer(r"TEST(?:_F)?\s*\([^,]+,\s*([A-Za-z_]\w*)\)\s*\{", text):
+            test_name = test_match.group(1)
+            test_start = test_match.start()
+            
+            # Find test block boundaries
+            depth = 0
+            test_end = len(text)
+            for idx in range(test_match.end(), len(text)):
+                if text[idx] == '{':
+                    depth += 1
+                elif text[idx] == '}':
+                    depth -= 1
+                    if depth == -1:
+                        test_end = idx
+                        break
+            
+            test_block = text[test_start:test_end]
+            
+            # Extract actual_return type - improved to handle:
+            # - Simple types: uint8_t
+            # - Namespace-qualified: SafetySwc::MyType
+            # - Template types: std::vector<int>
+            # - Pointers and references: uint8_t*, const uint8_t*
+            type_match = re.search(
+                r"((?:const\s+)?(?:[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*|[A-Za-z_]\w*\s*<[^>]*>)(?:\s*\*+)?(?:\s*[&]+)?)"
+                r"\s+actual_return\b",
+                test_block
+            )
+            if type_match:
+                return_type = " ".join(type_match.group(1).split())
+                result[test_name] = return_type
+        
+        return result
+
+    @staticmethod
     def _patch_expected_assignment(
         text: str,
         test_name: str,
         expected: str,
         literal: str,
         type_map: dict[str, str],
+        return_types: dict[str, str] | None = None,
     ) -> tuple[str, bool]:
         span = TestOracleFallback._test_block_span(text, test_name)
         if span is None:
@@ -370,6 +419,12 @@ class TestOracleFallback:
         block = text[start:end]
         expected_root = expected.split(".", 1)[0]
         ctype = type_map.get(expected_root, "")
+        
+        # Fallback: if expected_root is "expected_return" and not in type_map,
+        # try to extract the actual function return type from test harness
+        if not ctype and expected_root == "expected_return" and return_types:
+            ctype = return_types.get(test_name, "")
+        
         typed = TestBackendGenerator._typed_value(ctype, literal) if ctype else literal
         if re.fullmatch(r"[A-Za-z_]\w*", expected):
             # Generated suites usually assign fixture members as
@@ -1218,6 +1273,8 @@ class TestBackendGenerator:
         level: str,
         unit_sources: list[Path | str] | None = None,
         code_database: CodeDatabase | None = None,
+        selected_coverage: str | None = None,
+        **_ignored_kwargs,
     ) -> list[Path]:
         # GUI/CLI/project JSON code can pass Windows paths as strings. Normalize
         # at the public boundary so downstream path operations never fail with
@@ -1226,8 +1283,10 @@ class TestBackendGenerator:
         normalized_unit_sources = self._as_path_list(unit_sources) or [source_path]
         # Keep native LLVM MC/DC instrumentation strictly tied to the selected
         # coverage objective. C0/C1 generation must not compile or report with
-        # -fcoverage-mcdc, even when the clang/llvm-cov backend is used.
-        enable_mcdc = self._cases_request_mcdc(cases)
+        # -fcoverage-mcdc, even when escalation layers add MC/DC-labelled cases.
+        # Legacy callers that do not pass selected_coverage still fall back to
+        # testcase labels.
+        enable_mcdc = self._coverage_requests_mcdc(selected_coverage, cases)
         if backend == "CppUTest":
             return self._write_cpputest(source_path, functions, cases, normalized_unit_sources, code_database, enable_mcdc)
         if backend == "GoogleTest":
@@ -1235,8 +1294,11 @@ class TestBackendGenerator:
         return []
 
     @staticmethod
-    def _cases_request_mcdc(cases: list[TestCase]) -> bool:
-        return any(str(case.coverage).strip().upper() in {"MC/DC", "MCDC"} for case in cases)
+    def _coverage_requests_mcdc(selected_coverage: str | None, cases: list[TestCase]) -> bool:
+        selected = str(selected_coverage or "").strip().upper().replace(" ", "")
+        if selected:
+            return selected in {"MC/DC", "MCDC"}
+        return any("MC/DC" in str(case.coverage).strip().upper() or "MCDC" in str(case.coverage).strip().upper() for case in cases)
 
     @staticmethod
     def _dedupe_cases(cases: list[TestCase]) -> list[TestCase]:

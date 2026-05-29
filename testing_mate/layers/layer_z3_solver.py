@@ -205,17 +205,46 @@ def _operand_to_z3(token: str, variables: dict[str, Any], fn: FunctionInfo) -> A
 
 
 def _bounds_for_ctype(ctype: str) -> tuple[int | None, int | None]:
-    lower = 0 if re.search(r"\b(?:u?int(?:8|16|32|64)?(?:_t)?|unsigned|boolean|bool)\b", str(ctype).lower()) else None
     text = str(ctype).lower()
+    
+    # Boolean types: 0-1
     if "bool" in text or "boolean" in text:
         return 0, 1
+    
+    # Floating-point types: no practical bounds for Z3
+    if any(ftype in text for ftype in ("float", "double", "real")):
+        return None, None
+    
+    # Unsigned integer types
     if "uint8" in text:
         return 0, 255
     if "uint16" in text:
         return 0, 65535
     if "uint32" in text:
         return 0, 4294967295
-    return lower, None
+    if "uint64" in text:
+        return 0, 18446744073709551615
+    
+    # Signed integer types
+    if "int8" in text or (re.search(r"\bint8_t\b", text)):
+        return -128, 127
+    if "int16" in text or (re.search(r"\bint16_t\b", text)):
+        return -32768, 32767
+    if "int32" in text or (re.search(r"\bint32_t\b", text)):
+        return -2147483648, 2147483647
+    if "int64" in text or (re.search(r"\bint64_t\b", text)):
+        return -9223372036854775808, 9223372036854775807
+    
+    # Generic "signed" without size: use int32 bounds as default
+    if "signed" in text and not "unsigned" in text:
+        return -2147483648, 2147483647
+    
+    # Generic "unsigned" without size: use uint32 bounds as default
+    if "unsigned" in text:
+        return 0, 4294967295
+    
+    # Default: no constraints
+    return None, None
 
 
 def _is_boolean_type(ctype: str) -> bool:

@@ -4,13 +4,11 @@ import json
 import os
 import re
 import shutil
-import socket
-import subprocess
+
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import urllib.error
-import urllib.request
-from dataclasses import dataclass, field, asdict, replace
+import traceback
+from dataclasses import asdict, dataclass, field, replace
+import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
 import tkinter as tk
@@ -21,9 +19,8 @@ from testing_mate.constants import *
 from testing_mate.models import CoverageFeedback, CoverageGap, Condition, ExecutionContext, FunctionInfo, Parameter, RunResult, TestCase
 from testing_mate.c_backend import *
 from testing_mate.generator import TestBackendGenerator, TestBackendRunner, TestCaseRunReconciler, TestMockFallback, TestOracleFallback, backend_harness_path, format_run_result
-from testing_mate.boolean_expression import BooleanExpressionEvaluator
 from testing_mate.clang_analyzer import ClangEnhancedAnalyzer
-from testing_mate.code_database import CodeDatabase
+from testing_mate.code_database import CodeDatabase, CodeFunctionRecord
 from testing_mate.artifacts_writer import *
 from testing_mate.reporter import *
 from testing_mate.vector_generator import TestVectorGenerator
@@ -38,12 +35,14 @@ class TestingMateApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1360x860")
+        self.state('zoomed')  # Maximize window on Windows; use fullscreen on other systems
         self.minsize(1120, 720)
-        self.configure(bg="#f4f7fb")
+        self.configure(bg="#F6F8FF")
         self.sources: list[Path] = []
         self.generated_paths: list[Path] = []
         self.report_path: Path | None = None
+        self._worker_active = False
+        self._worker_thread: threading.Thread | None = None
         self.last_functions: list[FunctionInfo] = []
         self.last_cases: list[TestCase] = []
         self.last_feedback: CoverageFeedback | None = None
@@ -52,6 +51,31 @@ class TestingMateApp(tk.Tk):
         self._build_ui()
 
     def _build_style(self) -> None:
+        """Apply the Aurora Light theme without changing the existing layout."""
+        self._theme = {
+            "bg": "#F6F8FF",
+            "bg_soft": "#EEF4FF",
+            "panel": "#FFFFFF",
+            "panel_alt": "#F8FAFF",
+            "surface": "#F3F6FF",
+            "text": "#172033",
+            "text_strong": "#0F172A",
+            "muted": "#6B7280",
+            "primary": "#5B7CFA",
+            "primary_dark": "#3F5EF7",
+            "secondary": "#8B5CF6",
+            "accent": "#EC4899",
+            "cyan": "#06B6D4",
+            "success": "#22C55E",
+            "warning": "#F59E0B",
+            "danger": "#EF4444",
+            "border": "#E5E7F0",
+            "border_focus": "#A5B4FC",
+            "selected": "#EDE9FE",
+            "selected_strong": "#DDD6FE",
+            "heading": "#EEF2FF",
+        }
+        t = self._theme
         style = ttk.Style(self)
         try:
             style.theme_use("clam")
@@ -59,34 +83,85 @@ class TestingMateApp(tk.Tk):
             pass
         self.option_add("*Font", "{Segoe UI} 10")
         self.option_add("*Listbox.Font", "{Segoe UI} 9")
-        style.configure("TFrame", background="#f4f7fb")
-        style.configure("Panel.TFrame", background="#ffffff", relief="flat")
-        style.configure("Surface.TFrame", background="#f8fafc", relief="flat")
-        style.configure("Metric.TFrame", background="#f8fafc", relief="flat")
-        style.configure("TLabel", background="#f4f7fb", foreground="#172033", font=("Segoe UI", 10))
-        style.configure("Panel.TLabel", background="#ffffff", foreground="#172033", font=("Segoe UI", 10))
-        style.configure("Muted.TLabel", background="#ffffff", foreground="#64748b", font=("Segoe UI", 9))
-        style.configure("Title.TLabel", background="#f4f7fb", foreground="#0f172a", font=("Segoe UI Semibold", 24))
-        style.configure("Subtle.TLabel", background="#f4f7fb", foreground="#64748b", font=("Segoe UI", 10))
-        style.configure("Status.TLabel", background="#e8f2ff", foreground="#1d4ed8", font=("Segoe UI Semibold", 9), padding=(10, 5))
-        style.configure("PanelTitle.TLabel", background="#ffffff", foreground="#0f172a", font=("Segoe UI Semibold", 12))
-        style.configure("Section.TLabel", background="#ffffff", foreground="#334155", font=("Segoe UI Semibold", 10))
-        style.configure("MetricLabel.TLabel", background="#f8fafc", foreground="#64748b", font=("Segoe UI", 9))
-        style.configure("MetricValue.TLabel", background="#f8fafc", foreground="#0f172a", font=("Segoe UI Semibold", 17))
-        style.configure("TEntry", padding=(8, 6), fieldbackground="#ffffff", bordercolor="#cbd5e1", lightcolor="#cbd5e1", darkcolor="#cbd5e1")
-        style.configure("TCombobox", padding=(8, 6), fieldbackground="#ffffff", bordercolor="#cbd5e1", arrowsize=14)
+
+        style.configure("TFrame", background=t["bg"])
+        style.configure("Panel.TFrame", background=t["panel"], relief="flat")
+        style.configure("Surface.TFrame", background=t["surface"], relief="flat")
+        style.configure("Metric.TFrame", background=t["panel_alt"], relief="flat")
+
+        style.configure("TLabel", background=t["bg"], foreground=t["text"], font=("Segoe UI", 10))
+        style.configure("Panel.TLabel", background=t["panel"], foreground=t["text"], font=("Segoe UI", 10))
+        style.configure("Muted.TLabel", background=t["panel"], foreground=t["muted"], font=("Segoe UI", 9))
+        style.configure("Title.TLabel", background=t["bg"], foreground=t["primary_dark"], font=("Segoe UI Semibold", 24))
+        style.configure("Subtle.TLabel", background=t["bg"], foreground=t["muted"], font=("Segoe UI", 10))
+        style.configure(
+            "Status.TLabel",
+            background="#EEF2FF",
+            foreground=t["primary_dark"],
+            font=("Segoe UI Semibold", 9),
+            padding=(10, 5),
+        )
+        style.configure("PanelTitle.TLabel", background=t["panel"], foreground=t["text_strong"], font=("Segoe UI Semibold", 12))
+        style.configure("Section.TLabel", background=t["panel"], foreground=t["secondary"], font=("Segoe UI Semibold", 10))
+        style.configure("MetricLabel.TLabel", background=t["panel_alt"], foreground=t["muted"], font=("Segoe UI", 9))
+        style.configure("MetricValue.TLabel", background=t["panel_alt"], foreground=t["primary_dark"], font=("Segoe UI Semibold", 17))
+
+        style.configure(
+            "TEntry",
+            padding=(8, 6),
+            fieldbackground=t["panel"],
+            foreground=t["text"],
+            bordercolor=t["border"],
+            lightcolor=t["border"],
+            darkcolor=t["border"],
+            insertcolor=t["primary_dark"],
+        )
+        style.map("TEntry", bordercolor=[("focus", t["border_focus"])])
+        style.configure(
+            "TCombobox",
+            padding=(8, 6),
+            fieldbackground=t["panel"],
+            foreground=t["text"],
+            bordercolor=t["border"],
+            arrowsize=14,
+        )
+        style.map("TCombobox", bordercolor=[("focus", t["border_focus"])])
+
         style.configure("TButton", font=("Segoe UI Semibold", 10), padding=(12, 8), borderwidth=1)
-        style.configure("Accent.TButton", background="#1f6feb", foreground="#ffffff", bordercolor="#1f6feb")
-        style.map("Accent.TButton", background=[("active", "#1d4ed8"), ("pressed", "#1e40af")], foreground=[("disabled", "#dbeafe")])
-        style.configure("Secondary.TButton", background="#f8fafc", foreground="#172033", bordercolor="#cbd5e1")
-        style.map("Secondary.TButton", background=[("active", "#eef2f7"), ("pressed", "#e2e8f0")])
-        style.configure("Danger.TButton", background="#fff1f2", foreground="#9f1239", bordercolor="#fecdd3")
-        style.map("Danger.TButton", background=[("active", "#ffe4e6"), ("pressed", "#fecdd3")])
-        style.configure("TCheckbutton", background="#ffffff", foreground="#172033", font=("Segoe UI", 10))
-        style.configure("TRadiobutton", background="#ffffff", foreground="#172033", font=("Segoe UI", 10))
-        style.configure("Treeview", rowheight=30, fieldbackground="#ffffff", background="#ffffff", foreground="#172033", font=("Segoe UI", 10), bordercolor="#dbe3ef", borderwidth=1)
-        style.configure("Treeview.Heading", background="#eef2f7", foreground="#334155", font=("Segoe UI Semibold", 10), padding=(8, 7))
-        style.map("Treeview", background=[("selected", "#dbeafe")], foreground=[("selected", "#0f172a")])
+        style.configure("Accent.TButton", background=t["primary"], foreground="#FFFFFF", bordercolor=t["primary"])
+        style.map(
+            "Accent.TButton",
+            background=[("active", t["primary_dark"]), ("pressed", "#3730A3")],
+            foreground=[("disabled", "#E0E7FF")],
+        )
+        style.configure("Secondary.TButton", background="#FFFFFF", foreground=t["primary_dark"], bordercolor="#C7D2FE")
+        style.map("Secondary.TButton", background=[("active", "#EEF2FF"), ("pressed", "#E0E7FF")])
+        style.configure("Danger.TButton", background="#FFF1F2", foreground="#BE123C", bordercolor="#FDA4AF")
+        style.map("Danger.TButton", background=[("active", "#FFE4E6"), ("pressed", "#FECDD3")])
+
+        style.configure("TCheckbutton", background=t["panel"], foreground=t["text"], font=("Segoe UI", 10))
+        style.configure("TRadiobutton", background=t["panel"], foreground=t["text"], font=("Segoe UI", 10))
+        style.map("TCheckbutton", foreground=[("active", t["primary_dark"])])
+        style.map("TRadiobutton", foreground=[("active", t["primary_dark"])])
+
+        style.configure(
+            "Treeview",
+            rowheight=30,
+            fieldbackground=t["panel"],
+            background=t["panel"],
+            foreground=t["text"],
+            font=("Segoe UI", 10),
+            bordercolor=t["border"],
+            borderwidth=1,
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=t["heading"],
+            foreground=t["primary_dark"],
+            font=("Segoe UI Semibold", 10),
+            padding=(8, 7),
+        )
+        style.map("Treeview", background=[("selected", t["selected_strong"])], foreground=[("selected", t["text_strong"])])
 
     def _create_scrollable_panel(self, parent: ttk.Frame) -> ttk.Frame:
         shell = ttk.Frame(parent, style="Panel.TFrame")
@@ -94,7 +169,7 @@ class TestingMateApp(tk.Tk):
         shell.rowconfigure(0, weight=1)
         shell.columnconfigure(0, weight=1)
 
-        canvas = tk.Canvas(shell, width=398, bg="#ffffff", bd=0, highlightthickness=0)
+        canvas = tk.Canvas(shell, width=398, bg=self._theme["panel"], bd=0, highlightthickness=0)
         scrollbar = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.grid(row=0, column=0, sticky="nsew")
@@ -141,8 +216,8 @@ class TestingMateApp(tk.Tk):
         ).pack(anchor="w", pady=(4, 0))
         status_area = ttk.Frame(header)
         status_area.grid(row=0, column=1, sticky="e")
-        ttk.Label(status_area, text="Clang DB", style="Status.TLabel").pack(side="left", padx=(0, 8))
-        ttk.Label(status_area, text="GTest / CppUTest", style="Status.TLabel").pack(side="left")
+        # ttk.Label(status_area, text="Clang DB", style="Status.TLabel").pack(side="left", padx=(0, 8))
+        # ttk.Label(status_area, text="GTest / CppUTest", style="Status.TLabel").pack(side="left")
 
         body = ttk.Frame(root)
         body.pack(fill="both", expand=True)
@@ -175,22 +250,6 @@ class TestingMateApp(tk.Tk):
         ttk.Button(action_row, text="ReTest", command=self._rerun_async, style="Danger.TButton").pack(side="left", fill="x", expand=True, padx=(8, 0))
         ttk.Button(action_row, text="View Report", command=self._open_report_file, style="Secondary.TButton").pack(side="right", padx=(8, 0))
 
-        gap_action_row = ttk.Frame(left, style="Panel.TFrame")
-        gap_action_row.pack(fill="x", pady=(8, 0))
-        self.add_gap_cases_button = ttk.Button(
-            gap_action_row,
-            text="Add Gap Cases",
-            command=self._add_uncovered_cases_async,
-            style="Accent.TButton",
-        )
-        self.add_gap_cases_button.pack(side="left", fill="x", expand=True)
-        ttk.Label(
-            gap_action_row,
-            text="Select an uncovered row to target one line, or no row for all gaps.",
-            style="Muted.TLabel",
-            wraplength=220,
-        ).pack(side="left", padx=(8, 0))
-
         self.source_list = tk.Listbox(
             left,
             height=6,
@@ -198,12 +257,12 @@ class TestingMateApp(tk.Tk):
             bd=0,
             relief="flat",
             highlightthickness=1,
-            highlightbackground="#dbe3ef",
-            highlightcolor="#93c5fd",
-            selectbackground="#dbeafe",
-            selectforeground="#0f172a",
-            background="#f8fafc",
-            foreground="#172033",
+            highlightbackground=self._theme["border"],
+            highlightcolor=self._theme["border_focus"],
+            selectbackground=self._theme["selected_strong"],
+            selectforeground=self._theme["text_strong"],
+            background=self._theme["panel_alt"],
+            foreground=self._theme["text"],
             font=("Segoe UI", 9),
         )
         self.source_list.pack(fill="x", pady=(10, 16))
@@ -229,8 +288,10 @@ class TestingMateApp(tk.Tk):
         function_filter_row.pack(fill="x", pady=(6, 0))
         self.include_static_functions = tk.BooleanVar(value=False)
         self.include_main_function = tk.BooleanVar(value=False)
-        ttk.Checkbutton(function_filter_row, text="Include static functions", variable=self.include_static_functions).pack(anchor="w")
-        ttk.Checkbutton(function_filter_row, text="Include main()", variable=self.include_main_function).pack(anchor="w")
+        ttk.Checkbutton(function_filter_row, text="Include static functions", 
+                        variable=self.include_static_functions).pack(anchor="w", side= "left", pady=(0, 5))
+        ttk.Checkbutton(function_filter_row, text="Include main()", 
+                        variable=self.include_main_function).pack(anchor="w", side= "right", padx=(8,0), pady=(0, 5))
         iso_row = ttk.Frame(left, style="Panel.TFrame")
         iso_row.pack(fill="x", pady=(6, 0))
         self.iso26262_profile = tk.BooleanVar(value=False)
@@ -239,22 +300,22 @@ class TestingMateApp(tk.Tk):
         asil_box = ttk.Combobox(iso_row, textvariable=self.asil_level, values=("QM", "ASIL A", "ASIL B", "ASIL C", "ASIL D"), state="readonly", width=8)
         asil_box.pack(side="left", padx=(8, 0))
 
-        ttk.Label(left, text="Build Context", style="Section.TLabel").pack(anchor="w", pady=(14, 8))
-        self.compiler = tk.StringVar(value=DEFAULT_COMPILER)
         compilerFR = ttk.Frame(left, style="Panel.TFrame")
+        ttk.Label(compilerFR, text="Build Context", style="Section.TLabel").pack(anchor="w", pady=(14, 8), side="left", padx=(0, 20))
+        self.compiler = tk.StringVar(value=DEFAULT_COMPILER)
         compilerFR.pack(fill="x")
-        ttk.Entry(compilerFR, textvariable=self.compiler).pack(side="left", fill="x", expand=True)
+        ttk.Entry(compilerFR, textvariable=self.compiler).pack(side="right", fill="x", expand=True, padx=(10, 0))
 
         self.preprocess = tk.BooleanVar(value=True)
-        ttk.Checkbutton(compilerFR, text="Preprocess source first", variable=self.preprocess).pack(anchor="w", padx=(8, 0))
+        # ttk.Checkbutton(compilerFR, text="Preprocess source first", variable=self.preprocess).pack(anchor="w", padx=(8, 0))
 
-        ttk.Label(left, text="Extra include dirs (; separated)", style="Muted.TLabel").pack(anchor="w", pady=(8, 4))
+        # ttk.Label(left, text="Extra include dirs (; separated)", style="Muted.TLabel").pack(anchor="w", pady=(8, 4))
         self.include_dirs = tk.StringVar()
-        ttk.Entry(left, textvariable=self.include_dirs).pack(fill="x")
+        # ttk.Entry(left, textvariable=self.include_dirs).pack(fill="x")
 
-        ttk.Label(left, text="Defines (; separated)", style="Muted.TLabel").pack(anchor="w", pady=(8, 4))
+        # ttk.Label(left, text="Defines (; separated)", style="Muted.TLabel").pack(anchor="w", pady=(8, 4))
         self.defines = tk.StringVar()
-        ttk.Entry(left, textvariable=self.defines).pack(fill="x")
+        # ttk.Entry(left, textvariable=self.defines).pack(fill="x")
 
         ttk.Label(left, text="Output & Backend", style="Section.TLabel").pack(anchor="w", pady=(14, 8))
         output_row = ttk.Frame(left, style="Panel.TFrame")
@@ -335,8 +396,8 @@ class TestingMateApp(tk.Tk):
         ):
             card = ttk.Frame(metrics, style="Metric.TFrame", padding=(14, 12))
             card.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 8, 0))
-            ttk.Label(card, text=label, style="MetricLabel.TLabel").pack(anchor="w")
-            ttk.Label(card, textvariable=var, style="MetricValue.TLabel").pack(anchor="w", pady=(2, 0))
+            ttk.Label(card, text=label, style="MetricLabel.TLabel").pack(anchor="w", side="left")
+            ttk.Label(card, textvariable=var, style="MetricValue.TLabel").pack(anchor="w", side="right", pady=(2, 0))
 
         ttk.Label(right, text="Coverage Summary and Feedback", style="PanelTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(16, 8))
         columns = ("function", "line", "metric", "condition", "status")
@@ -351,9 +412,9 @@ class TestingMateApp(tk.Tk):
             self.tree.heading(col, text=title)
             self.tree.column(col, width=width, stretch=True)
         self.tree.grid(row=2, column=0, sticky="nsew")
-        self.tree.tag_configure("covered", background="#ecfdf5", foreground="#065f46")
-        self.tree.tag_configure("uncovered", background="#fff1f2", foreground="#9f1239")
-        self.tree.tag_configure("unknown", background="#f8fafc", foreground="#475569")
+        self.tree.tag_configure("covered", background="#ECFDF5", foreground="#047857")
+        self.tree.tag_configure("uncovered", background="#FFF1F2", foreground="#BE123C")
+        self.tree.tag_configure("unknown", background="#F8FAFF", foreground=self._theme["muted"])
         self.tree.bind("<Double-1>", lambda _event: self._add_uncovered_cases_async())
         tree_scroll = ttk.Scrollbar(right, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=tree_scroll.set)
@@ -363,15 +424,32 @@ class TestingMateApp(tk.Tk):
         case_header.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 8))
         case_header.columnconfigure(0, weight=1)
         ttk.Label(case_header, text="Generated Test Cases", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
+
+        # gap_action_row = ttk.Frame(case_header, style="Panel.TFrame")
+        # gap_action_row.pack(fill="x", pady=(8, 0))
+        self.add_gap_cases_button = ttk.Button(
+            case_header,
+            text="Add Gap Cases",
+            command=self._add_uncovered_cases_async,
+            style="Accent.TButton",
+        )
+        self.add_gap_cases_button.grid(row=0, column=1, sticky="e", padx=(0, 20))
+        # ttk.Label(
+        #     case_header,
+        #     text="Select an uncovered row to target one line, or no row for all gaps.",
+        #     style="Muted.TLabel",
+        #     wraplength=220,
+        # ).grid(row=0, column=1, sticky="e")
+
         ttk.Button(
             case_header,
             text="Add Manual Testcase",
             command=lambda: self._open_manual_case_popup(None),
             style="Accent.TButton",
-        ).grid(row=0, column=1, sticky="e")
+        ).grid(row=0, column=2, sticky="e")
         ttk.Label(
             case_header,
-            text="Click a testcase row to open a template popup. Use Steps mode for review-only cases or Harness Code mode for direct C++ test-body code.",
+            text="Click a testcase row to open a template popup. Use Steps mode for review-only cases \nor Harness Code mode for direct C++ test-body code.",
             style="Muted.TLabel",
             wraplength=760,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
@@ -387,8 +465,8 @@ class TestingMateApp(tk.Tk):
         ]:
             self.case_tree.heading(col, text=title)
             self.case_tree.column(col, width=width, stretch=True)
-        self.case_tree.tag_configure("manual", background="#fefce8", foreground="#713f12")
-        self.case_tree.tag_configure("auto", background="#ffffff", foreground="#172033")
+        self.case_tree.tag_configure("manual", background="#FFF7ED", foreground="#C2410C")
+        self.case_tree.tag_configure("auto", background=self._theme["panel"], foreground=self._theme["text"])
         self.case_tree.grid(row=4, column=0, sticky="nsew")
         self.case_tree.bind("<ButtonRelease-1>", self._on_case_tree_click)
         self.case_tree.bind("<Double-1>", self._on_case_tree_click)
@@ -405,10 +483,10 @@ class TestingMateApp(tk.Tk):
             height=7,
             bd=0,
             highlightthickness=1,
-            highlightbackground="#dbe3ef",
-            highlightcolor="#93c5fd",
-            bg="#0f172a",
-            fg="#dbeafe",
+            highlightbackground=self._theme["border"],
+            highlightcolor=self._theme["border_focus"],
+            bg="#111827",
+            fg="#E0F2FE",
             insertbackground="#ffffff",
             font=("Cascadia Mono", 9),
             wrap="word",
@@ -449,12 +527,18 @@ class TestingMateApp(tk.Tk):
             database = CompileCommandsDatabase.load(Path(selected))
             sources = database.source_files()
             self._add_source_paths(sources)
+            existing_includes = [item.strip() for item in self.include_dirs.get().split(";") if item.strip()]
             existing_defines = [item.strip() for item in self.defines.get().split(";") if item.strip()]
-            merged_defines = Orchestrator._unique_strings(existing_defines + database.defines())
+            compile_includes = database.include_dirs()
+            compile_defines = database.defines()
+            merged_includes = Orchestrator._unique_strings(existing_includes + compile_includes)
+            merged_defines = Orchestrator._unique_strings(existing_defines + compile_defines)
+            self.include_dirs.set(";".join(merged_includes))
             self.defines.set(";".join(merged_defines))
-            ignored_includes = len(database.include_dirs())
-            include_note = f"; ignored {ignored_includes} compile include dirs" if ignored_includes else ""
-            self._append_log(f"Loaded compile_commands.json: added {len(sources)} files; merged defines{include_note}.")
+            self._append_log(
+                f"Loaded compile_commands.json: added {len(sources)} files; "
+                f"merged {len(compile_includes)} include dirs and {len(compile_defines)} defines."
+            )
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"Could not load compile_commands.json:\n{exc}")
 
@@ -538,10 +622,11 @@ class TestingMateApp(tk.Tk):
         if not self.sources and not self.compile_commands.get().strip():
             messagebox.showwarning(APP_NAME, "Add source files, a source folder, or compile_commands.json.")
             return
+        if not self._validate_output_access():
+            return
         if not self._ensure_msys2_toolchain():
             return
-        thread = threading.Thread(target=self._run, daemon=True)
-        thread.start()
+        self._start_background_task("Generate", self._run)
 
     def _refine_run_async(self) -> None:
         if not self.sources and not self.compile_commands.get().strip():
@@ -551,24 +636,28 @@ class TestingMateApp(tk.Tk):
         if not report or not Path(report).exists():
             messagebox.showwarning(APP_NAME, "Select an existing coverage/fail report first.")
             return
+        if not self._validate_output_access():
+            return
         if not self._ensure_msys2_toolchain():
             return
-        thread = threading.Thread(target=self._refine_and_run_from_report, daemon=True)
-        thread.start()
+        self._start_background_task("Refine From Report", self._refine_and_run_from_report)
 
     def _rerun_async(self) -> None:
-        RERUN_CMD = 1
         if not self.sources and not self.compile_commands.get().strip():
             messagebox.showwarning(APP_NAME, "Add source files, a source folder, or compile_commands.json.")
             return
+        if not self._validate_output_access():
+            return
         if not self._ensure_msys2_toolchain():
             return
-        thread = threading.Thread(target=self._rerun_existing_testcases, daemon=True)
-        thread.start()
+        self._start_background_task("ReTest", self._rerun_existing_testcases)
+
 
     def _add_uncovered_cases_async(self) -> None:
         if not self.sources and not self.compile_commands.get().strip():
             messagebox.showwarning(APP_NAME, "Add source files, a source folder, or compile_commands.json first.")
+            return
+        if not self._validate_output_access():
             return
         if not self._ensure_msys2_toolchain():
             return
@@ -577,8 +666,56 @@ class TestingMateApp(tk.Tk):
             if not messagebox.askyesno(APP_NAME, "Selected row is not marked uncovered. Add gap cases for all uncovered rows instead?"):
                 return
             selected_gap = None
-        thread = threading.Thread(target=lambda: self._add_uncovered_cases(selected_gap), daemon=True)
-        thread.start()
+        self._start_background_task("Add Gap Cases", lambda: self._add_uncovered_cases(selected_gap))
+
+
+    def _start_background_task(self, title: str, _target: Callable[[], None]) -> None:
+        if self._worker_active:
+            messagebox.showwarning(APP_NAME, "Another TestingMate operation is already running. Wait until it completes before starting a new one.")
+            return
+        self._worker_active = True
+        self.configure(cursor="watch")
+
+        def _runner() -> None:
+            try:
+                _target()
+            except Exception as exc:
+                details = traceback.format_exc()
+                self._append_log(f"ERROR {title}: {exc}")
+                self._append_log(details)
+                self.after(0, lambda: messagebox.showerror(APP_NAME, f"{title} failed:\n{exc}\n\nCheck the log window for traceback details."))
+            finally:
+                def _cleanup() -> None:
+                    self.configure(cursor="")
+                    self._worker_active = False
+                    self._worker_thread = None
+                self.after(0, _cleanup)
+
+        self._worker_thread = threading.Thread(target=_runner, daemon=True)
+        self._worker_thread.start()
+
+    def _validate_output_access(self) -> bool:
+        raw = self.output_dir.get().strip()
+        if not raw:
+            messagebox.showwarning(APP_NAME, "Select an output folder first.")
+            return False
+        try:
+            out_dir = Path(raw).expanduser()
+            probe_dir = out_dir if out_dir.exists() else out_dir.parent
+            if not str(probe_dir):
+                probe_dir = Path.cwd()
+            probe_dir.mkdir(parents=True, exist_ok=True)
+            probe = probe_dir / f".testing_mate_write_probe_{os.getpid()}.tmp"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return True
+        except Exception as exc:
+            messagebox.showerror(
+                APP_NAME,
+                "Output folder is not writable. Choose another output folder or close programs that lock generated files.\n\n"
+                f"Output: {raw}\nError: {exc}",
+            )
+            return False
 
     def _coverage_mcdc_enabled(self) -> bool:
         return str(self.coverage.get()).strip().upper() in {"MC/DC", "MCDC"}
@@ -655,7 +792,35 @@ class TestingMateApp(tk.Tk):
         values = self.tree.item(selection[0], "values")
         return str(values[0]) if values else ""
 
-    def _manual_case_template(self, fn: FunctionInfo | None, backend: str, mode: str) -> tuple[str, str, str]:
+    def _extract_mock_template(self, function_name: str) -> dict:
+        """Auto-discover mock/stub keys from existing cases or function body."""
+        _PREFIXES = ("__stub_return.", "__stub_output.", "__expected_calls",
+                     "__expected_call_arg.", "__expected_return",
+                     "__expected_output.", "__expected_global.")
+        mock_keys = {}
+        for case in self.last_cases:
+            if case.function != function_name:
+                continue
+            for key, value in (case.values or {}).items():
+                if any(key == p or key.startswith(p) for p in _PREFIXES):
+                    if key not in mock_keys:
+                        mock_keys[key] = str(value)
+        if not mock_keys:
+            fn = next((f for f in self.last_functions if f.name == function_name), None)
+            if fn and fn.body:
+                calls = re.findall(r'\b([a-zA-Z_]\w*)\s*\(', fn.body)
+                skip = {"if","else","for","while","switch","case","return",
+                        "sizeof","typeof","do","break","continue","goto",function_name}
+                seen = set()
+                for c in calls:
+                    if c not in skip and c not in seen:
+                        seen.add(c)
+                        mock_keys[f"__stub_return.{c}"] = "0"
+                    if len(mock_keys) >= 8:
+                        break
+        return mock_keys
+
+    def _manual_case_template(self, fn: FunctionInfo | None, backend: str, mode: str) -> tuple[str, str, str, str]:
         fn_name = fn.name if fn else "FunctionUnderTest"
         if fn:
             arg_names = []
@@ -673,11 +838,15 @@ class TestingMateApp(tk.Tk):
             values = {}
         call = f"{fn_name}({', '.join(arg_names)})"
         values_json = json.dumps(values, indent=2)
+        mock_keys = self._extract_mock_template(fn_name) if fn else {}
+        if fn and fn.return_type.strip() != "void" and "__expected_return" not in mock_keys:
+            mock_keys["__expected_return"] = "0"
+        mock_json = json.dumps(mock_keys, indent=2) if mock_keys else "{}"
         steps = (
-            "1. Configure the precondition values shown in the Values JSON.\n"
-            f"2. Invoke `{fn_name}` through the generated harness.\n"
-            "3. Observe return value, output parameters, globals, and expected dependency calls.\n"
-            "4. Confirm the selected uncovered line/branch/MC/DC obligation is exercised."
+            "\n\t1. Configure the precondition values shown in the Values JSON.\n"
+            f"\t2. Invoke `{fn_name}` through the generated harness.\n"
+            "\t3. Observe return value, output parameters, globals, and expected dependency calls.\n"
+            "\t4. Confirm the selected uncovered line/branch/MC/DC obligation is exercised."
         )
         if mode == "Harness Code":
             if backend == "CppUTest":
@@ -690,8 +859,8 @@ class TestingMateApp(tk.Tk):
                     code = f"actual_return = {call};\nEXPECT_EQ(/* expected */ 0, actual_return);"
                 else:
                     code = f"{call};\n/* Add EXPECT_* assertions here. */"
-            return values_json, steps, code
-        return values_json, steps, ""
+            return values_json, steps, code, mock_json
+        return values_json, steps, "", mock_json
 
     def _open_manual_case_popup(self, selected_case: TestCase | None = None) -> None:
         if not self.last_functions:
@@ -764,8 +933,15 @@ class TestingMateApp(tk.Tk):
         values_text.grid(row=5, column=0, sticky="nsew", padx=(0, 8), pady=(4, 8))
         code_text.grid(row=5, column=1, sticky="nsew", padx=(8, 0), pady=(4, 8))
 
-        ttk.Label(body, text="Expected Result", style="Panel.TLabel").grid(row=6, column=0, sticky="w", pady=(0, 4))
-        ttk.Entry(body, textvariable=expected_var).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(body, text="Mock / Stub Configuration", style="Section.TLabel").grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        mock_text = tk.Text(body, height=7, font=("Cascadia Mono", 9), wrap="none",
+                            bg="#1E1E2E", fg="#A6E3A1", insertbackground="#CDD6F4")
+        mock_text.grid(row=7, column=0, columnspan=2, sticky="nsew", pady=(4, 8))
+        body.rowconfigure(7, weight=1)
+
+        ttk.Label(body, text="Expected Result", style="Panel.TLabel").grid(row=8, column=0, sticky="w", pady=(0, 4))
+        ttk.Entry(body, textvariable=expected_var).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(0, 8))
 
         hint = ttk.Label(
             body,
@@ -773,25 +949,28 @@ class TestingMateApp(tk.Tk):
             style="Muted.TLabel",
             wraplength=900,
         )
-        hint.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        hint.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(0, 8))
 
         current_template: dict[str, str] = {"function": "", "mode": ""}
 
-        def selected_fn() -> FunctionInfo | None:
+        def _selected_fn() -> FunctionInfo | None:
             return next((fn for fn in self.last_functions if fn.name == function_var.get()), None)
 
         def fill_template(force: bool = False) -> None:
-            fn = selected_fn()
+            fn = _selected_fn()
             mode = "Harness Code" if mode_var.get() == "Harness Code" else "Steps Only"
             if not force and current_template.get("function") == function_var.get() and current_template.get("mode") == mode:
                 return
-            values_json, steps, code = self._manual_case_template(fn, self.backend.get(), mode)
+            values_json, steps, code, mock_json = self._manual_case_template(fn, self.backend.get(), mode)
             if force or not values_text.get("1.0", "end").strip():
                 values_text.delete("1.0", "end")
                 values_text.insert("1.0", values_json)
             if force or not code_text.get("1.0", "end").strip():
                 code_text.delete("1.0", "end")
                 code_text.insert("1.0", code if mode == "Harness Code" else steps)
+            if force or not mock_text.get("1.0", "end").strip() or mock_text.get("1.0", "end").strip() == "{}":
+                mock_text.delete("1.0", "end")
+                mock_text.insert("1.0", mock_json)
             current_template["function"] = function_var.get()
             current_template["mode"] = mode
 
@@ -800,7 +979,15 @@ class TestingMateApp(tk.Tk):
             manual_code = values.pop("__manual_action_code", "")
             values.pop("__manual_steps_only", None)
             values.pop("__manual_source", None)
-            values_text.insert("1.0", json.dumps(values, indent=2))
+            # Separate mock keys from input values
+            _MP = ("__stub_return.","__stub_output.","__expected_calls",
+                   "__expected_call_arg.","__expected_return",
+                   "__expected_output.","__expected_global.")
+            mv, iv = {}, {}
+            for k, v in values.items():
+                (mv if any(k == p or k.startswith(p) for p in _MP) else iv)[k] = v
+            values_text.insert("1.0", json.dumps(iv, indent=2))
+            mock_text.insert("1.0", json.dumps(mv, indent=2) if mv else "{}")
             code_text.insert("1.0", manual_code or selected_case.test_steps or "")
         else:
             fill_template(force=True)
@@ -812,9 +999,9 @@ class TestingMateApp(tk.Tk):
         actions.grid(row=2, column=0, sticky="ew")
         actions.columnconfigure(0, weight=1)
 
-        def save() -> None:
-            fn = selected_fn()
-            if fn is None:
+        def _save() -> None:
+            fn = _selected_fn()
+            if fn == None:
                 messagebox.showerror(APP_NAME, "Select a valid function.", parent=popup)
                 return
             try:
@@ -824,6 +1011,16 @@ class TestingMateApp(tk.Tk):
                     raise ValueError("Values JSON must be an object.")
             except Exception as exc:
                 messagebox.showerror(APP_NAME, f"Invalid Values JSON: {exc}", parent=popup)
+                return
+            # Merge mock/stub configuration into values
+            try:
+                raw_mock = mock_text.get("1.0", "end").strip()
+                mock_vals = json.loads(raw_mock) if raw_mock else {}
+                if not isinstance(mock_vals, dict):
+                    raise ValueError("Mock JSON must be an object.")
+                values.update(mock_vals)
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, f"Invalid Mock/Stub JSON: {exc}", parent=popup)
                 return
             code_or_steps = code_text.get("1.0", "end").rstrip()
             payload = {
@@ -843,7 +1040,7 @@ class TestingMateApp(tk.Tk):
 
         ttk.Button(actions, text="Insert Template", command=lambda: fill_template(force=True), style="Secondary.TButton").grid(row=0, column=0, sticky="w")
         ttk.Button(actions, text="Cancel", command=popup.destroy, style="Secondary.TButton").grid(row=0, column=1, sticky="e", padx=(8, 0))
-        ttk.Button(actions, text="Add Testcase", command=save, style="Accent.TButton").grid(row=0, column=2, sticky="e", padx=(8, 0))
+        ttk.Button(actions, text="Add Testcase", command=_save, style="Accent.TButton").grid(row=0, column=2, sticky="e", padx=(8, 0))
 
     def _add_manual_testcase_async(self, payload: dict) -> None:
         if not self.sources and not self.compile_commands.get().strip():
@@ -851,8 +1048,9 @@ class TestingMateApp(tk.Tk):
             return
         if not self._ensure_msys2_toolchain():
             return
-        thread = threading.Thread(target=lambda: self._add_manual_testcase(payload), daemon=True)
-        thread.start()
+        if not self._validate_output_access():
+            return
+        self._start_background_task("Add Manual Testcase", lambda: self._add_manual_testcase(payload))
 
     def _add_manual_testcase(self, payload: dict) -> None:
         self._set_log("")
@@ -1030,6 +1228,10 @@ class TestingMateApp(tk.Tk):
         self.log.insert("end", text + "\n")
         self.log.see("end")
 
+    def _log(self, text: str) -> None:
+        """Thread-safe logging method that can be called from background threads."""
+        self._append_log(text)
+
     def _show_completion_popup(self, title: str, summary_lines: list[str], generated_paths: list[Path], *, is_error: bool = False) -> None:
         def show() -> None:
             details = "\n".join(summary_lines[:8]) if summary_lines else "No source files were processed."
@@ -1153,7 +1355,7 @@ class OrchestratorOptions:
     target_coverage_percent: float = 100.0
     coverage_density: int = 3
     max_ai_rounds: int = 1
-    mock_retry_limit: int = 5
+    mock_retry_limit: int = 8
     clean_before_generate: bool = True
     unit_sources_override: list[Path] = field(default_factory=list)
 
@@ -1174,6 +1376,39 @@ class Orchestrator:
 
     def _log(self, text: str) -> None:
         self.log_callback(text)
+
+    def _assert_writable_dir(self, path: Path, label: str = "workspace") -> None:
+        """Create and probe a writable directory before expensive generation starts."""
+        try:
+            path = path.expanduser()
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / f".testing_mate_write_probe_{os.getpid()}.tmp"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+        except Exception as exc:
+            raise PermissionError(
+                f"{label} is not writable: {path}. "
+                "Choose an output folder outside protected/source directories, "
+                "close any editor/viewer locking generated files, or run with proper permissions. "
+                f"Original error: {exc}"
+            ) from exc
+
+    def _remove_tree_strict(self, path: Path, label: str = "workspace") -> None:
+        """Remove generated data and fail loudly if permission/lock prevents cleanup."""
+        if not path.exists():
+            return
+
+        def onerror(func, failed_path, exc_info):
+            try:
+                os.chmod(failed_path, 0o700)
+                func(failed_path)
+            except Exception:
+                raise PermissionError(
+                    f"Could not clean {label}: {failed_path}. "
+                    "The directory may be read-only or locked by an editor, terminal, Explorer preview, antivirus, or a running test binary."
+                )
+
+        shutil.rmtree(path, onerror=onerror)
 
     @staticmethod
     def _path_contains(parent: Path, child: Path) -> bool:
@@ -1222,13 +1457,16 @@ class Orchestrator:
             # Safety fallback: never recursively delete a path that looks like a source/project folder.
             backend_out_dir = out_dir / backend
             if backend_out_dir.exists():
-                shutil.rmtree(backend_out_dir, ignore_errors=True)
+                self._remove_tree_strict(backend_out_dir, f"old {backend} generated workspace")
                 self._log(f"Cleaned old {backend} generated workspace: {backend_out_dir}")
             else:
                 self._log(f"Skipped broad cleanup for safety; output path may contain source data: {out_dir}")
+            self._assert_writable_dir(out_dir, "output workspace")
             return
 
-        shutil.rmtree(out_dir, ignore_errors=True)
+        parent = out_dir.parent if str(out_dir.parent) else Path.cwd()
+        self._assert_writable_dir(parent, "output parent folder")
+        self._remove_tree_strict(out_dir, "old Generate workspace")
         self._log(f"Cleaned old Generate workspace: {out_dir}")
 
     @staticmethod
@@ -1578,7 +1816,7 @@ class Orchestrator:
         result = OrchestratorResult()
         project_sources, _include_dirs, _defines, _compiler = self._resolve_project_inputs(options)
         out_dir = source_scoped_output_dir(options.output_dir.expanduser(), project_sources)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        self._assert_writable_dir(out_dir, "output workspace")
         if out_dir != options.output_dir.expanduser():
             self._log(f"Output folder: {out_dir}")
         if len(project_sources) > 1:
@@ -1608,7 +1846,7 @@ class Orchestrator:
                 feedback = self._merge_run_failures(feedback, run_result)
 
                 writer = ArtifactWriter(backend_out_dir)
-                report_path = writer._write_html_report(source, functions, cases, backend, feedback, run_result)
+                report_path = writer._write_html_report(source, functions, cases, backend, feedback, run_result, selected_coverage=options.coverage)
                 summary_path = writer._write_summary(source, functions, cases, feedback, run_result)
                 result.generated_paths.extend([report_path, summary_path])
                 if run_result.returncode not in (0, None) or (run_result.returncode is None and run_result.skipped_reason):
@@ -1644,11 +1882,16 @@ class Orchestrator:
         return result
 
     def add_manual_test_case(self, options: OrchestratorOptions, payload: dict) -> OrchestratorResult:
-        """Append one user-authored testcase, regenerate the backend harness, rerun, and refresh reports."""
+        """Append one user-authored testcase, regenerate the backend harness, rerun, and refresh reports.
+
+        Optimized: loads cached analysis artifacts instead of re-running the
+        heavy preprocess -> Clang -> CodeDatabase pipeline.  Falls back to
+        full analysis only when the cache is missing or stale.
+        """
         result = OrchestratorResult()
         project_sources, include_dirs, defines, compiler = self._resolve_project_inputs(options)
         out_dir = source_scoped_output_dir(options.output_dir.expanduser(), project_sources)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        self._assert_writable_dir(out_dir, "output workspace")
         if out_dir != options.output_dir.expanduser():
             self._log(f"Output folder: {out_dir}")
 
@@ -1656,8 +1899,6 @@ class Orchestrator:
         if requested_source:
             project_sources = [source for source in project_sources if source.name == requested_source or source.stem == Path(requested_source).stem] or project_sources
 
-        analyzer = ClangEnhancedAnalyzer(include_dirs, defines, compiler, self._log)
-        generator = TestVectorGenerator()
         report_parser = CoverageReportParser()
         loaded_feedback = load_coverage_feedback(options.report_file, report_parser, self._log)
         backend = options.backend
@@ -1667,48 +1908,36 @@ class Orchestrator:
         for source in project_sources[:1]:
             try:
                 backend_out_dir = out_dir / backend
-                analysis_input_source, analysis_stub_dir = self._prepare_backend_analysis_workspace(
-                    backend_out_dir,
-                    source,
-                    backend,
-                    unit_sources or [source],
-                )
-                analysis_source = analysis_input_source
-                if options.preprocess:
-                    preprocess_out_dir = (analysis_stub_dir / "preprocessed") if analysis_stub_dir else (out_dir / "preprocessed")
-                    preprocessor = CPreprocessor(compiler, [], defines, stub_dir=analysis_stub_dir)
-                    analysis_source, note = preprocessor.preprocess_file(analysis_input_source, preprocess_out_dir)
-                    self._log(note)
-                functions = analyzer.analyze(
-                    analysis_source,
-                    include_static_functions=options.include_static_functions,
-                    include_main=options.include_main_function,
-                )
-                if analysis_source != source:
-                    analyzer.apply_original_source_context(functions, source)
-                code_database = CodeDatabase.from_functions(source, analysis_source, functions, analyzer=analyzer.last_analyzer)
-                writer = ArtifactWriter(backend_out_dir)
+
+                # ── FAST PATH: load from cached analysis artifacts ──
                 try:
-                    _saved_functions, existing_cases = self._load_existing_analysis(backend_out_dir, source)
-                    self._log(f"Loaded {len(existing_cases)} existing cases for {source.name}.")
-                except Exception as exc:
-                    self._log(f"Existing analysis not available for {source.name}; generating initial cases first: {exc}")
-                    existing_cases = generator.generate(
-                        source.name,
-                        functions,
-                        options.level,
-                        options.coverage,
-                        options.iso26262_profile,
-                        options.asil_level,
-                        options.include_static_functions,
-                        code_database,
+                    functions, existing_cases, code_database = self._load_full_cache(
+                        backend_out_dir, source,
+                    )
+                    self._log(
+                        f"Cache hit: loaded {len(functions)} functions, "
+                        f"{len(existing_cases)} existing cases from cached artifacts."
+                    )
+                except (FileNotFoundError, ValueError) as exc:
+                    # ── SLOW PATH: full analysis on cache miss ──
+                    self._log(f"Cache miss ({exc}); running full analysis pipeline...")
+                    functions, existing_cases, code_database = self._full_analyze_source(
+                        source, options, include_dirs, defines, compiler,
+                        backend_out_dir, out_dir, unit_sources,
                     )
 
-                manual_case = self._manual_case_from_payload(source, functions, existing_cases, options, payload)
+                # Build the manual testcase from the GUI payload
+                manual_case = self._manual_case_from_payload(
+                    source, functions, existing_cases, options, payload,
+                )
                 cases = [*existing_cases, manual_case]
+
+                # Merge coverage feedback
                 feedback = collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or loaded_feedback
                 feedback = merge_generated_coverage_feedback(feedback, functions, cases, options.coverage)
 
+                # Regenerate ONLY the backend harness and artifacts (no re-analysis)
+                writer = ArtifactWriter(backend_out_dir)
                 paths = writer.write(
                     source,
                     functions,
@@ -1722,17 +1951,24 @@ class Orchestrator:
                     include_dirs=include_dirs,
                     target_coverage_percent=options.target_coverage_percent,
                     code_database=code_database,
+                    selected_coverage=options.coverage,
                 )
                 result.generated_paths.extend(paths)
                 self._log(f"Added manual testcase {manual_case.test_id} for {manual_case.function}.")
 
-                run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit, cases, functions, code_database)
+                # Run backend
+                run_result = self._run_backend_with_oracle_fallback(
+                    backend, backend_out_dir, source,
+                    options.mock_retry_limit, cases, functions, code_database,
+                )
                 if run_result.returncode not in (0, None):
                     result.exit_code = run_result.returncode
+
+                # Refresh reports
                 refreshed_feedback = collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or feedback
                 refreshed_feedback = merge_generated_coverage_feedback(refreshed_feedback, functions, cases, options.coverage)
                 refreshed_feedback = self._merge_run_failures(refreshed_feedback, run_result)
-                report_path = writer._write_html_report(source, functions, cases, backend, refreshed_feedback, run_result)
+                report_path = writer._write_html_report(source, functions, cases, backend, refreshed_feedback, run_result, selected_coverage=options.coverage)
                 summary_path = writer._write_summary(source, functions, cases, refreshed_feedback, run_result)
                 result.generated_paths.extend([report_path, summary_path])
                 result.functions.extend(functions)
@@ -1789,6 +2025,24 @@ class Orchestrator:
         values = {str(key): str(value) for key, value in values.items()}
         mode = str(payload.get("mode") or "Steps Only")
         code_or_steps = str(payload.get("code_or_steps") or "").rstrip()
+        _mock_lines = []
+        for _k in sorted(values):
+            if _k.startswith("__stub_return."):
+                _fn = re.sub(r"[^A-Za-z0-9_]", "_", _k[len("__stub_return."):])
+                _mock_lines.append(f"    tm_stub_{_fn}_return = {values[_k]};")
+            elif _k.startswith("__stub_output."):
+                _parts = _k[len("__stub_output."):].split(".", 1)
+                _fn = re.sub(r"[^A-Za-z0-9_]", "_", _parts[0])
+                _idx = re.sub(r"[^A-Za-z0-9_]", "_", _parts[1]) if len(_parts) > 1 else "0"
+                _mock_lines.append(f"    tm_stub_{_fn}_output_{_idx} = {values[_k]};")
+            elif _k.startswith("__expected_call_arg."):
+                _rest = _k[len("__expected_call_arg."):].split(".", 1)
+                _fn = re.sub(r"[^A-Za-z0-9_]", "_", _rest[0])
+                _idx = re.sub(r"[^A-Za-z0-9_]", "_", _rest[1]) if len(_rest) > 1 else "0"
+                _mock_lines.append(f"    tm_expected_{_fn}_arg{_idx} = {values[_k]};")
+        if _mock_lines and mode == "Harness Code" and code_or_steps:
+            _block = "    /* Testing Mate: mock/stub setup */\n" + "\n".join(_mock_lines) + "\n\n"
+            code_or_steps = _block + code_or_steps
         if mode == "Harness Code" and code_or_steps:
             values["__manual_action_code"] = code_or_steps
         else:
@@ -1838,18 +2092,22 @@ class Orchestrator:
     def add_uncovered_cases(self, options: OrchestratorOptions, selected_gap: dict | None = None) -> OrchestratorResult:
         """Add deterministic candidate cases for uncovered lines/branches shown by the latest report.
 
+        Optimized: loads cached analysis artifacts instead of re-running the
+        heavy preprocess -> Clang -> CodeDatabase pipeline.  Falls back to
+        full analysis only when the cache is missing or stale.
+
         If `selected_gap` comes from the GUI tree, only that row is targeted.
-        Otherwise all parsed coverage gaps are used. The method rewrites the backend
-        harness with the merged case list, reruns it, and regenerates the HTML report.
+        Otherwise all parsed coverage gaps are used.  The method rewrites the
+        backend harness with the merged case list, reruns it, and regenerates
+        the HTML report.
         """
         result = OrchestratorResult()
         project_sources, include_dirs, defines, compiler = self._resolve_project_inputs(options)
         out_dir = source_scoped_output_dir(options.output_dir.expanduser(), project_sources)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        self._assert_writable_dir(out_dir, "output workspace")
         if out_dir != options.output_dir.expanduser():
             self._log(f"Output folder: {out_dir}")
 
-        analyzer = ClangEnhancedAnalyzer(include_dirs, defines, compiler, self._log)
         generator = TestVectorGenerator()
         report_parser = CoverageReportParser()
         loaded_feedback = load_coverage_feedback(options.report_file, report_parser, self._log)
@@ -1860,46 +2118,29 @@ class Orchestrator:
         for source in project_sources:
             try:
                 backend_out_dir = out_dir / backend
-                analysis_input_source, analysis_stub_dir = self._prepare_backend_analysis_workspace(
-                    backend_out_dir,
-                    source,
-                    backend,
-                    unit_sources or [source],
-                )
-                analysis_source = analysis_input_source
-                if options.preprocess:
-                    preprocess_out_dir = (analysis_stub_dir / "preprocessed") if analysis_stub_dir else (out_dir / "preprocessed")
-                    preprocessor = CPreprocessor(compiler, [], defines, stub_dir=analysis_stub_dir)
-                    analysis_source, note = preprocessor.preprocess_file(analysis_input_source, preprocess_out_dir)
-                    self._log(note)
-                functions = analyzer.analyze(
-                    analysis_source,
-                    include_static_functions=options.include_static_functions,
-                    include_main=options.include_main_function,
-                )
-                if analysis_source != source:
-                    analyzer.apply_original_source_context(functions, source)
-                code_database = CodeDatabase.from_functions(source, analysis_source, functions, analyzer=analyzer.last_analyzer)
-                writer = ArtifactWriter(backend_out_dir)
+
+                # ── FAST PATH: load from cached analysis artifacts ──
                 try:
-                    _saved_functions, existing_cases = self._load_existing_analysis(backend_out_dir, source)
-                    self._log(f"Loaded {len(existing_cases)} existing cases for {source.name}.")
-                except Exception as exc:
-                    self._log(f"Existing analysis not available for {source.name}; generating initial cases first: {exc}")
-                    existing_cases = generator.generate(
-                        source.name,
-                        functions,
-                        options.level,
-                        options.coverage,
-                        options.iso26262_profile,
-                        options.asil_level,
-                        options.include_static_functions,
-                        code_database,
+                    functions, existing_cases, code_database = self._load_full_cache(
+                        backend_out_dir, source,
+                    )
+                    self._log(
+                        f"Cache hit: loaded {len(functions)} functions, "
+                        f"{len(existing_cases)} existing cases from cached artifacts."
+                    )
+                except (FileNotFoundError, ValueError) as exc:
+                    # ── SLOW PATH: full analysis on cache miss ──
+                    self._log(f"Cache miss ({exc}); running full analysis pipeline...")
+                    functions, existing_cases, code_database = self._full_analyze_source(
+                        source, options, include_dirs, defines, compiler,
+                        backend_out_dir, out_dir, unit_sources,
                     )
 
+                # Merge coverage feedback from latest backend evidence
                 feedback = collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or loaded_feedback
                 feedback = merge_generated_coverage_feedback(feedback, functions, existing_cases, options.coverage)
 
+                # Plan coverage gaps
                 gaps = CoverageGapPlanner().plan(feedback, functions, max_gaps=48)
                 if str(options.coverage).strip().upper() not in {"MC/DC", "MCDC"}:
                     gaps = [gap for gap in gaps if gap.metric != "MC/DC"]
@@ -1931,6 +2172,9 @@ class Orchestrator:
                     continue
 
                 cases = [*existing_cases, *new_cases]
+
+                # Regenerate ONLY the backend harness and artifacts (no re-analysis)
+                writer = ArtifactWriter(backend_out_dir)
                 paths = writer.write(
                     source,
                     functions,
@@ -1944,17 +2188,24 @@ class Orchestrator:
                     include_dirs=include_dirs,
                     target_coverage_percent=options.target_coverage_percent,
                     code_database=code_database,
+                    selected_coverage=options.coverage,
                 )
                 result.generated_paths.extend(paths)
                 self._log(f"Added {len(new_cases)} coverage-gap candidate cases for {source.name}.")
 
-                run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit, cases, functions, code_database)
+                # Run backend
+                run_result = self._run_backend_with_oracle_fallback(
+                    backend, backend_out_dir, source,
+                    options.mock_retry_limit, cases, functions, code_database,
+                )
                 if run_result.returncode not in (0, None):
                     result.exit_code = run_result.returncode
+
+                # Refresh reports
                 refreshed_feedback = collect_backend_feedback(report_parser, backend_out_dir, source, backend, self._log) or feedback
                 refreshed_feedback = merge_generated_coverage_feedback(refreshed_feedback, functions, cases, options.coverage)
                 refreshed_feedback = self._merge_run_failures(refreshed_feedback, run_result)
-                report_path = writer._write_html_report(source, functions, cases, backend, refreshed_feedback, run_result)
+                report_path = writer._write_html_report(source, functions, cases, backend, refreshed_feedback, run_result, selected_coverage=options.coverage)
                 summary_path = writer._write_summary(source, functions, cases, refreshed_feedback, run_result)
                 result.generated_paths.extend([report_path, summary_path])
                 result.functions.extend(functions)
@@ -2042,7 +2293,7 @@ class Orchestrator:
         report_path: Path | None,
     ) -> Path:
         """Write a completion marker for one parallel source node."""
-        node_out_dir.mkdir(parents=True, exist_ok=True)
+        self._assert_writable_dir(node_out_dir, "source node workspace")
         status_path = node_out_dir / "testing_mate_node_status.json"
         status = "PASS" if node_result.exit_code == 0 else "FAIL"
         payload = {
@@ -2082,7 +2333,7 @@ class Orchestrator:
         result = OrchestratorResult()
         backend = options.backend
         node_root = out_dir / "modules"
-        node_root.mkdir(parents=True, exist_ok=True)
+        self._assert_writable_dir(node_root, "parallel node root")
         report_items: list[dict] = []
         workers = self._node_worker_count(len(project_sources))
         self._log(f"Parallel folder mode: {len(project_sources)} source node(s), {workers} worker(s).")
@@ -2104,23 +2355,17 @@ class Orchestrator:
             status_path = self._write_source_node_status(node_out_dir, source, node_result, report_path)
             return source, node_out_dir, node_result, report_path, status_path
 
-        if workers <= 1:
-            completed = [run_one(source) for source in project_sources]
-        else:
-            completed = []
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_map = {executor.submit(run_one, source): source for source in project_sources}
-                for future in as_completed(future_map):
-                    source = future_map[future]
-                    try:
-                        completed.append(future.result())
-                    except Exception as exc:
-                        node_out_dir = node_root / self._safe_node_name(source)
-                        node_result = OrchestratorResult(exit_code=1)
-                        node_result.summary_lines.append(f"{source.name}: ERROR {exc}")
-                        status_path = self._write_source_node_status(node_out_dir, source, node_result, None)
-                        completed.append((source, node_out_dir, node_result, None, status_path))
-                        self._log(f"[{source.name}] ERROR node failed: {exc}")
+        completed = []
+        for source in project_sources:
+            try:
+                completed.append(run_one(source))
+            except Exception as exc:
+                node_out_dir = node_root / self._safe_node_name(source)
+                node_result = OrchestratorResult(exit_code=1)
+                node_result.summary_lines.append(f"{source.name}: ERROR {exc}")
+                status_path = self._write_source_node_status(node_out_dir, source, node_result, None)
+                completed.append((source, node_out_dir, node_result, None, status_path))
+                self._log(f"[{source.name}] ERROR node failed: {exc}")
 
         completed.sort(key=lambda item: project_sources.index(item[0]))
         for source, _node_out_dir, node_result, report_path, status_path in completed:
@@ -2161,7 +2406,7 @@ class Orchestrator:
         result = OrchestratorResult()
         backend = options.backend
         node_root = out_dir / "modules"
-        node_root.mkdir(parents=True, exist_ok=True)
+        self._assert_writable_dir(node_root, "parallel node root")
         report_items: list[dict] = []
         workers = self._node_worker_count(len(project_sources))
         self._log(f"Parallel rerun mode: {len(project_sources)} source node(s), {workers} worker(s).")
@@ -2181,23 +2426,17 @@ class Orchestrator:
             status_path = self._write_source_node_status(node_out_dir, source, node_result, report_path)
             return source, node_out_dir, node_result, report_path, status_path
 
-        if workers <= 1:
-            completed = [run_one(source) for source in project_sources]
-        else:
-            completed = []
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_map = {executor.submit(run_one, source): source for source in project_sources}
-                for future in as_completed(future_map):
-                    source = future_map[future]
-                    try:
-                        completed.append(future.result())
-                    except Exception as exc:
-                        node_out_dir = node_root / self._safe_node_name(source)
-                        node_result = OrchestratorResult(exit_code=1)
-                        node_result.summary_lines.append(f"{source.name}: ERROR {exc}")
-                        status_path = self._write_source_node_status(node_out_dir, source, node_result, None)
-                        completed.append((source, node_out_dir, node_result, None, status_path))
-                        self._log(f"[{source.name}] ERROR rerun node failed: {exc}")
+        completed = []
+        for source in project_sources:
+            try:
+                completed.append(run_one(source))
+            except Exception as exc:
+                node_out_dir = node_root / self._safe_node_name(source)
+                node_result = OrchestratorResult(exit_code=1)
+                node_result.summary_lines.append(f"{source.name}: ERROR {exc}")
+                status_path = self._write_source_node_status(node_out_dir, source, node_result, None)
+                completed.append((source, node_out_dir, node_result, None, status_path))
+                self._log(f"[{source.name}] ERROR rerun node failed: {exc}")
 
         completed.sort(key=lambda item: project_sources.index(item[0]))
         for source, _node_out_dir, node_result, report_path, status_path in completed:
@@ -2233,7 +2472,7 @@ class Orchestrator:
         out_dir = source_scoped_output_dir(options.output_dir.expanduser(), project_sources)
         if not refine_from_report and options.clean_before_generate:
             self._clean_generate_workspace(out_dir, project_sources, options.backend)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        self._assert_writable_dir(out_dir, "output workspace")
         if out_dir != options.output_dir.expanduser():
             self._log(f"Output folder: {out_dir}")
         if len(project_sources) > 1:
@@ -2260,7 +2499,7 @@ class Orchestrator:
                 analysis_source = analysis_input_source
                 if options.preprocess:
                     preprocess_out_dir = (analysis_stub_dir / "preprocessed") if analysis_stub_dir else (out_dir / "preprocessed")
-                    preprocessor = CPreprocessor(compiler, [], defines, stub_dir=analysis_stub_dir)
+                    preprocessor = CPreprocessor(compiler, include_dirs, defines, stub_dir=analysis_stub_dir)
                     analysis_source, note = preprocessor.preprocess_file(analysis_input_source, preprocess_out_dir)
                     self._log(note)
                 functions = analyzer.analyze(
@@ -2362,6 +2601,7 @@ class Orchestrator:
                     include_dirs=include_dirs,
                     target_coverage_percent=options.target_coverage_percent,
                     code_database=code_database,
+                    selected_coverage=options.coverage,
                 )
                 result.generated_paths.extend(source_paths)
                 report_path = next(
@@ -2422,6 +2662,7 @@ class Orchestrator:
                                 include_dirs=include_dirs,
                                 target_coverage_percent=options.target_coverage_percent,
                                 code_database=code_database,
+                                selected_coverage=options.coverage,
                             )
                             result.generated_paths.extend(source_paths)
                             run_result = self._run_backend_with_oracle_fallback(backend, backend_out_dir, source, options.mock_retry_limit, cases, functions, code_database)
@@ -2432,7 +2673,7 @@ class Orchestrator:
                             active_feedback = self._merge_run_failures(active_feedback, run_result)
                         elif escalation_statuses:
                             self._log("Layer fallback found no new non-duplicate gap case below target.")
-                    report_path = writer._write_html_report(source, functions, cases, backend, active_feedback, run_result)
+                    report_path = writer._write_html_report(source, functions, cases, backend, active_feedback, run_result, selected_coverage=options.coverage)
                     result.generated_paths.append(report_path)
                     result.generated_paths.append(writer._write_summary(source, functions, cases, active_feedback, run_result))
                     if run_result.returncode not in (0, None) or (run_result.returncode is None and run_result.skipped_reason):
@@ -2486,14 +2727,17 @@ class Orchestrator:
                 compile_commands = options.compile_commands if isinstance(options.compile_commands, Path) else Path(str(options.compile_commands))
                 database = CompileCommandsDatabase.load(compile_commands)
                 compile_sources = database.source_files()
+                compile_includes = database.include_dirs()
+                compile_defines = database.defines()
                 sources.extend(compile_sources)
-                defines.extend(database.defines())
+                include_dirs.extend(compile_includes)
+                defines.extend(compile_defines)
                 database_compiler = database.compiler()
                 if database_compiler and not options.compiler.strip():
                     compiler = database_compiler
                 self._log(
                     f"Loaded compile_commands.json: {len(compile_sources)} source files, "
-                    f"{len(database.defines())} defines; ignored {len(database.include_dirs())} compile include dirs."
+                    f"{len(compile_includes)} include dirs, {len(compile_defines)} defines."
                 )
             except Exception as exc:
                 self._log(f"compile_commands.json could not be loaded: {exc}")
@@ -2565,6 +2809,124 @@ class Orchestrator:
         if not cases:
             raise ValueError(f"No saved test cases were found in {analysis_path}.")
         return functions, cases
+
+    @staticmethod
+    def _load_cached_code_database(backend_out_dir: Path, source: Path) -> "CodeDatabase | None":
+        """Load a previously-saved CodeDatabase from the JSON artifact.
+
+        Returns None when the file is absent or cannot be deserialized.
+        """
+        db_path = backend_out_dir / f"{source.stem}_code_database.json"
+        if not db_path.exists():
+            return None
+        try:
+            # Preferred API: CodeDatabase.load(path)
+            return CodeDatabase.load(db_path)
+        except AttributeError:
+            pass
+        try:
+            payload = json.loads(db_path.read_text(encoding="utf-8"))
+            return CodeDatabase.from_json(payload)
+        except (AttributeError, Exception):
+            pass
+        return None
+
+    def _load_full_cache(
+        self,
+        backend_out_dir: Path,
+        source: Path,
+    ) -> "tuple[list[FunctionInfo], list[TestCase], CodeDatabase | None]":
+        """Load functions, test cases, and code database from cached analysis artifacts.
+
+        Raises FileNotFoundError when artifacts are missing or stale (source
+        file was modified after the analysis was written).
+        """
+        analysis_path = backend_out_dir / f"{source.stem}_analysis.json"
+        if not analysis_path.exists():
+            raise FileNotFoundError(f"Analysis artifact not found: {analysis_path}")
+
+        # Staleness check: reject the cache when the source is newer
+        try:
+            if source.exists() and source.stat().st_mtime > analysis_path.stat().st_mtime:
+                raise FileNotFoundError(
+                    f"Source {source.name} is newer than cached analysis; "
+                    "full re-analysis required."
+                )
+        except OSError:
+            pass  # stat failure is non-fatal; proceed with cached data
+
+        functions, cases = self._load_existing_analysis(backend_out_dir, source)
+        code_database = self._load_cached_code_database(backend_out_dir, source)
+        return functions, cases, code_database
+
+    def _full_analyze_source(
+        self,
+        source: Path,
+        options: OrchestratorOptions,
+        include_dirs: list[str],
+        defines: list[str],
+        compiler: str,
+        backend_out_dir: Path,
+        out_dir: Path,
+        unit_sources: list[Path],
+    ) -> "tuple[list[FunctionInfo], list[TestCase], CodeDatabase | None]":
+        """Run the complete heavy analysis pipeline for a single source file.
+
+        Pipeline: prepare workspace -> preprocess -> Clang analyze ->
+        CodeDatabase -> generate initial test cases.
+
+        This is the *slow path* and should only be invoked when cached
+        artifacts are missing or stale.
+        """
+        backend = options.backend
+
+        # 1. Prepare backend analysis workspace (copy source + stubs)
+        analysis_input_source, analysis_stub_dir = self._prepare_backend_analysis_workspace(
+            backend_out_dir, source, backend, unit_sources or [source],
+        )
+
+        # 2. Preprocess
+        analysis_source = analysis_input_source
+        if options.preprocess:
+            preprocess_out_dir = (
+                (analysis_stub_dir / "preprocessed")
+                if analysis_stub_dir
+                else (out_dir / "preprocessed")
+            )
+            preprocessor = CPreprocessor(compiler, include_dirs, defines, stub_dir=analysis_stub_dir)
+            analysis_source, note = preprocessor.preprocess_file(analysis_input_source, preprocess_out_dir)
+            self._log(note)
+
+        # 3. Clang analysis
+        analyzer = ClangEnhancedAnalyzer(include_dirs, defines, compiler, self._log)
+        functions = analyzer.analyze(
+            analysis_source,
+            include_static_functions=options.include_static_functions,
+            include_main=options.include_main_function,
+        )
+        if analysis_source != source:
+            analyzer.apply_original_source_context(functions, source)
+
+        # 4. Build code database
+        code_database = CodeDatabase.from_functions(
+            source, analysis_source, functions, analyzer=analyzer.last_analyzer,
+        )
+        self._log(f"Code database: {len(code_database.functions)} functions extracted for {source.name}.")
+
+        # 5. Generate initial test cases
+        generator = TestVectorGenerator()
+        cases = generator.generate(
+            source.name,
+            functions,
+            options.level,
+            options.coverage,
+            options.iso26262_profile,
+            options.asil_level,
+            options.include_static_functions,
+            code_database,
+        )
+
+        return functions, cases, code_database
 
     @staticmethod
     def _function_from_payload(item: dict) -> FunctionInfo:

@@ -1,6 +1,6 @@
 from enum import IntEnum
 import os
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable
 
 from pathlib import Path
 
@@ -15,9 +15,28 @@ def snapshot_coverage(cov_db: any, fn: any) -> dict:
         m = cov_db.metrics
     except Exception:
         m = getattr(cov_db, 'metrics', {}) or (cov_db or {})
-    metrics['C0_line'] = (m.get('C0') or 0.0) / 100.0 if m.get('C0') is not None else 0.0
-    metrics['C1_branch'] = (m.get('C1') or 0.0) / 100.0 if m.get('C1') is not None else 0.0
-    metrics['MCDC'] = (m.get('MC/DC') or 0.0) / 100.0 if m.get('MC/DC') is not None else 0.0
+    c0 = m.get('C0')
+    c1 = m.get('C1')
+    mcdc = m.get('MC/DC')
+    metrics['C0_line'] = (c0 or 0.0) / 100.0 if c0 is not None else 0.0
+    metrics['C1_branch'] = (c1 or 0.0) / 100.0 if c1 is not None else 0.0
+
+    # LLVM reports native MC/DC only for eligible decisions.  For a function
+    # whose extracted decisions are all single atomic conditions, MC/DC has no
+    # additional independent-condition obligation beyond executing the true and
+    # false decision outcomes.  In that case, do not force escalation forever
+    # just because LLVM returns MC/DC as N/A/zero-count; use C1 as the effective
+    # target signal for the simple-decision case.
+    simple_decision_only = False
+    try:
+        conditions = list(getattr(fn, 'conditions', []) or [])
+        simple_decision_only = bool(conditions) and all(len(getattr(cond, 'decisions', None) or [getattr(cond, 'text', '')]) <= 1 for cond in conditions)
+    except Exception:
+        simple_decision_only = False
+    if mcdc is None and simple_decision_only and c1 is not None:
+        metrics['MCDC'] = metrics['C1_branch']
+    else:
+        metrics['MCDC'] = (mcdc or 0.0) / 100.0 if mcdc is not None else 0.0
     return metrics
 
 
@@ -112,6 +131,7 @@ class BackendExecutionService:
             include_dirs=self.context.include_dirs,
             target_coverage_percent=self.context.target_coverage_percent,
             code_database=code_database,
+            selected_coverage=self.context.coverage,
         )
 
         layer_reconcile_updates = 0

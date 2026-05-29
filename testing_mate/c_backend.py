@@ -6,7 +6,7 @@ import shlex
 import shutil
 import subprocess
 
-from testing_mate.constants import C_KEYWORDS, DEFAULT_COMPILER, C_SOURCE_EXTENSIONS, HEADER_SOURCE_EXTENSIONS, SOURCE_EXTENSIONS, EXCLUDED_SOURCE_DIRS
+from testing_mate.constants import C_KEYWORDS, DEFAULT_COMPILER, C_SOURCE_EXTENSIONS, SOURCE_EXTENSIONS, EXCLUDED_SOURCE_DIRS
 
 from testing_mate.models import *
 from testing_mate.mcdc_engine import MCDCAnalyzer
