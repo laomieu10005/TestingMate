@@ -370,16 +370,15 @@ class ArtifactWriter:
                             "allowed_pointer_fields": TestVectorGenerator._pointer_field_defaults(fn),
                             "fixit_hints": getattr(fn, "fixit_hints", [])[:20],
                         },
-                        "code_database_chunk": (
-                            code_database.function_chunk(fn.name, cases)
-                            if code_database is not None
-                            else {
-                                "source_file": source.name,
-                                "analyzer": "function_info",
-                                "functions": [OllamaTestRefiner._function_chunk(fn, 8)],
-                                "recent_engine_cases": [OllamaTestRefiner._case_chunk(case) for case in recent_cases],
-                            }
+                        "llm_context": OllamaTestRefiner.llm_context(
+                            source.name,
+                            fn,
+                            cases,
+                            coverage,
+                            None,
+                            code_database,
                         ),
+                        "code_database_chunk": OllamaTestRefiner._compact_code_database_chunk(source.name, fn, code_database),
                         "recent_existing_cases_for_function": [OllamaTestRefiner._case_chunk(case) for case in recent_cases],
                         "dedupe_against": [OllamaTestRefiner._case_signature(case) for case in recent_cases],
                         "acceptance_rules": OllamaTestRefiner._acceptance_rules(backend),

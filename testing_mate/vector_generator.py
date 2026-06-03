@@ -1202,7 +1202,25 @@ class TestVectorGenerator:
         base = {param.name: self._nominal_value(param) for param in params}
         base.update(self._pointer_field_defaults(fn))
         base.update(self._database_pointer_defaults(fn))
+        # Add array element defaults for parameters referenced in conditions
+        base.update(self._array_element_defaults_from_condition(fn))
+        # Add pointer dereference defaults for pointers referenced in conditions
+        base.update(self._pointer_deref_defaults_from_condition(fn))
         return base
+
+    def _array_element_defaults_from_condition(self, fn: FunctionInfo) -> dict[str, str]:
+        """Generate array element fixtures from all conditions in the function."""
+        defaults: dict[str, str] = {}
+        for condition in fn.conditions:
+            defaults.update(self._array_element_defaults_from_params(fn.parameters, condition.text))
+        return defaults
+
+    def _pointer_deref_defaults_from_condition(self, fn: FunctionInfo) -> dict[str, str]:
+        """Generate pointer dereference fixtures from all conditions in the function."""
+        defaults: dict[str, str] = {}
+        for condition in fn.conditions:
+            defaults.update(self._pointer_deref_defaults_from_params(fn.parameters, condition.text))
+        return defaults
 
     def _simple_vectors_for(self, fn: FunctionInfo, coverage: str) -> list[dict[str, str]]:
         params = fn.parameters
@@ -1215,9 +1233,29 @@ class TestVectorGenerator:
                     merged = dict(base)
                     merged.update(vec)
                     self._append_unique(vectors, merged)
+                # Add boundary vectors for this condition
+                for vec in self._condition_boundary_vectors(params, condition):
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
+                # Add equivalence vectors for this condition
+                for vec in self._condition_equivalence_vectors(params, condition):
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
         if coverage == "MC/DC":
             for condition in fn.conditions[:1]:
                 for vec in self._mcdc_pair_vectors(params, condition):
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
+                # Add boundary vectors for this condition
+                for vec in self._condition_boundary_vectors(params, condition):
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
+                # Add equivalence vectors for this condition
+                for vec in self._condition_equivalence_vectors(params, condition):
                     merged = dict(base)
                     merged.update(vec)
                     self._append_unique(vectors, merged)
@@ -1244,9 +1282,29 @@ class TestVectorGenerator:
                     merged = dict(base)
                     merged.update(vec)
                     self._append_unique(vectors, merged)
+                # Add boundary vectors for this condition
+                for vec in self._condition_boundary_vectors(params, condition)[:4]:
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
+                # Add equivalence vectors for this condition
+                for vec in self._condition_equivalence_vectors(params, condition)[:4]:
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
         if coverage == "MC/DC":
             for condition in fn.conditions:
                 for vec in self._mcdc_pair_vectors(params, condition):
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
+                # Add boundary vectors for this condition
+                for vec in self._condition_boundary_vectors(params, condition)[:4]:
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
+                # Add equivalence vectors for this condition
+                for vec in self._condition_equivalence_vectors(params, condition)[:4]:
                     merged = dict(base)
                     merged.update(vec)
                     self._append_unique(vectors, merged)
@@ -1262,6 +1320,16 @@ class TestVectorGenerator:
                     merged = dict(base)
                     merged.update(vec)
                     self._append_unique(vectors, merged)
+                # Add boundary vectors for this condition
+                for vec in self._condition_boundary_vectors(params, condition)[:4]:
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
+                # Add equivalence vectors for this condition
+                for vec in self._condition_equivalence_vectors(params, condition)[:4]:
+                    merged = dict(base)
+                    merged.update(vec)
+                    self._append_unique(vectors, merged)
             for param in params[:8]:
                 values = self._interesting_values(param)
                 for value in (values[:2] + values[-2:]):
@@ -1272,6 +1340,18 @@ class TestVectorGenerator:
                 for value in (values[:2] + values[-2:]):
                     vec = dict(base)
                     vec[field_key] = value
+                    self._append_unique(vectors, vec)
+            # Add array element test values
+            for array_key, values in self._array_element_values(fn).items():
+                for value in (values[:2] + values[-2:]):
+                    vec = dict(base)
+                    vec[array_key] = value
+                    self._append_unique(vectors, vec)
+            # Add pointer dereference test values
+            for deref_key, values in self._pointer_deref_values(fn).items():
+                for value in (values[:2] + values[-2:]):
+                    vec = dict(base)
+                    vec[deref_key] = value
                     self._append_unique(vectors, vec)
         return vectors
 
@@ -1425,6 +1505,148 @@ class TestVectorGenerator:
                 self._drive_decision(vec, decision, desired)
             self._append_unique(vectors, vec)
         return vectors
+
+    def _condition_boundary_vectors(self, params: list[Parameter], condition: Condition) -> list[dict[str, str]]:
+        """Generate boundary value test vectors for a specific condition.
+        
+        Extracts comparison boundaries from the condition text and creates vectors
+        that test at and around those boundaries. This ensures condition boundaries
+        are explicitly tested (e.g., x=5, x=4, x=6 for "x > 5").
+        """
+        base = {param.name: self._nominal_value(param) for param in params}
+        base.update(self._pointer_field_defaults_from_params(params, condition.text))
+        vectors: list[dict[str, str]] = []
+        
+        # Extract boundary values from condition text
+        boundaries = self._extract_boundaries_from_condition(condition.text, params)
+        
+        # For each boundary value, create vectors that test at and around it
+        for param_name, values in boundaries.items():
+            if param_name not in base:
+                continue
+            for value in values:
+                # Test at boundary (should satisfy)
+                vec_at = dict(base)
+                vec_at[param_name] = str(value)
+                self._append_unique(vectors, vec_at)
+                
+                # Test just below boundary
+                if isinstance(value, (int, float)) and value > 0:
+                    below = int(value) - 1 if isinstance(value, int) else value - 0.1
+                    vec_below = dict(base)
+                    vec_below[param_name] = str(below)
+                    self._append_unique(vectors, vec_below)
+                
+                # Test just above boundary
+                if isinstance(value, (int, float)):
+                    above = int(value) + 1 if isinstance(value, int) else value + 0.1
+                    vec_above = dict(base)
+                    vec_above[param_name] = str(above)
+                    self._append_unique(vectors, vec_above)
+        
+        return vectors
+
+    def _condition_equivalence_vectors(self, params: list[Parameter], condition: Condition) -> list[dict[str, str]]:
+        """Generate equivalence class test vectors for a specific condition.
+        
+        Identifies equivalence classes from the condition (e.g., x < 5 creates
+        classes: x in [-inf, 4], x in [5, inf]) and creates representative vectors
+        for each class. Ensures different input equivalence classes are tested.
+        """
+        base = {param.name: self._nominal_value(param) for param in params}
+        base.update(self._pointer_field_defaults_from_params(params, condition.text))
+        vectors: list[dict[str, str]] = []
+        
+        # Extract equivalence classes from condition
+        equivalence_classes = self._extract_equivalence_classes(condition.text, params)
+        
+        # Create representative vector for each equivalence class
+        for param_name, class_values in equivalence_classes.items():
+            if param_name not in base:
+                continue
+            for representative in class_values:
+                vec = dict(base)
+                vec[param_name] = str(representative)
+                self._append_unique(vectors, vec)
+        
+        return vectors
+
+    def _extract_boundaries_from_condition(self, condition_text: str, params: list[Parameter]) -> dict[str, list[str]]:
+        """Extract boundary values from condition text for parameters.
+        
+        Scans the condition for comparison operators and extracts the comparison
+        values as potential boundaries. Returns a dictionary mapping parameter
+        names to lists of boundary values to test.
+        """
+        boundaries: dict[str, list[str]] = {}
+        
+        for param in params:
+            param_name = param.name
+            boundaries[param_name] = []
+            
+            # Pattern: param op constant or constant op param
+            patterns = [
+                rf"\b{re.escape(param_name)}\b\s*(?:==|!=|>=|<=|>|<)\s*([-+]?\d+(?:\.\d+)?[uUlL]*)",
+                rf"([-+]?\d+(?:\.\d+)?[uUlL]*)\s*(?:==|!=|>=|<=|>|<)\s*\b{re.escape(param_name)}\b",
+            ]
+            
+            for pattern in patterns:
+                for match in re.finditer(pattern, condition_text):
+                    value = match.group(1).rstrip("uUlLfF")
+                    if value not in boundaries[param_name]:
+                        boundaries[param_name].append(value)
+        
+        return boundaries
+
+    def _extract_equivalence_classes(self, condition_text: str, params: list[Parameter]) -> dict[str, list[str]]:
+        """Extract equivalence class representatives from condition text.
+        
+        Identifies decision boundaries and creates representative values for
+        equivalence classes. For example, "x > 5" creates two classes:
+        - x <= 5 (representative: 5 or 0)
+        - x > 5 (representative: 6 or higher)
+        """
+        equivalence_classes: dict[str, list[str]] = {}
+        
+        for param in params:
+            param_name = param.name
+            equivalence_classes[param_name] = []
+            
+            # Look for comparisons involving this parameter
+            match = re.search(
+                rf"\b{re.escape(param_name)}\b\s*(?:==|!=|>=|<=|>|<)\s*([-+]?\d+(?:\.\d+)?[uUlL]*)",
+                condition_text
+            )
+            
+            if not match:
+                # Try reversed pattern
+                match = re.search(
+                    rf"([-+]?\d+(?:\.\d+)?[uUlL]*)\s*(?:==|!=|>=|<=|>|<)\s*\b{re.escape(param_name)}\b",
+                    condition_text
+                )
+            
+            if match:
+                boundary_value = match.group(1).rstrip("uUlLfF")
+                try:
+                    boundary = int(boundary_value) if "." not in boundary_value else float(boundary_value)
+                    
+                    # Create representatives for equivalence classes
+                    if boundary > 0:
+                        equivalence_classes[param_name].extend([
+                            str(0),           # Below boundary
+                            str(boundary),    # At boundary
+                            str(boundary + 1) # Above boundary
+                        ])
+                    else:
+                        equivalence_classes[param_name].extend([
+                            str(boundary - 1), # Below boundary
+                            str(boundary),     # At boundary
+                            str(boundary + 1)  # Above boundary
+                        ])
+                except (ValueError, TypeError):
+                    pass
+        
+        return equivalence_classes
 
     @staticmethod
     def _mcdc_boolean_assignments(condition_text: str, decisions: list[str], target_index: int | None = None) -> list[tuple[bool, ...]]:
@@ -1646,6 +1868,124 @@ class TestVectorGenerator:
         decision = decision.strip()
         decision = self._strip_wrapping_parentheses(decision)
         decision = re.sub(r"\([A-Za-z_]\w+\)\s*", "", decision)
+        
+        # Pattern: Array subscript with field access: arr[i].field op value
+        # Example: buffer[index].state == 5
+        array_field_match = re.search(
+            r"\b([A-Za-z_]\w*)\s*\[\s*([A-Za-z_]\w*)\s*\]\s*\.\s*([A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*)\b\s*(==|!=|>=|<=|>|<)\s*(-?\d+(?:\.\d+)?u?)",
+            decision
+        )
+        if array_field_match:
+            array_name, index_name, field_path, op, value = array_field_match.groups()
+            # Try to drive the index parameter if it exists
+            if index_name in vector:
+                vector[index_name] = "0"
+            # Try to drive the array element field if it exists
+            key = self._field_key(f"{array_name}[{index_name}]", field_path)
+            key = self._resolve_vector_key(key, vector)
+            if key in vector:
+                raw = value.rstrip("uU")
+                number = float(raw) if "." in raw else int(raw)
+                vector[key] = self._value_for_compare(number, op, target_true)
+                return
+        
+        # Pattern: Array subscript comparison: arr[i] op value
+        # Example: data[index] > 10 or arr[i] == STATUS_OK
+        array_match = re.search(
+            r"\b([A-Za-z_]\w*)\s*\[\s*([A-Za-z_]\w*|\d+)\s*\]\s*(==|!=|>=|<=|>|<)\s*(-?\d+(?:\.\d+)?[uUlL]*|[A-Z][A-Za-z0-9_]*)",
+            decision
+        )
+        if array_match:
+            array_name, index_expr, op, value = array_match.groups()
+            # Drive the index if it's a parameter
+            if index_expr.isdigit():
+                index = int(index_expr)
+            else:
+                index = 0
+                if index_expr in vector:
+                    vector[index_expr] = str(index)
+            # Create or update the array element key
+            array_key = f"{array_name}[{index}]"
+            if array_key not in vector:
+                array_key = array_name  # Fallback to array name if specific index doesn't exist
+            
+            # Handle numeric comparisons
+            try:
+                raw = value.rstrip("uUlLfF")
+                if raw and raw[0].isdigit() or raw[0] == '-':
+                    number = float(raw) if "." in raw else int(raw)
+                    vector[array_key] = self._value_for_compare(number, op, target_true)
+                    return
+            except (ValueError, IndexError):
+                pass
+            
+            # Handle enum constant comparisons
+            if value.isupper() or (value[0].isupper() and "_" in value):
+                vector[array_key] = self._literal_for_equality_target(value, (op == "==") == target_true)
+                return
+        
+        # Pattern: Pointer dereference comparison: *ptr op value
+        # Example: *data > 0 or *buffer == 10
+        deref_match = re.search(
+            r"\*\s*([A-Za-z_]\w*)\s*(==|!=|>=|<=|>|<)\s*(-?\d+(?:\.\d+)?[uUlL]*|[A-Z][A-Za-z0-9_]*|[A-Za-z_]\w*)",
+            decision
+        )
+        if deref_match:
+            ptr_name, op, value = deref_match.groups()
+            if ptr_name in vector:
+                # For dereferenced pointer, create a fixture for the dereferenced value
+                deref_key = f"*{ptr_name}"
+                
+                # Try numeric comparison
+                try:
+                    raw = value.rstrip("uUlLfF")
+                    if raw and (raw[0].isdigit() or raw[0] == '-'):
+                        number = float(raw) if "." in raw else int(raw)
+                        vector[deref_key] = self._value_for_compare(number, op, target_true)
+                        return
+                except (ValueError, IndexError):
+                    pass
+                
+                # Try enum constant comparison
+                if value.isupper() or (value[0].isupper() and "_" in value):
+                    vector[deref_key] = self._literal_for_equality_target(value, (op == "==") == target_true)
+                    return
+                
+                # Try parameter comparison
+                if value in vector:
+                    try:
+                        parsed = self._literal(vector[value])
+                        if isinstance(parsed, (int, float)):
+                            vector[deref_key] = self._value_for_compare(parsed, op, target_true)
+                            return
+                    except (ValueError, TypeError):
+                        pass
+        
+        # Pattern: Negated array subscript: !arr[i]
+        negated_array = re.fullmatch(r"!\s*([A-Za-z_]\w*)\s*\[\s*(\d+|[A-Za-z_]\w*)\s*\]", decision)
+        if negated_array:
+            array_name, index_expr = negated_array.groups()
+            if index_expr.isdigit():
+                index = int(index_expr)
+            else:
+                index = 0
+                if index_expr in vector:
+                    vector[index_expr] = str(index)
+            array_key = f"{array_name}[{index}]"
+            if array_key not in vector:
+                array_key = array_name
+            vector[array_key] = "0" if target_true else "1"
+            return
+        
+        # Pattern: Negated pointer dereference: !*ptr
+        negated_deref = re.fullmatch(r"!\s*\*\s*([A-Za-z_]\w*)", decision)
+        if negated_deref:
+            ptr_name = negated_deref.group(1)
+            if ptr_name in vector:
+                deref_key = f"*{ptr_name}"
+                vector[deref_key] = "0" if target_true else "1"
+                return
+        
         field_match = re.search(r"\b([A-Za-z_]\w*)\s*->\s*([A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*)\b\s*(==|!=|>=|<=|>|<)\s*(-?\d+(?:\.\d+)?u?)", decision)
         if field_match:
             key = self._field_key(field_match.group(1), field_match.group(2))
@@ -1904,3 +2244,113 @@ class TestVectorGenerator:
         if any(token in lowered for token in ("age", "counter", "threshold", "max", "min", "delta")):
             return "1"
         return "1"
+
+    @staticmethod
+    def _array_element_defaults_from_params(params: list[Parameter], text: str) -> dict[str, str]:
+        """Generate default values for array parameters referenced in conditions.
+        
+        Scans text for array subscript patterns and creates fixture keys for array elements
+        that are referenced in conditions.
+        """
+        defaults: dict[str, str] = {}
+        for param in params:
+            # Look for array subscript patterns: arr[index] or arr[N]
+            patterns = [
+                rf"\b{re.escape(param.name)}\s*\[\s*([A-Za-z_]\w*|\d+)\s*\]",
+            ]
+            for pattern in patterns:
+                for match in re.finditer(pattern, text):
+                    index_expr = match.group(1)
+                    if index_expr.isdigit():
+                        # Literal index: arr[0]
+                        array_key = f"{param.name}[{index_expr}]"
+                        defaults[array_key] = "0"
+                    else:
+                        # Parameter index: arr[i]
+                        array_key = f"{param.name}[0]"
+                        defaults[array_key] = "0"
+        return defaults
+
+    @staticmethod
+    def _pointer_deref_defaults_from_params(params: list[Parameter], text: str) -> dict[str, str]:
+        """Generate default values for dereferenced pointers referenced in conditions.
+        
+        Scans text for pointer dereference patterns (*ptr) and creates fixture keys
+        for dereferenced pointer values.
+        """
+        defaults: dict[str, str] = {}
+        for param in params:
+            if param.kind != "pointer":
+                continue
+            # Look for dereference patterns: *ptr or (*ptr)
+            pattern = rf"\*\s*{re.escape(param.name)}\b"
+            if re.search(pattern, text):
+                deref_key = f"*{param.name}"
+                defaults[deref_key] = "0"
+        return defaults
+
+    @staticmethod
+    def _array_element_values(fn: FunctionInfo) -> dict[str, list[str]]:
+        """Extract interesting values for array elements from conditions.
+        
+        Returns a dictionary mapping array element keys to lists of test values,
+        derived from comparisons found in conditions.
+        """
+        values: dict[str, list[str]] = {}
+        
+        for condition in fn.conditions:
+            # Array subscript patterns: arr[i] op value
+            array_pattern = rf"\b([A-Za-z_]\w*)\s*\[\s*(\d+|[A-Za-z_]\w*)\s*\]\s*(==|!=|>=|<=|>|<)\s*(-?\d+(?:\.\d+)?u?)"
+            for match in re.finditer(array_pattern, condition.text):
+                array_name, index_expr, op, raw = match.groups()
+                index = int(index_expr) if index_expr.isdigit() else 0
+                array_key = f"{array_name}[{index}]"
+                
+                clean = raw.rstrip("uU")
+                try:
+                    number = float(clean) if "." in clean else int(clean)
+                    candidates = [
+                        TestVectorGenerator._value_for_compare(number, op, True),
+                        TestVectorGenerator._value_for_compare(number, op, False),
+                        "0",
+                    ]
+                    values[array_key] = sorted(set(candidates), key=str)
+                except (ValueError, TypeError):
+                    pass
+        
+        return values
+
+    @staticmethod
+    def _pointer_deref_values(fn: FunctionInfo) -> dict[str, list[str]]:
+        """Extract interesting values for dereferenced pointers from conditions.
+        
+        Returns a dictionary mapping dereferenced pointer keys to lists of test values,
+        derived from comparisons found in conditions.
+        """
+        values: dict[str, list[str]] = {}
+        
+        for condition in fn.conditions:
+            for param in fn.parameters:
+                if param.kind != "pointer":
+                    continue
+                
+                # Pointer dereference patterns: *ptr op value
+                deref_pattern = rf"\*\s*{re.escape(param.name)}\b\s*(==|!=|>=|<=|>|<)\s*(-?\d+(?:\.\d+)?u?|[A-Z][A-Za-z0-9_]*)"
+                for match in re.finditer(deref_pattern, condition.text):
+                    op, raw = match.groups()
+                    deref_key = f"*{param.name}"
+                    
+                    clean = raw.rstrip("uU")
+                    try:
+                        if clean and (clean[0].isdigit() or clean[0] == '-'):
+                            number = float(clean) if "." in clean else int(clean)
+                            candidates = [
+                                TestVectorGenerator._value_for_compare(number, op, True),
+                                TestVectorGenerator._value_for_compare(number, op, False),
+                                "0",
+                            ]
+                            values[deref_key] = sorted(set(candidates), key=str)
+                    except (ValueError, TypeError):
+                        pass
+        
+        return values
