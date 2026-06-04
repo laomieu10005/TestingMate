@@ -138,7 +138,7 @@ class OllamaTestRefiner:
         
         if use_packager:
             return self._refine_packaged(
-                source_name, functions, existing_cases, feedback, coverage, level, backend, code_database
+                source_name, functions, existing_cases, feedback, coverage, level, backend, code_database, iteration
             )
         
         prompt = self._prompt(source_name, functions, existing_cases, feedback, coverage, target_percent, backend, code_database)
@@ -160,6 +160,7 @@ class OllamaTestRefiner:
         level: str,
         backend: str,
         code_database: CodeDatabase | None,
+        iteration: int,
     ) -> tuple[list[TestCase], str]:
         """Refine using optimized data packaging."""
         has_feedback = has_report_evidence(feedback)
@@ -191,13 +192,13 @@ class OllamaTestRefiner:
         
         try:
             payload = self.client.generate_json(prompt)
-            notes = payload.get("analysis", "")
-            raw_cases = payload.get("test_cases", [])
+            notes = self._response_notes(payload)
+            raw_cases = self._response_cases(payload)
             
             if not isinstance(raw_cases, list):
                 return [], "Invalid packaged response."
             
-            cases = self._cases_from_payload(source_name, functions, raw_cases, coverage, level, 1)
+            cases = self._cases_from_payload(source_name, functions, raw_cases, coverage, level, iteration)
             return cases, notes
         except Exception as exc:
             return [], f"Packaged refinement failed: {exc}"
@@ -222,7 +223,7 @@ class OllamaTestRefiner:
         
         if use_packager:
             return self._refine_gap_packaged(
-                source_name, fn, existing_cases, feedback, gap, coverage, level, backend, code_database
+                source_name, fn, existing_cases, feedback, gap, coverage, level, backend, code_database, iteration
             )
         
         prompt = self._gap_prompt(source_name, fn, existing_cases, feedback, gap, coverage, target_percent, backend, code_database)
@@ -245,6 +246,7 @@ class OllamaTestRefiner:
         level: str,
         backend: str,
         code_database: CodeDatabase | None,
+        iteration: int,
     ) -> tuple[list[TestCase], str]:
         """Refine gap using optimized data packaging."""
         package = LLMDataPackager.package_gap_refinement(
@@ -262,13 +264,13 @@ class OllamaTestRefiner:
         
         try:
             payload = self.client.generate_json(prompt)
-            notes = payload.get("analysis", "")
-            raw_cases = payload.get("test_cases", [])
+            notes = self._response_notes(payload)
+            raw_cases = self._response_cases(payload)
             
             if not isinstance(raw_cases, list):
                 return [], "Invalid packaged response."
             
-            cases = self._cases_from_payload(source_name, [fn], raw_cases, coverage, level, 1)
+            cases = self._cases_from_payload(source_name, [fn], raw_cases, coverage, level, iteration)
             return cases, notes
         except Exception as exc:
             return [], f"Packaged gap refinement failed: {exc}"
@@ -1166,30 +1168,67 @@ def refine_with_ollama(
             log(f"Ollama round {iteration}: refining {len(gaps)} coverage-feedback chunks.")
             round_added = 0
             by_name = {fn.name: fn for fn in functions}
-            for gap_index, gap in enumerate(gaps, start=1):
-                fn = by_name.get(gap.function)
-                if not fn:
-                    continue
-                try:
-                    new_cases, notes = refiner.refine_gap(
-                        source.name,
-                        fn,
-                        merged,
-                        feedback,
-                        gap,
-                        coverage,
-                        level,
-                        target_percent,
-                        (iteration * 100) + gap_index,
-                        backend,
-                        code_database,
-                    )
-                except Exception as exc:
-                    log(f"Ollama chunk failed for {gap.function} line {gap.line or '-'}: {exc}")
-                    continue
-                added = merge_cases(merged, new_cases)
-                round_added += added
-                log(f"Ollama feedback chunk {gap_index}/{len(gaps)} {gap.metric} {gap.function}:{gap.line or '-'} added {added}. {notes[:240]}")
+            use_packager = OllamaClient._env_bool("TESTMATE_LLM_USE_PACKAGER", True)
+            parallel_workers = OllamaClient._env_int("TESTMATE_LLM_PARALLEL_WORKERS", 3, minimum=1)
+            use_parallel = use_packager and parallel_workers > 1 and len(gaps) > 1
+
+            if use_parallel:
+                max_cases_per_gap = OllamaClient._env_int("TESTMATE_LLM_MAX_CASES_PER_GAP", 3, minimum=1)
+                grouped: dict[str, list[CoverageGap]] = {}
+                for gap in gaps:
+                    if gap.function in by_name:
+                        grouped.setdefault(gap.function, []).append(gap)
+                log(f"Ollama round {iteration}: using packaged parallel refinement with {min(parallel_workers, 4)} worker(s).")
+                parallel_refiner = OllamaParallelRefiner(client, max_workers=parallel_workers)
+                for function_name, function_gaps in grouped.items():
+                    fn = by_name[function_name]
+                    try:
+                        new_cases, notes_list = parallel_refiner.refine_gaps_parallel(
+                            source.name,
+                            fn,
+                            merged,
+                            function_gaps,
+                            coverage,
+                            level,
+                            backend,
+                            code_database,
+                            max_cases_per_gap=max_cases_per_gap,
+                            feedback=feedback,
+                        )
+                    except Exception as exc:
+                        log(f"Ollama parallel refinement failed for {function_name}: {exc}")
+                        continue
+                    added = merge_cases(merged, new_cases)
+                    round_added += added
+                    for note in notes_list[:3]:
+                        if note:
+                            log(f"Ollama parallel note {function_name}: {note[:240]}")
+                    log(f"Ollama parallel {function_name}: added {added} from {len(function_gaps)} gap chunk(s).")
+            else:
+                for gap_index, gap in enumerate(gaps, start=1):
+                    fn = by_name.get(gap.function)
+                    if not fn:
+                        continue
+                    try:
+                        new_cases, notes = refiner.refine_gap(
+                            source.name,
+                            fn,
+                            merged,
+                            feedback,
+                            gap,
+                            coverage,
+                            level,
+                            target_percent,
+                            (iteration * 100) + gap_index,
+                            backend,
+                            code_database,
+                        )
+                    except Exception as exc:
+                        log(f"Ollama chunk failed for {gap.function} line {gap.line or '-'}: {exc}")
+                        continue
+                    added = merge_cases(merged, new_cases)
+                    round_added += added
+                    log(f"Ollama feedback chunk {gap_index}/{len(gaps)} {gap.metric} {gap.function}:{gap.line or '-'} added {added}. {notes[:240]}")
             if round_added == 0:
                 log("Ollama refinement stopped: no new unique cases were added from coverage chunks.")
                 break
@@ -1267,6 +1306,7 @@ class OllamaParallelRefiner:
         backend: str = "GoogleTest",
         code_database: CodeDatabase | None = None,
         max_cases_per_gap: int = 3,
+        feedback: CoverageFeedback | None = None,
     ) -> tuple[list[TestCase], list[str]]:
         """Refine multiple coverage gaps in parallel.
         
@@ -1295,10 +1335,11 @@ class OllamaParallelRefiner:
             (
                 gap,
                 LLMDataPackager.package_gap_refinement(
-                    source_name, fn, existing_cases, gap, coverage, None, code_database
+                    source_name, fn, existing_cases, gap, coverage, feedback, code_database
                 ),
+                index,
             )
-            for gap in gaps[:8]  # Limit to 8 gaps per batch
+            for index, gap in enumerate(gaps[:8], start=1)  # Limit to 8 gaps per batch
         ]
         
         # Process gaps concurrently
@@ -1308,13 +1349,16 @@ class OllamaParallelRefiner:
                     self._refine_single_gap,
                     gap,
                     pkg,
+                    source_name,
                     fn,
                     existing_cases,
+                    coverage,
                     level,
                     backend,
                     max_cases_per_gap,
+                    index,
                 ): gap.line
-                for gap, pkg in packaged_gaps
+                for gap, pkg, index in packaged_gaps
             }
             
             for future in as_completed(futures):
@@ -1324,7 +1368,7 @@ class OllamaParallelRefiner:
                     if note:
                         notes.append(note)
                 except Exception as exc:
-                    gap_line = future_map.get(future, "unknown")
+                    gap_line = futures.get(future, "unknown")
                     notes.append(f"Parallel gap refinement failed (line {gap_line}): {exc}")
         
         return all_cases, notes
@@ -1333,11 +1377,14 @@ class OllamaParallelRefiner:
         self,
         gap: CoverageGap,
         package: dict[str, Any],
+        source_name: str,
         fn: FunctionInfo,
         existing_cases: list[TestCase],
+        coverage: str,
         level: str,
         backend: str,
         max_cases: int,
+        iteration: int,
     ) -> tuple[list[TestCase], str]:
         """Refine a single gap using packaged data.
         
@@ -1360,12 +1407,17 @@ class OllamaParallelRefiner:
         except Exception as exc:
             return [], f"LLM request failed for {gap.metric} at line {gap.line}: {exc}"
         
-        raw_cases = payload.get("test_cases", [])
+        raw_cases = OllamaTestRefiner._response_cases(payload)
         if not isinstance(raw_cases, list):
             return [], f"Invalid LLM response for gap at line {gap.line}"
         
-        cases = self._cases_from_payload(fn.name, raw_cases, existing_cases, level)
-        note = payload.get("analysis", "")
+        cases = OllamaParallelRefiner._cases_from_payload(
+            fn.name,
+            raw_cases[:max_cases],
+            existing_cases,
+            level,
+        )
+        note = OllamaTestRefiner._response_notes(payload)
         
         return cases, note
 
@@ -1427,6 +1479,7 @@ class OllamaParallelRefiner:
             
             case = TestCase(
                 test_id=f"Parallel_{fn_name}_{index:03d}",
+                unit=existing_cases[0].unit if existing_cases else "unknown",
                 function=fn_name,
                 values=dict(values) if values else {},
                 expected=raw.get("expected", "Review"),
